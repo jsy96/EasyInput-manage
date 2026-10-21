@@ -1,0 +1,8 @@
+node_modules/
+out/
+dist/
+release/
+firmware/**/build/
+firmware/**/sdkconfig
+firmware/**/managed_components/
+.DS_Store
