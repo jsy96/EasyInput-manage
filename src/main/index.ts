@@ -36,9 +36,10 @@ async function getDesktopWallpaper(): Promise<{ dataUrl: string | null; source: 
 
 function registerSerialPermissions(): void {
   const appSession = session.defaultSession
-  appSession.setPermissionCheckHandler((_contents, permission) => permission === 'serial')
+  const allowedPermissions = new Set(['serial', 'bluetooth-scanning'])
+  appSession.setPermissionCheckHandler((_contents, permission) => allowedPermissions.has(permission))
   appSession.setPermissionRequestHandler((_contents, permission, callback) => {
-    callback(permission === 'serial')
+    callback(allowedPermissions.has(permission))
   })
 
   appSession.on('select-serial-port', (event, ports, _contents, callback) => {
@@ -82,6 +83,78 @@ function registerSerialPermissions(): void {
   })
 }
 
+function registerBluetoothDeviceSelection(window: BrowserWindow): void {
+  let choiceTimer: ReturnType<typeof setTimeout> | null = null
+  let noDeviceTimer: ReturnType<typeof setTimeout> | null = null
+  let selectionCallback: ((deviceId: string) => void) | null = null
+  let dialogOpen = false
+  const devicesById = new Map<string, string>()
+
+  const finishSelection = (deviceId: string): void => {
+    if (choiceTimer) clearTimeout(choiceTimer)
+    if (noDeviceTimer) clearTimeout(noDeviceTimer)
+    choiceTimer = null
+    noDeviceTimer = null
+    const callback = selectionCallback
+    selectionCallback = null
+    devicesById.clear()
+    dialogOpen = false
+    callback?.(deviceId)
+  }
+
+  window.webContents.on('select-bluetooth-device', (event, devices, callback) => {
+    event.preventDefault()
+    selectionCallback = callback
+    for (const device of devices) {
+      if (device.deviceName.startsWith('EasyInput')) devicesById.set(device.deviceId, device.deviceName)
+    }
+
+    if (devicesById.size === 0) {
+      if (!noDeviceTimer) {
+        noDeviceTimer = setTimeout(() => {
+          if (dialogOpen || devicesById.size > 0 || !selectionCallback) return
+          dialogOpen = true
+          void dialog.showMessageBox(window, {
+            type: 'warning',
+            title: '未发现开发板',
+            message: '附近没有发现 EasyInput 开发板。',
+            detail: '请确认开发板已开机、距离较近，并运行支持 BLE GATT 的固件后重试。',
+            buttons: ['知道了'],
+            noLink: true,
+          }).then(() => finishSelection(''), () => finishSelection(''))
+        }, 8000)
+      }
+      return
+    }
+
+    if (noDeviceTimer) clearTimeout(noDeviceTimer)
+    noDeviceTimer = null
+    if (choiceTimer || dialogOpen) return
+    choiceTimer = setTimeout(() => {
+      choiceTimer = null
+      if (!selectionCallback || devicesById.size === 0) return
+      const candidates = [...devicesById.entries()]
+      const labels = candidates.map(([deviceId, name], index) => {
+        const duplicates = candidates.filter(([, candidateName]) => candidateName === name).length > 1
+        return duplicates ? `${name} · 设备 ${index + 1}` : name
+      })
+      dialogOpen = true
+      void dialog.showMessageBox(window, {
+        type: 'question',
+        title: '选择蓝牙设备',
+        message: '选择要连接的 EasyInput 开发板',
+        detail: '蓝牙连接会加密本次会话中的状态和命令数据。',
+        buttons: [...labels, '取消'],
+        cancelId: labels.length,
+        defaultId: 0,
+        noLink: true,
+      }).then(({ response }) => {
+        finishSelection(response < candidates.length ? candidates[response][0] : '')
+      }).catch(() => finishSelection(''))
+    }, 650)
+  })
+}
+
 function createWindow(): void {
   mainWindow = new BrowserWindow({
     width: 1440,
@@ -98,6 +171,7 @@ function createWindow(): void {
       sandbox: true,
     },
   })
+  registerBluetoothDeviceSelection(mainWindow)
 
   mainWindow.once('ready-to-show', () => mainWindow?.show())
   mainWindow.on('closed', () => { mainWindow = null })

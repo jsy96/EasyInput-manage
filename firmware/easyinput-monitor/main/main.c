@@ -1,11 +1,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/idf_additions.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
@@ -35,17 +37,22 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_gap.h"
+#include "host/ble_att.h"
+#include "host/ble_gatt.h"
 #include "host/ble_hs.h"
+#include "host/ble_uuid.h"
+#include "os/os_mbuf.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
 #define PROTOCOL_VERSION 2
 #define KEY_COUNT 8
 #define DEBOUNCE_US 25000
-#define INPUT_SCAN_MS 5
+#define INPUT_SCAN_MS 10
 #define STATUS_INTERVAL_MS 1000
 #define USB_LINE_MAX 512
 #define PARTITION_COUNT_MAX 24
+#define BLE_TX_QUEUE_DEPTH 16
 
 static const char *TAG = "easyinput";
 static const gpio_num_t key_gpios[KEY_COUNT] = {2, 47, 38, 41, 1, 6, 7, 48};
@@ -54,6 +61,9 @@ static const gpio_num_t encoder_b_gpio = 16;
 static const gpio_num_t encoder_button_gpio = 18;
 
 static SemaphoreHandle_t usb_tx_mutex;
+static SemaphoreHandle_t ble_notify_tx_done;
+static QueueHandle_t ble_tx_queue;
+static QueueHandle_t ble_command_queue;
 static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
 static char wifi_state[16] = "disconnected";
 static char wifi_ssid[33] = {0};
@@ -70,6 +80,14 @@ static bool wifi_configured;
 static int ble_peers;
 static char ble_state[16] = "starting";
 static uint8_t ble_address_type;
+static uint16_t ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+static uint16_t ble_tx_value_handle;
+static bool ble_link_encrypted;
+static bool ble_notifications_enabled;
+static uint32_t ble_connection_generation;
+static int ble_notify_tx_status;
+static char ble_command_buffer[USB_LINE_MAX];
+static size_t ble_command_length;
 static esp_netif_t *wifi_netif;
 static adc_oneshot_unit_handle_t adc_handle;
 static adc_cali_handle_t adc_cali_handle;
@@ -87,6 +105,60 @@ static esp_flash_counters_t last_flash_counters;
 static uint64_t last_flash_sample_us;
 
 static void start_advertising(void);
+static void handle_command(const char *line);
+
+typedef struct {
+    char *line;
+    uint16_t conn_handle;
+    uint32_t generation;
+} ble_tx_frame_t;
+
+static const ble_uuid128_t ble_service_uuid = BLE_UUID128_INIT(
+    0x01, 0x00, 0x00, 0xb0, 0x8d, 0x2d, 0xbc, 0xa3,
+    0x51, 0x4f, 0x24, 0x6e, 0x01, 0x00, 0x00, 0xe1);
+static const ble_uuid128_t ble_tx_uuid = BLE_UUID128_INIT(
+    0x01, 0x00, 0x00, 0xb0, 0x8d, 0x2d, 0xbc, 0xa3,
+    0x51, 0x4f, 0x24, 0x6e, 0x02, 0x00, 0x00, 0xe1);
+static const ble_uuid128_t ble_rx_uuid = BLE_UUID128_INIT(
+    0x01, 0x00, 0x00, 0xb0, 0x8d, 0x2d, 0xbc, 0xa3,
+    0x51, 0x4f, 0x24, 0x6e, 0x03, 0x00, 0x00, 0xe1);
+
+static int ble_tx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
+                            struct ble_gatt_access_ctxt *context, void *arg)
+{
+    (void)conn_handle;
+    (void)attr_handle;
+    (void)context;
+    (void)arg;
+    return BLE_ATT_ERR_READ_NOT_PERMITTED;
+}
+
+static int ble_command_access_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                 struct ble_gatt_access_ctxt *context, void *arg);
+
+static const struct ble_gatt_chr_def ble_characteristics[] = {
+    {
+        .uuid = &ble_tx_uuid.u,
+        .access_cb = ble_tx_access_cb,
+        .flags = BLE_GATT_CHR_F_NOTIFY,
+        .val_handle = &ble_tx_value_handle,
+    },
+    {
+        .uuid = &ble_rx_uuid.u,
+        .access_cb = ble_command_access_cb,
+        .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC,
+    },
+    {0},
+};
+
+static const struct ble_gatt_svc_def ble_services[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = &ble_service_uuid.u,
+        .characteristics = ble_characteristics,
+    },
+    {0},
+};
 
 typedef struct {
     bool raw_pressed;
@@ -94,13 +166,92 @@ typedef struct {
     int64_t changed_at_us;
 } debounced_input_t;
 
+static void queue_ble_line(const char *line)
+{
+    if (ble_tx_queue == NULL || line == NULL) return;
+
+    ble_tx_frame_t frame = {0};
+    portENTER_CRITICAL(&state_lock);
+    const bool ready = ble_conn_handle != BLE_HS_CONN_HANDLE_NONE && ble_link_encrypted && ble_notifications_enabled;
+    frame.conn_handle = ble_conn_handle;
+    frame.generation = ble_connection_generation;
+    portEXIT_CRITICAL(&state_lock);
+    if (!ready) return;
+
+    const size_t line_length = strlen(line);
+    frame.line = malloc(line_length + 2);
+    if (frame.line == NULL) return;
+    memcpy(frame.line, line, line_length + 1);
+    frame.line[line_length] = '\n';
+    frame.line[line_length + 1] = '\0';
+    if (xQueueSend(ble_tx_queue, &frame, 0) != pdTRUE) {
+        free(frame.line);
+        ESP_LOGW(TAG, "BLE transmit queue full; frame dropped");
+    }
+}
+
 static void send_line(const char *line)
 {
-    if (usb_tx_mutex == NULL || line == NULL) return;
-    if (xSemaphoreTake(usb_tx_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (line == NULL) return;
+    if (usb_tx_mutex != NULL && xSemaphoreTake(usb_tx_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         usb_serial_jtag_write_bytes(line, strlen(line), pdMS_TO_TICKS(80));
         usb_serial_jtag_write_bytes("\n", 1, pdMS_TO_TICKS(80));
         xSemaphoreGive(usb_tx_mutex);
+    }
+    queue_ble_line(line);
+}
+
+static bool ble_frame_is_current(const ble_tx_frame_t *frame)
+{
+    bool current;
+    portENTER_CRITICAL(&state_lock);
+    current = frame->conn_handle == ble_conn_handle &&
+              frame->generation == ble_connection_generation &&
+              ble_link_encrypted && ble_notifications_enabled;
+    portEXIT_CRITICAL(&state_lock);
+    return current;
+}
+
+static void ble_tx_task(void *arg)
+{
+    (void)arg;
+    ble_tx_frame_t frame;
+    while (true) {
+        if (xQueueReceive(ble_tx_queue, &frame, portMAX_DELAY) != pdTRUE) continue;
+        const size_t line_length = strlen(frame.line);
+        const uint16_t mtu = ble_att_mtu(frame.conn_handle);
+        const size_t max_payload = mtu > 3 ? mtu - 3 : 20;
+        size_t offset = 0;
+
+        while (offset < line_length && ble_frame_is_current(&frame)) {
+            const size_t remaining = line_length - offset;
+            const uint16_t chunk_length = (uint16_t)(remaining < max_payload ? remaining : max_payload);
+            struct os_mbuf *packet = ble_hs_mbuf_from_flat(frame.line + offset, chunk_length);
+            if (packet == NULL) {
+                ESP_LOGW(TAG, "Unable to allocate BLE notification packet");
+                break;
+            }
+
+            while (xSemaphoreTake(ble_notify_tx_done, 0) == pdTRUE) {}
+            portENTER_CRITICAL(&state_lock);
+            ble_notify_tx_status = BLE_HS_EUNKNOWN;
+            portEXIT_CRITICAL(&state_lock);
+            const int rc = ble_gatts_notify_custom(frame.conn_handle, ble_tx_value_handle, packet);
+            if (rc != 0) {
+                ESP_LOGW(TAG, "BLE notification failed: %d", rc);
+                break;
+            }
+            if (xSemaphoreTake(ble_notify_tx_done, pdMS_TO_TICKS(1500)) != pdTRUE) {
+                ESP_LOGW(TAG, "BLE notification timed out");
+                break;
+            }
+            portENTER_CRITICAL(&state_lock);
+            const int notify_status = ble_notify_tx_status;
+            portEXIT_CRITICAL(&state_lock);
+            if (notify_status != 0) break;
+            offset += chunk_length;
+        }
+        free(frame.line);
     }
 }
 
@@ -159,6 +310,17 @@ static void emit_hello(void)
              "{\"type\":\"hello\",\"protocol\":%d,\"board\":\"easyinput-v2\",\"chip\":\"ESP32-S3\",\"firmware\":\"%s\",\"uptime_ms\":%lld}",
              PROTOCOL_VERSION, app_description->version, (long long)uptime_ms);
     send_line(line);
+}
+
+static void queue_ble_hello(void)
+{
+    char line[192];
+    const int64_t uptime_ms = esp_timer_get_time() / 1000;
+    const esp_app_desc_t *app_description = esp_app_get_description();
+    snprintf(line, sizeof(line),
+             "{\"type\":\"hello\",\"protocol\":%d,\"board\":\"easyinput-v2\",\"chip\":\"ESP32-S3\",\"firmware\":\"%s\",\"uptime_ms\":%lld}",
+             PROTOCOL_VERSION, app_description->version, (long long)uptime_ms);
+    queue_ble_line(line);
 }
 
 static void collect_partition_info(void)
@@ -604,13 +766,68 @@ static void handle_command(const char *line)
     cJSON_Delete(command);
 }
 
+static int ble_command_access_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                 struct ble_gatt_access_ctxt *context, void *arg)
+{
+    (void)attr_handle;
+    (void)arg;
+    if (context->op != BLE_GATT_ACCESS_OP_WRITE_CHR || context->om == NULL) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    portENTER_CRITICAL(&state_lock);
+    const bool encrypted = ble_conn_handle == conn_handle && ble_link_encrypted;
+    portEXIT_CRITICAL(&state_lock);
+    if (!encrypted) return BLE_ATT_ERR_INSUFFICIENT_ENC;
+
+    const uint16_t packet_length = OS_MBUF_PKTLEN(context->om);
+    if (packet_length > USB_LINE_MAX - 1) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    char chunk[USB_LINE_MAX];
+    uint16_t chunk_length = 0;
+    const int rc = ble_hs_mbuf_to_flat(context->om, chunk, sizeof(chunk), &chunk_length);
+    if (rc != 0) return BLE_ATT_ERR_UNLIKELY;
+
+    for (uint16_t index = 0; index < chunk_length; index++) {
+        const char byte = chunk[index];
+        if (byte == '\r') continue;
+        if (byte == '\n') {
+            if (ble_command_length > 0) {
+                ble_command_buffer[ble_command_length] = '\0';
+                if (ble_command_queue == NULL || xQueueSend(ble_command_queue, ble_command_buffer, 0) != pdTRUE) {
+                    memset(ble_command_buffer, 0, sizeof(ble_command_buffer));
+                    ble_command_length = 0;
+                    memset(chunk, 0, sizeof(chunk));
+                    return BLE_ATT_ERR_INSUFFICIENT_RES;
+                }
+            }
+            memset(ble_command_buffer, 0, sizeof(ble_command_buffer));
+            ble_command_length = 0;
+        } else {
+            if (ble_command_length >= sizeof(ble_command_buffer) - 1) {
+                memset(ble_command_buffer, 0, sizeof(ble_command_buffer));
+                ble_command_length = 0;
+                memset(chunk, 0, sizeof(chunk));
+                return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+            }
+            ble_command_buffer[ble_command_length++] = byte;
+        }
+    }
+    memset(chunk, 0, sizeof(chunk));
+    return 0;
+}
+
 static void usb_task(void *arg)
 {
     (void)arg;
     char chunk[USB_LINE_MAX];
     char line[USB_LINE_MAX];
+    char ble_line[USB_LINE_MAX];
     size_t line_length = 0;
     while (true) {
+        if (ble_command_queue != NULL && xQueueReceive(ble_command_queue, ble_line, 0) == pdTRUE) {
+            handle_command(ble_line);
+            memset(ble_line, 0, sizeof(ble_line));
+        }
         const int read = usb_serial_jtag_read_bytes(chunk, sizeof(chunk), pdMS_TO_TICKS(20));
         if (read <= 0) continue;
         for (int index = 0; index < read; index++) {
@@ -757,12 +974,63 @@ int ble_gap_event_handler(struct ble_gap_event *event, void *context)
             portENTER_CRITICAL(&state_lock);
             strlcpy(ble_state, "connected", sizeof(ble_state));
             ble_peers = 1;
+            ble_conn_handle = event->connect.conn_handle;
+            ble_link_encrypted = false;
+            ble_notifications_enabled = false;
+            ble_connection_generation++;
             portEXIT_CRITICAL(&state_lock);
+            memset(ble_command_buffer, 0, sizeof(ble_command_buffer));
+            ble_command_length = 0;
+            const int rc = ble_gap_security_initiate(event->connect.conn_handle);
+            if (rc != 0) {
+                ESP_LOGW(TAG, "BLE security negotiation failed to start: %d", rc);
+                (void)ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            }
         } else {
             start_advertising();
         }
         break;
     case BLE_GAP_EVENT_DISCONNECT:
+        portENTER_CRITICAL(&state_lock);
+        ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        ble_link_encrypted = false;
+        ble_notifications_enabled = false;
+        ble_connection_generation++;
+        ble_peers = 0;
+        portEXIT_CRITICAL(&state_lock);
+        memset(ble_command_buffer, 0, sizeof(ble_command_buffer));
+        ble_command_length = 0;
+        start_advertising();
+        break;
+    case BLE_GAP_EVENT_ENC_CHANGE:
+        if (event->enc_change.status == 0) {
+            portENTER_CRITICAL(&state_lock);
+            ble_link_encrypted = true;
+            const bool notifications_enabled = ble_notifications_enabled;
+            portEXIT_CRITICAL(&state_lock);
+            if (notifications_enabled) queue_ble_hello();
+        } else {
+            ESP_LOGW(TAG, "BLE link encryption failed: %d", event->enc_change.status);
+            (void)ble_gap_terminate(event->enc_change.conn_handle, BLE_ERR_AUTH_FAIL);
+        }
+        break;
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        if (event->subscribe.attr_handle == ble_tx_value_handle) {
+            portENTER_CRITICAL(&state_lock);
+            ble_notifications_enabled = event->subscribe.cur_notify != 0;
+            const bool ready = ble_notifications_enabled && ble_link_encrypted;
+            portEXIT_CRITICAL(&state_lock);
+            if (ready) queue_ble_hello();
+        }
+        break;
+    case BLE_GAP_EVENT_NOTIFY_TX:
+        if (event->notify_tx.attr_handle == ble_tx_value_handle) {
+            portENTER_CRITICAL(&state_lock);
+            ble_notify_tx_status = event->notify_tx.status;
+            portEXIT_CRITICAL(&state_lock);
+            if (ble_notify_tx_done != NULL) xSemaphoreGive(ble_notify_tx_done);
+        }
+        break;
     case BLE_GAP_EVENT_ADV_COMPLETE:
         start_advertising();
         break;
@@ -790,8 +1058,14 @@ static void ble_reset_handler(int reason)
     ESP_LOGW(TAG, "BLE host reset: %d", reason);
     portENTER_CRITICAL(&state_lock);
     strlcpy(ble_state, "disconnected", sizeof(ble_state));
+    ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    ble_link_encrypted = false;
+    ble_notifications_enabled = false;
+    ble_connection_generation++;
     ble_peers = 0;
     portEXIT_CRITICAL(&state_lock);
+    memset(ble_command_buffer, 0, sizeof(ble_command_buffer));
+    ble_command_length = 0;
 }
 
 static void ble_host_task(void *arg)
@@ -813,9 +1087,25 @@ static void init_ble_monitor(void)
     }
     ble_hs_cfg.sync_cb = ble_sync_handler;
     ble_hs_cfg.reset_cb = ble_reset_handler;
+    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
+    ble_hs_cfg.sm_bonding = 0;
+    ble_hs_cfg.sm_mitm = 0;
+    ble_hs_cfg.sm_sc = 1;
     ble_svc_gap_init();
     ble_svc_gatt_init();
     ESP_ERROR_CHECK(ble_svc_gap_device_name_set("EasyInput"));
+    int rc = ble_gatts_count_cfg(ble_services);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "BLE GATT service count failed: %d", rc);
+        strlcpy(ble_state, "disabled", sizeof(ble_state));
+        return;
+    }
+    rc = ble_gatts_add_svcs(ble_services);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "BLE GATT service registration failed: %d", rc);
+        strlcpy(ble_state, "disabled", sizeof(ble_state));
+        return;
+    }
     nimble_port_freertos_init(ble_host_task);
 }
 
@@ -843,6 +1133,13 @@ void app_main(void)
         ESP_LOGE(TAG, "USB transmit mutex allocation failed");
         return;
     }
+    ble_tx_queue = xQueueCreate(BLE_TX_QUEUE_DEPTH, sizeof(ble_tx_frame_t));
+    ble_command_queue = xQueueCreate(4, USB_LINE_MAX);
+    ble_notify_tx_done = xSemaphoreCreateBinary();
+    if (ble_tx_queue == NULL || ble_command_queue == NULL || ble_notify_tx_done == NULL) {
+        ESP_LOGE(TAG, "BLE transport queue allocation failed");
+        return;
+    }
     usb_serial_jtag_driver_config_t usb_config = {.rx_buffer_size = 512, .tx_buffer_size = 4096};
     const esp_err_t usb_result = usb_serial_jtag_driver_install(&usb_config);
     if (usb_result != ESP_OK) {
@@ -853,6 +1150,7 @@ void app_main(void)
     configure_system_sensors();
     init_wifi_monitor();
     init_ble_monitor();
+    xTaskCreate(ble_tx_task, "ble_tx", 4096, NULL, 6, NULL);
     emit_hello();
     xTaskCreate(input_task, "input_scan", 4096, NULL, 8, NULL);
     xTaskCreate(usb_task, "usb_command", 6144, NULL, 6, NULL);

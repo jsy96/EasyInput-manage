@@ -4,8 +4,8 @@ EasyInput Studio is a local desktop monitor and firmware manager for the EasyInp
 
 ## Current features
 
-- USB Serial/JTAG connection and protocol heartbeat state.
-- Wi-Fi diagnostics (SSID, signal, channel, IP/mask/gateway/DNS, disconnect code, retry counters), USB-based Wi-Fi setup and configuration clearing.
+- USB Serial/JTAG or BLE GATT connection for protocol heartbeat, telemetry, events, and Wi-Fi commands.
+- Wi-Fi diagnostics (SSID, signal, channel, IP/mask/gateway/DNS, disconnect code, retry counters), USB- or BLE-based Wi-Fi setup and configuration clearing.
 - BLE advertising/connection state, status LED, shared peripheral power, five WS2812 pixels, microphone level/VAD fields, and speaker state when reported by firmware.
 - Live CPU usage by core, frequency and chip temperature; internal RAM and PSRAM totals/free space/fragmentation; Flash partitions, application image headroom, NVS entry headroom, and Flash API read/write/erase rates.
 - Host network adapter addresses, masks, and MAC addresses, plus board battery voltage, external-power, and charging state.
@@ -13,7 +13,7 @@ EasyInput Studio is a local desktop monitor and firmware manager for the EasyInp
 - Local firmware bundle import, SHA-256 and target checks, ESP32-S3/MAC identification, explicit write confirmation, per-image progress, and no whole-flash erase.
 - A clearly marked interface preview mode that uses synthetic data without connecting to hardware.
 
-The monitor firmware intentionally holds GPIO8 low because the shared LED/microphone/speaker rail still needs a board-qualified ready condition. Until that qualification exists, the app reports those consumers as unavailable rather than showing guessed physical state. Mic audio capture, WS2812 control, and speaker playback are therefore not active in this firmware build. Wi-Fi can be configured from the app; the password travels over USB and is stored in the board's NVS. The current partition table does not enable NVS encryption, so configure Wi-Fi only over a trusted local USB connection.
+The monitor firmware intentionally holds GPIO8 low because the shared LED/microphone/speaker rail still needs a board-qualified ready condition. Until that qualification exists, the app reports those consumers as unavailable rather than showing guessed physical state. Mic audio capture, WS2812 control, and speaker playback are therefore not active in this firmware build. Wi-Fi can be configured from the app; the password travels over USB or an encrypted BLE session and is stored in the board's NVS. The current partition table does not enable NVS encryption, so configure Wi-Fi only from a trusted Studio session.
 
 ## Run the desktop app
 
@@ -22,7 +22,7 @@ npm install
 npm run dev
 ```
 
-The app is local-only. To connect to a running monitor firmware, choose **连接开发板** and select the EasyInput ESP32-S3 USB Serial/JTAG port. The expected application protocol is documented in [PROTOCOL.md](PROTOCOL.md).
+The app is local-only. Connect from the Bluetooth LE card or choose **连接开发板** and select the EasyInput ESP32-S3 USB Serial/JTAG port. Firmware flashing still uses the USB Serial/JTAG port. The expected application protocol is documented in [PROTOCOL.md](PROTOCOL.md).
 
 ## Build board firmware
 

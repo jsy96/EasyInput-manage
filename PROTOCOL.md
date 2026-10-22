@@ -21,7 +21,7 @@ All frames use `protocol: 2`. The desktop ignores older, unknown, or malformed v
 
 All commands use `{"type":"command","protocol":2,"action":"…"}`. `status.get` requests an immediate status frame.
 
-Wi-Fi setup sends the network name and password over the local USB serial connection:
+Wi-Fi setup sends the network name and password over the active USB serial or encrypted BLE connection:
 
 ```json
 {"type":"command","protocol":2,"action":"wifi.configure","ssid":"Studio-WiFi","password":"example-password"}
@@ -30,11 +30,25 @@ Wi-Fi setup sends the network name and password over the local USB serial connec
 
 The firmware stores credentials in the board's Wi-Fi configuration in NVS. The current partition table does not enable NVS encryption; treat local USB access and the board's NVS contents as sensitive. Passwords are cleared from the UI after sending and from command buffers after use, and are not returned in status or result frames. A `result` frame reports command success without including credentials.
 
+## BLE GATT transport
+
+The firmware exposes one custom GATT service while advertising as `EasyInput`:
+
+| Attribute | UUID | Properties |
+| --- | --- | --- |
+| EasyInput Studio service | `e1000001-6e24-4f51-a3bc-2d8db0000001` | Primary service |
+| Board to Studio | `e1000002-6e24-4f51-a3bc-2d8db0000001` | Notify |
+| Studio to board | `e1000003-6e24-4f51-a3bc-2d8db0000001` | Encrypted write with response |
+
+Both characteristics carry the same protocol 2 UTF-8 JSON lines used over USB. Board notifications are a byte stream: a JSON frame may span several notifications, so the client reassembles bytes through the next newline before parsing. Studio sends commands as a newline-terminated byte stream in writes of at most 20 bytes; the board reassembles each line before parsing it. The negotiated ATT MTU determines notification chunk size.
+
+On connection, the board negotiates LE Secure Connections encryption without storing a bond. The board has no display or input for MITM verification, so pairing uses Just Works: it encrypts the radio link but does not authenticate the peer against an active nearby attacker. Studio sends Wi-Fi credentials only after it has received protocol data over the encrypted connection. The firmware accepts one BLE peer at a time. Studio uses either USB or BLE as its active data transport; firmware flashing always uses USB.
+
 ## Hardware truth and limits
 
 - The board has one native USB-C port. The app filters for Espressif USB Serial/JTAG (`VID 303A`, `PID 1001`) and asks the user to select a port; it does not infer identity from a path such as `/dev/cu.usbmodem…`.
 - Wi-Fi uses the ESP32-S3 2.4 GHz station radio. Disconnect reason codes come from ESP-IDF; the app names common authentication, access point, beacon, and handshake failures and retains the numeric code for other reasons.
-- BLE starts advertising as `EasyInput` and reports advertising or link-connected state. It does not expose an application GATT service yet.
+- BLE advertises as `EasyInput`, reports link state, and exposes the Studio GATT service documented above. BLE command writes require an encrypted link.
 - GPIO8 remains low. The hardware knowledge pack has no qualified shared-rail settling condition, so LEDs on GPIO12, microphone input on GPIO11, and speaker output on GPIO15 are reported unavailable/off. The independent status LED GPIO42 is held low.
 - The speaker has no physical activity feedback pin. A future status can only report firmware playback state unless hardware feedback is added.
 - Battery reporting is limited to calibrated voltage and board power/charge pins. There is no qualified battery chemistry or fuel gauge for a remaining-capacity percentage.

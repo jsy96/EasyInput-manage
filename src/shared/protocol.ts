@@ -1,4 +1,7 @@
 export const PROTOCOL_VERSION = 2
+export const BLE_SERVICE_UUID = 'e1000001-6e24-4f51-a3bc-2d8db0000001'
+export const BLE_TX_UUID = 'e1000002-6e24-4f51-a3bc-2d8db0000001'
+export const BLE_RX_UUID = 'e1000003-6e24-4f51-a3bc-2d8db0000001'
 
 export type ConnectionState = 'unknown' | 'disabled' | 'disconnected' | 'connecting' | 'connected' | 'advertising'
 

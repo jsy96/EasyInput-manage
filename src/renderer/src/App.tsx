@@ -5,10 +5,14 @@ import {
   RotateCw, Usb, Wifi, X, Zap,
 } from 'lucide-react'
 import { ESPLoader, Transport } from 'esptool-js'
-import type { BoardHello, BoardResult, BoardStatus, InputEvent } from '@shared/protocol'
-import { describeInputEvent, parseBoardMessage, PROTOCOL_VERSION } from '@shared/protocol'
+import type { BoardHello, BoardMessage, BoardResult, BoardStatus, InputEvent } from '@shared/protocol'
+import {
+  BLE_RX_UUID, BLE_SERVICE_UUID, BLE_TX_UUID,
+  describeInputEvent, parseBoardMessage, PROTOCOL_VERSION,
+} from '@shared/protocol'
 
 const FLASH_BYTES = 16 * 1024 * 1024
+const BLE_WRITE_CHUNK_BYTES = 20
 
 type FirmwareImageSpec = { file: string; address: number; bytes: number; sha256: string }
 type FirmwareManifest = {
@@ -162,7 +166,9 @@ export default function App(): React.JSX.Element {
   const [wifiSsid, setWifiSsid] = useState('')
   const [wifiPassword, setWifiPassword] = useState('')
   const [wifiBusy, setWifiBusy] = useState(false)
-  const [bleNotice, setBleNotice] = useState('')
+  const [bleConnected, setBleConnected] = useState(false)
+  const [bleConnecting, setBleConnecting] = useState(false)
+  const [bleError, setBleError] = useState('')
   const [localAddresses, setLocalAddresses] = useState<LocalAddress[]>([])
   const [desktopWallpaper, setDesktopWallpaper] = useState<string | null>(null)
   const [events, setEvents] = useState<BoardEventRow[]>([])
@@ -180,13 +186,22 @@ export default function App(): React.JSX.Element {
   const portRef = useRef<SerialPort | null>(null)
   const readerRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null)
   const readTaskRef = useRef<Promise<void> | null>(null)
+  const bleDeviceRef = useRef<EasyInputBluetoothDevice | null>(null)
+  const bleServerRef = useRef<EasyInputBluetoothServer | null>(null)
+  const bleTxRef = useRef<EasyInputBluetoothCharacteristic | null>(null)
+  const bleRxRef = useRef<EasyInputBluetoothCharacteristic | null>(null)
+  const bleDisconnectHandlerRef = useRef<EventListener | null>(null)
+  const bleNotificationHandlerRef = useRef<EventListener | null>(null)
+  const bleConnectRequestRef = useRef(false)
+  const protocolBufferRef = useRef('')
   const flashFolderRef = useRef<HTMLInputElement | null>(null)
   const wifiSsidRef = useRef<HTMLInputElement | null>(null)
   const eventCounter = useRef(0)
 
   const appVersion = window.easyinputDesktop?.version ?? '0.1.0'
   const currentStatus = status ?? emptyStatus
-  const protocolOnline = Boolean(serialOpen && hello && status && lastSeenAt !== null && clock - lastSeenAt < 3000)
+  const dataTransportOpen = serialOpen || bleConnected
+  const protocolOnline = Boolean(dataTransportOpen && hello && status && lastSeenAt !== null && clock - lastSeenAt < 3000)
   const usbLabel = !serialOpen ? '未连接' : protocolOnline ? '通信正常' : '串口已打开 · 等待板端协议'
   const usbStateClass = !serialOpen ? 'is-muted' : protocolOnline ? 'is-live' : 'is-warn'
   const micLevel = Math.max(0, Math.min(100, Math.round(((currentStatus.microphone.rms ?? 0) / 32768) * 100)))
@@ -255,10 +270,48 @@ export default function App(): React.JSX.Element {
   }, [])
 
   useEffect(() => {
-    if (!serialOpen) return
+    if (!dataTransportOpen) return
     const timer = window.setInterval(() => setClock(Date.now()), 500)
     return () => window.clearInterval(timer)
-  }, [serialOpen])
+  }, [dataTransportOpen])
+
+  function clearConnectionData(): void {
+    protocolBufferRef.current = ''
+    setHello(null)
+    setStatus(null)
+    setWifiResult(null)
+    setWifiBusy(false)
+    setLastSeen('')
+    setLastSeenAt(null)
+    setEvents([])
+  }
+
+  function handleBoardMessage(message: BoardMessage): void {
+    setLastSeen(new Date().toLocaleTimeString('zh-CN'))
+    setLastSeenAt(Date.now())
+    if (message.type === 'hello') setHello(message)
+    if (message.type === 'status') setStatus(message)
+    if (message.type === 'result') {
+      setWifiResult(message)
+      setWifiBusy(false)
+      if (message.action === 'wifi.configure') setWifiPassword('')
+    }
+    if (message.type === 'event') {
+      const row: BoardEventRow = { ...message, receivedAt: new Date().toLocaleTimeString('zh-CN'), rowId: ++eventCounter.current }
+      setEvents((previous) => [row, ...previous].slice(0, 80))
+    }
+  }
+
+  function handleProtocolText(text: string): void {
+    let buffer = protocolBufferRef.current + text
+    const lines = buffer.split(/\r?\n/)
+    buffer = lines.pop() ?? ''
+    protocolBufferRef.current = buffer.length <= 32768 ? buffer : ''
+    for (const line of lines) {
+      const message = parseBoardMessage(line.trim())
+      if (message) handleBoardMessage(message)
+    }
+  }
 
   async function closeSerial(): Promise<void> {
     const port = portRef.current
@@ -275,8 +328,7 @@ export default function App(): React.JSX.Element {
     readTaskRef.current = null
     portRef.current = null
     setSerialOpen(false)
-    setHello(null)
-    setStatus(null)
+    clearConnectionData()
   }
 
   async function readSerial(port: SerialPort): Promise<void> {
@@ -289,25 +341,13 @@ export default function App(): React.JSX.Element {
       while (true) {
         const { value, done } = await reader.read()
         if (done) break
-        buffer += decoder.decode(value, { stream: true })
+        const text = decoder.decode(value, { stream: true })
+        buffer += text
         const lines = buffer.split(/\r?\n/)
         buffer = lines.pop() ?? ''
         for (const line of lines) {
           const message = parseBoardMessage(line.trim())
-          if (!message) continue
-          setLastSeen(new Date().toLocaleTimeString('zh-CN'))
-          setLastSeenAt(Date.now())
-          if (message.type === 'hello') setHello(message)
-          if (message.type === 'status') setStatus(message)
-          if (message.type === 'result') {
-            setWifiResult(message)
-            setWifiBusy(false)
-            if (message.action === 'wifi.configure') setWifiPassword('')
-          }
-          if (message.type === 'event') {
-            const row: BoardEventRow = { ...message, receivedAt: new Date().toLocaleTimeString('zh-CN'), rowId: ++eventCounter.current }
-            setEvents((previous) => [row, ...previous].slice(0, 80))
-          }
+          if (message) handleBoardMessage(message)
         }
       }
     } catch (error) {
@@ -318,8 +358,7 @@ export default function App(): React.JSX.Element {
       if (portRef.current === port) {
         portRef.current = null
         setSerialOpen(false)
-        setHello(null)
-        setStatus(null)
+        clearConnectionData()
       }
     }
   }
@@ -332,7 +371,9 @@ export default function App(): React.JSX.Element {
       return
     }
     try {
+      if (bleDeviceRef.current) disconnectBle()
       if (portRef.current) await closeSerial()
+      clearConnectionData()
       const port = await navigator.serial.requestPort()
       await port.open({ baudRate: 115200, bufferSize: 65536 })
       portRef.current = port
@@ -353,6 +394,89 @@ export default function App(): React.JSX.Element {
     }
   }
 
+  function clearBleReferences(device: EasyInputBluetoothDevice, disconnect: boolean): void {
+    const disconnectHandler = bleDisconnectHandlerRef.current
+    if (disconnectHandler) device.removeEventListener('gattserverdisconnected', disconnectHandler)
+    const notificationHandler = bleNotificationHandlerRef.current
+    if (notificationHandler) bleTxRef.current?.removeEventListener('characteristicvaluechanged', notificationHandler)
+    bleDisconnectHandlerRef.current = null
+    bleNotificationHandlerRef.current = null
+    bleTxRef.current = null
+    bleRxRef.current = null
+    bleServerRef.current = null
+    bleDeviceRef.current = null
+    if (disconnect && device.gatt?.connected) device.gatt.disconnect()
+    setBleConnected(false)
+    clearConnectionData()
+  }
+
+  function disconnectBle(): void {
+    const device = bleDeviceRef.current
+    if (!device) return
+    clearBleReferences(device, true)
+  }
+
+  async function connectBle(): Promise<void> {
+    if (bleConnectRequestRef.current || bleConnected) return
+    setBleError('')
+    setDemoMode(false)
+    const bluetooth = navigator.bluetooth
+    if (!bluetooth) {
+      setBleError('当前桌面内核未提供 Web Bluetooth API。')
+      return
+    }
+
+    bleConnectRequestRef.current = true
+    setBleConnecting(true)
+    try {
+      if (portRef.current) await closeSerial()
+      clearConnectionData()
+      const device = await bluetooth.requestDevice({
+        filters: [{ namePrefix: 'EasyInput' }],
+        optionalServices: [BLE_SERVICE_UUID],
+      })
+      const server = device.gatt
+      if (!server) throw new Error('所选设备不支持 GATT 连接。')
+      bleDeviceRef.current = device
+
+      const onDisconnected: EventListener = () => {
+        if (bleDeviceRef.current !== device) return
+        clearBleReferences(device, false)
+        setBleError('蓝牙连接已断开。')
+      }
+      bleDisconnectHandlerRef.current = onDisconnected
+      device.addEventListener('gattserverdisconnected', onDisconnected)
+
+      const connectedServer = await server.connect()
+      bleServerRef.current = connectedServer
+      const service = await connectedServer.getPrimaryService(BLE_SERVICE_UUID)
+      const tx = await service.getCharacteristic(BLE_TX_UUID)
+      const rx = await service.getCharacteristic(BLE_RX_UUID)
+      const decoder = new TextDecoder()
+      const onNotification: EventListener = () => {
+        const value = tx.value
+        if (!value) return
+        const bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+        handleProtocolText(decoder.decode(bytes, { stream: true }))
+      }
+      bleTxRef.current = tx
+      bleRxRef.current = rx
+      bleNotificationHandlerRef.current = onNotification
+      tx.addEventListener('characteristicvaluechanged', onNotification)
+      await tx.startNotifications()
+      setBleConnected(true)
+    } catch (error) {
+      const device = bleDeviceRef.current
+      if (device) clearBleReferences(device, true)
+      if (!(error instanceof DOMException && error.name === 'NotFoundError')) {
+        setBleError(error instanceof Error ? error.message : '无法连接蓝牙设备。')
+      }
+    } finally {
+      bleConnectRequestRef.current = false
+      setBleConnecting(false)
+    }
+  }
+
   async function toggleDemoMode(): Promise<void> {
     if (demoMode) {
       setDemoMode(false)
@@ -363,13 +487,15 @@ export default function App(): React.JSX.Element {
       setLastSeenAt(null)
       return
     }
+    if (bleDeviceRef.current) disconnectBle()
     if (portRef.current) await closeSerial()
     setDemoMode(true)
   }
 
   async function sendWifiCommand(action: 'wifi.configure' | 'wifi.clear'): Promise<void> {
     const port = portRef.current
-    if (!port?.writable || !protocolOnline || wifiBusy) return
+    const useBle = bleConnected
+    if ((!useBle && !port?.writable) || !protocolOnline || wifiBusy) return
     if (action === 'wifi.configure') {
       const ssid = wifiSsid
       const password = wifiPassword
@@ -388,21 +514,38 @@ export default function App(): React.JSX.Element {
         command.password = wifiPassword
       }
       const frame = new TextEncoder().encode(`${JSON.stringify(command)}\n`)
-      let writer: WritableStreamDefaultWriter<Uint8Array> | null = null
       try {
-        writer = port.writable.getWriter()
-        await writer.write(frame)
+        if (useBle) {
+          const characteristic = bleRxRef.current
+          if (!characteristic) throw new Error('蓝牙命令通道已断开。')
+          for (let offset = 0; offset < frame.length; offset += BLE_WRITE_CHUNK_BYTES) {
+            const chunk = frame.slice(offset, offset + BLE_WRITE_CHUNK_BYTES)
+            try {
+              await characteristic.writeValueWithResponse(chunk)
+            } finally {
+              chunk.fill(0)
+            }
+          }
+        } else {
+          const writer = port?.writable?.getWriter()
+          if (!writer) throw new Error('USB 串口已断开。')
+          try {
+            await writer.write(frame)
+          } finally {
+            writer.releaseLock()
+          }
+        }
       } finally {
-        writer?.releaseLock()
         frame.fill(0)
         if (action === 'wifi.configure') command.password = ''
       }
       if (action === 'wifi.configure') setWifiPassword('')
       window.setTimeout(() => setWifiBusy(false), 12000)
     } catch {
+      if (useBle) disconnectBle()
       setWifiBusy(false)
       setWifiPassword('')
-      setWifiResult({ type: 'result', protocol: PROTOCOL_VERSION, action, ok: false, message: 'USB 命令发送失败，请确认串口仍连接。' })
+      setWifiResult({ type: 'result', protocol: PROTOCOL_VERSION, action, ok: false, message: useBle ? '蓝牙命令发送失败，请确认连接仍有效。' : 'USB 命令发送失败，请确认串口仍连接。' })
     }
   }
 
@@ -410,10 +553,6 @@ export default function App(): React.JSX.Element {
     if (currentStatus.wifi.ssid) setWifiSsid(currentStatus.wifi.ssid)
     document.getElementById('wifi-config')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
     window.setTimeout(() => wifiSsidRef.current?.focus(), 350)
-  }
-
-  function showBleConnectionNotice(): void {
-    setBleNotice('当前固件只进行 BLE 广播，没有为 Studio 提供可连接的 GATT 服务，因此暂时不能建立蓝牙连接。')
   }
 
   async function importFirmware(event: React.ChangeEvent<HTMLInputElement>): Promise<void> {
@@ -451,10 +590,10 @@ export default function App(): React.JSX.Element {
     setFlashPreparing(true)
     let transport: Transport | null = null
     try {
+      if (bleDeviceRef.current) disconnectBle()
       await closeSerial()
+      clearConnectionData()
       setDemoMode(false)
-      setHello(null)
-      setStatus(null)
       const port = await navigator.serial.requestPort()
       transport = new Transport(port, false)
       const loader = new ESPLoader({
@@ -548,11 +687,11 @@ export default function App(): React.JSX.Element {
             <h1>EasyInput <span>Studio</span></h1>
           </div>
           <div className="topbar-actions">
-            <button className="text-button demo-toggle" onClick={() => void toggleDemoMode()}>
+            <button className="text-button demo-toggle" disabled={bleConnecting} onClick={() => void toggleDemoMode()}>
               {demoMode ? <Check size={15} /> : <Activity size={15} />}
               {demoMode ? '退出演示' : '预览界面'}
             </button>
-            <button className={`button ${serialOpen ? 'button-subtle' : 'button-primary'}`} onClick={() => serialOpen ? void closeSerial() : void connectBoard()}>
+            <button className={`button ${serialOpen ? 'button-subtle' : 'button-primary'}`} disabled={bleConnecting} onClick={() => serialOpen ? void closeSerial() : void connectBoard()}>
               <Usb size={16} /> {serialOpen ? '断开 USB' : '连接开发板'}
             </button>
           </div>
@@ -581,7 +720,7 @@ export default function App(): React.JSX.Element {
               <div className="usb-icon"><Usb size={17} /></div>
               <div><span>USB-C / 原生串口</span><strong className={usbStateClass}>{usbLabel}</strong></div>
             </div>
-            {!serialOpen && <button className="icon-button connect-small" onClick={() => void connectBoard()} aria-label="连接开发板"><Link2 size={17} /></button>}
+            {!serialOpen && <button className="icon-button connect-small" disabled={bleConnecting} onClick={() => void connectBoard()} aria-label="连接 USB 串口"><Link2 size={17} /></button>}
           </div>
 
           <article className="firmware-card panel" id="firmware-panel">
@@ -639,11 +778,11 @@ export default function App(): React.JSX.Element {
                   <div className="card-foot"><span>{wifiExtra}{currentStatus.wifi.state === 'connected' && currentStatus.wifi.channel ? ` · 信道 ${currentStatus.wifi.channel}` : ''}</span>{currentStatus.wifi.state === 'connected' && typeof currentStatus.wifi.rssi === 'number' && <span className="signal-bars" aria-label={`信号强度 ${currentStatus.wifi.rssi} dBm`}>{[1, 2, 3, 4].map((level) => <i key={level} className={wifiSignalLevel(currentStatus.wifi.rssi) >= level ? '' : 'signal-muted'} />)}</span>}</div>
                 </article>
                 <article className="status-card panel">
-                  <div className="card-topline"><div className="card-icon bluetooth-icon"><Bluetooth size={17} /></div><button className="card-connect-button" onClick={showBleConnectionNotice}>连接</button></div>
+                  <div className="card-topline"><div className="card-icon bluetooth-icon"><Bluetooth size={17} /></div><button className="card-connect-button" disabled={bleConnecting} onClick={() => { if (bleConnected) disconnectBle(); else void connectBle() }}>{bleConnecting ? '连接中' : bleConnected ? '断开' : '连接'}</button></div>
                   <div className="card-label">Bluetooth LE</div>
                   <div className="status-value-row"><strong className={stateClass(currentStatus.ble.state)}>{stateLabel(currentStatus.ble.state)}</strong><span className="status-dash" /></div>
                   <div className="card-foot"><span>{currentStatus.ble.name ?? (currentStatus.ble.peers !== undefined ? `${currentStatus.ble.peers} 个连接` : '由板端固件上报')}</span><span className="bluetooth-wave"><i /><i /><i /></span></div>
-                  {bleNotice && <p className="ble-notice">{bleNotice}</p>}
+                  {bleError && <p className="ble-notice">{bleError}</p>}
                 </article>
               </div>
 

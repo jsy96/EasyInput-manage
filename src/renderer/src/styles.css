@@ -95,6 +95,7 @@ button { color: inherit; }
 .card-index { color: #4c6077; font: 400 13.5px 'DM Mono', monospace; }
 .card-connect-button { position: relative; z-index: 1; padding: 5px 10px; border: 1px solid rgba(112, 178, 194, .2); border-radius: 6px; color: #93c5d1; background: rgba(66, 143, 158, .1); font-size: 12px; cursor: pointer; transition: .16s ease; }
 .card-connect-button:hover { color: #d8f5f4; border-color: rgba(112, 205, 212, .42); background: rgba(66, 164, 175, .18); }
+.card-connect-button:disabled { opacity: .55; cursor: wait; }
 .ble-notice { margin: 9px 0 0; color: #d6b985; font-size: 12px; line-height: 1.45; }
 .card-label { margin-top: 10px; color: #8798aa; font-size: 15px; }
 .status-value-row { display: flex; align-items: center; justify-content: space-between; margin-top: 4px; }
