@@ -25,10 +25,15 @@ Wi-Fi setup sends the network name and password over the active USB serial or en
 
 ```json
 {"type":"command","protocol":2,"action":"wifi.configure","ssid":"Studio-WiFi","password":"example-password"}
+{"type":"command","protocol":2,"action":"wifi.connect_saved"}
 {"type":"command","protocol":2,"action":"wifi.clear"}
 ```
 
 The firmware stores credentials in the board's Wi-Fi configuration in NVS. The current partition table does not enable NVS encryption; treat local USB access and the board's NVS contents as sensitive. Passwords are cleared from the UI after sending and from command buffers after use, and are not returned in status or result frames. A `result` frame reports command success without including credentials.
+
+`wifi.connect_saved` retries the Wi-Fi configuration already stored by the board. While association is failing, the firmware keeps retrying and reports an increasing `wifi.retries` count plus the most recent disconnect reason in status frames.
+
+Wi-Fi commands pause automatic reconnection and wait for the station's stopped event before changing configuration. The station is then restarted, and the command initiates one connection attempt using the saved configuration. Stop/start event waits time out after three seconds each. Failed commands include the ESP-IDF error name and numeric code; configuration write failures also attempt to resume station operation using the configuration still held by the driver. No command erases the NVS partition.
 
 ## BLE GATT transport
 

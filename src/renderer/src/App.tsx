@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { version as appVersion } from '../../../package.json'
+import { registerSW } from 'virtual:pwa-register'
 import {
   Activity, ArrowDownToLine, Bluetooth, Check, ChevronDown, CircleHelp, Cpu, Download,
   FileUp, HardDrive, Headphones, Lightbulb, Link2, LoaderCircle, Mic, Monitor,
@@ -27,8 +29,6 @@ type FirmwareManifest = {
 type LoadedImage = FirmwareImageSpec & { data: Uint8Array }
 type BoardEventRow = InputEvent & { receivedAt: string; rowId: number }
 type FlashCandidate = { loader: ESPLoader; transport: Transport; chip: string; mac: string }
-type LocalAddress = { name: string; address: string; family: string; netmask: string; mac: string }
-
 const emptyStatus: BoardStatus = {
   type: 'status', protocol: PROTOCOL_VERSION, uptime_ms: 0,
   wifi: { state: 'unknown' }, ble: { state: 'unknown' },
@@ -156,6 +156,7 @@ function validateManifest(value: unknown): FirmwareManifest {
 
 export default function App(): React.JSX.Element {
   const [serialOpen, setSerialOpen] = useState(false)
+  const [serialConnecting, setSerialConnecting] = useState(false)
   const [serialError, setSerialError] = useState('')
   const [lastSeen, setLastSeen] = useState('')
   const [lastSeenAt, setLastSeenAt] = useState<number | null>(null)
@@ -169,8 +170,6 @@ export default function App(): React.JSX.Element {
   const [bleConnected, setBleConnected] = useState(false)
   const [bleConnecting, setBleConnecting] = useState(false)
   const [bleError, setBleError] = useState('')
-  const [localAddresses, setLocalAddresses] = useState<LocalAddress[]>([])
-  const [desktopWallpaper, setDesktopWallpaper] = useState<string | null>(null)
   const [events, setEvents] = useState<BoardEventRow[]>([])
   const [demoMode, setDemoMode] = useState(false)
   const [manifest, setManifest] = useState<FirmwareManifest | null>(null)
@@ -182,6 +181,7 @@ export default function App(): React.JSX.Element {
   const [flashCandidate, setFlashCandidate] = useState<FlashCandidate | null>(null)
   const [flashPreparing, setFlashPreparing] = useState(false)
   const [flashing, setFlashing] = useState(false)
+  const [updateWaiting, setUpdateWaiting] = useState(false)
   const [confirmedTarget, setConfirmedTarget] = useState(false)
   const portRef = useRef<SerialPort | null>(null)
   const readerRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null)
@@ -197,16 +197,41 @@ export default function App(): React.JSX.Element {
   const flashFolderRef = useRef<HTMLInputElement | null>(null)
   const wifiSsidRef = useRef<HTMLInputElement | null>(null)
   const eventCounter = useRef(0)
+  const updateSWRef = useRef<((reloadPage?: boolean) => Promise<void>) | null>(null)
+  const updateStartedRef = useRef(false)
 
-  const appVersion = window.easyinputDesktop?.version ?? '0.1.0'
   const currentStatus = status ?? emptyStatus
   const dataTransportOpen = serialOpen || bleConnected
+  const updateBlocked = serialOpen || serialConnecting || bleConnected || bleConnecting || wifiBusy || flashing || flashPreparing || flashCandidate !== null
   const protocolOnline = Boolean(dataTransportOpen && hello && status && lastSeenAt !== null && clock - lastSeenAt < 3000)
   const usbLabel = !serialOpen ? '未连接' : protocolOnline ? '通信正常' : '串口已打开 · 等待板端协议'
   const usbStateClass = !serialOpen ? 'is-muted' : protocolOnline ? 'is-live' : 'is-warn'
   const micLevel = Math.max(0, Math.min(100, Math.round(((currentStatus.microphone.rms ?? 0) / 32768) * 100)))
 
   const latestEvents = useMemo(() => events.slice(0, 28), [events])
+
+  useEffect(() => {
+    let updateTimer: number | undefined
+    updateSWRef.current = registerSW({
+      immediate: true,
+      onNeedRefresh: () => setUpdateWaiting(true),
+      onRegisteredSW: (_url, registration) => {
+        if (!registration) return
+        updateTimer = window.setInterval(() => {
+          if (document.visibilityState === 'visible') void registration.update()
+        }, 30 * 60 * 1000)
+      },
+    })
+    return () => { if (updateTimer !== undefined) window.clearInterval(updateTimer) }
+  }, [])
+
+  useEffect(() => {
+    if (!updateWaiting || updateBlocked || updateStartedRef.current) return
+    const updateSW = updateSWRef.current
+    if (!updateSW) return
+    updateStartedRef.current = true
+    void updateSW(true).catch(() => { updateStartedRef.current = false })
+  }, [updateBlocked, updateWaiting])
 
   useEffect(() => {
     if (!demoMode) return
@@ -245,29 +270,6 @@ export default function App(): React.JSX.Element {
       { type: 'event', protocol: PROTOCOL_VERSION, source: 'encoder', action: 'down', uptime_ms: 8349500, receivedAt: '演示', rowId: 4 },
     ])
   }, [demoMode])
-
-  useEffect(() => {
-    let active = true
-    void window.easyinputDesktop?.getDesktopWallpaper().then(({ dataUrl }) => {
-      if (active && dataUrl) setDesktopWallpaper(dataUrl)
-    }).catch(() => undefined)
-    return () => { active = false }
-  }, [])
-
-  useEffect(() => {
-    let active = true
-    const refresh = async (): Promise<void> => {
-      try {
-        const addresses = await window.easyinputDesktop?.getNetworkAddresses()
-        if (active && addresses) setLocalAddresses(addresses)
-      } catch {
-        if (active) setLocalAddresses([])
-      }
-    }
-    void refresh()
-    const timer = window.setInterval(() => void refresh(), 2000)
-    return () => { active = false; window.clearInterval(timer) }
-  }, [])
 
   useEffect(() => {
     if (!dataTransportOpen) return
@@ -367,9 +369,10 @@ export default function App(): React.JSX.Element {
     setSerialError('')
     setDemoMode(false)
     if (!('serial' in navigator)) {
-      setSerialError('当前桌面内核未提供 Web Serial API。')
+      setSerialError('此浏览器不支持 Web Serial API，请使用最新版 Chrome 或 Edge。')
       return
     }
+    setSerialConnecting(true)
     try {
       if (bleDeviceRef.current) disconnectBle()
       if (portRef.current) await closeSerial()
@@ -391,6 +394,8 @@ export default function App(): React.JSX.Element {
       } else if (!message.toLowerCase().includes('cancel')) {
         setSerialError(message)
       }
+    } finally {
+      setSerialConnecting(false)
     }
   }
 
@@ -422,7 +427,7 @@ export default function App(): React.JSX.Element {
     setDemoMode(false)
     const bluetooth = navigator.bluetooth
     if (!bluetooth) {
-      setBleError('当前桌面内核未提供 Web Bluetooth API。')
+      setBleError('此浏览器不支持 Web Bluetooth API，请使用支持该功能的 Chrome 或 Edge。')
       return
     }
 
@@ -492,7 +497,7 @@ export default function App(): React.JSX.Element {
     setDemoMode(true)
   }
 
-  async function sendWifiCommand(action: 'wifi.configure' | 'wifi.clear'): Promise<void> {
+  async function sendWifiCommand(action: 'wifi.configure' | 'wifi.clear' | 'wifi.connect_saved'): Promise<void> {
     const port = portRef.current
     const useBle = bleConnected
     if ((!useBle && !port?.writable) || !protocolOnline || wifiBusy) return
@@ -544,7 +549,7 @@ export default function App(): React.JSX.Element {
     } catch {
       if (useBle) disconnectBle()
       setWifiBusy(false)
-      setWifiPassword('')
+      if (action === 'wifi.configure') setWifiPassword('')
       setWifiResult({ type: 'result', protocol: PROTOCOL_VERSION, action, ok: false, message: useBle ? '蓝牙命令发送失败，请确认连接仍有效。' : 'USB 命令发送失败，请确认串口仍连接。' })
     }
   }
@@ -584,7 +589,7 @@ export default function App(): React.JSX.Element {
   async function prepareFlash(): Promise<void> {
     if (!manifest || images.length === 0) return
     setFlashError('')
-    setFlashLog('请保持开发板开机，短按并松开 BOOT 后再选择下载端口。')
+    setFlashLog('请保持开发板开机，选择 ESP32 USB 端口后会自动进入下载模式。')
     setFlashCandidate(null)
     setConfirmedTarget(false)
     setFlashPreparing(true)
@@ -607,7 +612,7 @@ export default function App(): React.JSX.Element {
           write: (line) => setFlashLog(line.trim()),
         },
       })
-      const chip = await loader.main('no_reset')
+      const chip = await loader.main('default_reset')
       if (!chip.toLowerCase().includes('esp32-s3')) throw new Error(`识别到 ${chip}，固件要求 ESP32-S3。`)
       const mac = await loader.chip.readMac(loader)
       setFlashCandidate({ loader, transport, chip, mac })
@@ -615,7 +620,7 @@ export default function App(): React.JSX.Element {
     } catch (error) {
       if (transport) await transport.disconnect().catch(() => undefined)
       setFlashError(error instanceof Error ? error.message : '连接下载端口失败。')
-      setFlashLog('连接未完成。请检查数据线和下载模式，再由你决定是否重试。')
+      setFlashLog('自动连接未完成。请保持开发板开机，短按并松开 BOOT，然后重试并选择 ESP32 下载端口。')
     } finally {
       setFlashPreparing(false)
     }
@@ -662,15 +667,17 @@ export default function App(): React.JSX.Element {
   }
 
   const wifiExtra = currentStatus.wifi.ssid
-    ? `${currentStatus.wifi.ssid}${currentStatus.wifi.state === 'connected' && typeof currentStatus.wifi.rssi === 'number' ? ` · ${currentStatus.wifi.rssi} dBm` : currentStatus.wifi.state === 'connecting' ? ' · 正在连接' : ' · 已保存'}`
+    ? `${currentStatus.wifi.ssid}${currentStatus.wifi.state === 'connected' && typeof currentStatus.wifi.rssi === 'number' ? ` · ${currentStatus.wifi.rssi} dBm` : currentStatus.wifi.state === 'connecting' ? (currentStatus.wifi.retries ? ` · 重试 ${currentStatus.wifi.retries} 次` : ' · 正在连接') : ' · 已保存'}`
     : currentStatus.wifi.configured === false
       ? '尚未配置网络'
       : currentStatus.wifi.state === 'connected' && typeof currentStatus.wifi.rssi === 'number'
       ? `${currentStatus.wifi.rssi} dBm`
       : '由板端固件上报'
+  const wifiRetrying = currentStatus.wifi.state === 'connecting' && (currentStatus.wifi.retries ?? 0) > 0
+  const wifiStatusLabel = wifiRetrying ? `重试中 · ${currentStatus.wifi.retries} 次` : stateLabel(currentStatus.wifi.state)
 
   return (
-    <main className="app-shell" style={desktopWallpaper ? ({ '--desktop-wallpaper': `url("${desktopWallpaper}")` } as React.CSSProperties) : undefined}>
+    <main className="app-shell">
       <aside className="side-rail">
         <div className="brand-mark"><span className="brand-key">E</span><span className="brand-dot" /></div>
         <div className="rail-rule" />
@@ -691,13 +698,14 @@ export default function App(): React.JSX.Element {
               {demoMode ? <Check size={15} /> : <Activity size={15} />}
               {demoMode ? '退出演示' : '预览界面'}
             </button>
-            <button className={`button ${serialOpen ? 'button-subtle' : 'button-primary'}`} disabled={bleConnecting} onClick={() => serialOpen ? void closeSerial() : void connectBoard()}>
-              <Usb size={16} /> {serialOpen ? '断开 USB' : '连接开发板'}
+            <button className={`button ${serialOpen ? 'button-subtle' : 'button-primary'}`} disabled={bleConnecting || serialConnecting} onClick={() => serialOpen ? void closeSerial() : void connectBoard()}>
+              {serialConnecting ? <LoaderCircle size={16} className="spin" /> : <Usb size={16} />} {serialConnecting ? '连接中' : serialOpen ? '断开 USB' : '连接开发板'}
             </button>
           </div>
         </header>
 
         {serialError && <div className="notice notice-error"><X size={16} /><span>{serialError}</span><button onClick={() => setSerialError('')} aria-label="关闭"><X size={14} /></button></div>}
+        {updateWaiting && updateBlocked && <div className="notice notice-update"><RotateCw size={15} /><span>新版本已就绪，设备操作结束后会自动更新。</span></div>}
 
         <div className="page-content">
           <div className="section-heading">
@@ -720,7 +728,7 @@ export default function App(): React.JSX.Element {
               <div className="usb-icon"><Usb size={17} /></div>
               <div><span>USB-C / 原生串口</span><strong className={usbStateClass}>{usbLabel}</strong></div>
             </div>
-            {!serialOpen && <button className="icon-button connect-small" disabled={bleConnecting} onClick={() => void connectBoard()} aria-label="连接 USB 串口"><Link2 size={17} /></button>}
+            {!serialOpen && <button className="icon-button connect-small" disabled={bleConnecting || serialConnecting} onClick={() => void connectBoard()} aria-label="连接 USB 串口"><Link2 size={17} /></button>}
           </div>
 
           <article className="firmware-card panel" id="firmware-panel">
@@ -760,7 +768,7 @@ export default function App(): React.JSX.Element {
                 ) : (
                   <button className="button button-primary flash-button full-button" disabled={!manifest || flashPreparing || flashing} onClick={() => void prepareFlash()}>
                     {flashPreparing ? <LoaderCircle size={15} className="spin" /> : <Download size={15} />}
-                    {flashPreparing ? '正在识别芯片…' : '进入下载模式并识别设备'}
+                    {flashPreparing ? '正在识别芯片…' : '连接并识别设备'}
                   </button>
                 )}
                 <div className="flash-footnote"><span className="footnote-icon">i</span><span>仅写入清单列出的镜像，不擦除整片 Flash。烧录后按板上电源开关关机再开机。</span></div>
@@ -774,7 +782,7 @@ export default function App(): React.JSX.Element {
                 <article className="status-card panel">
                   <div className="card-topline"><div className="card-icon wifi-icon"><Wifi size={18} /></div><button className="card-connect-button" onClick={focusWifiConfiguration}>连接</button></div>
                   <div className="card-label">Wi-Fi</div>
-                  <div className="status-value-row"><strong className={stateClass(currentStatus.wifi.state)}>{stateLabel(currentStatus.wifi.state)}</strong><span className="status-dash" /></div>
+                  <div className="status-value-row"><strong className={stateClass(currentStatus.wifi.state)}>{wifiStatusLabel}</strong><span className="status-dash" /></div>
                   <div className="card-foot"><span>{wifiExtra}{currentStatus.wifi.state === 'connected' && currentStatus.wifi.channel ? ` · 信道 ${currentStatus.wifi.channel}` : ''}</span>{currentStatus.wifi.state === 'connected' && typeof currentStatus.wifi.rssi === 'number' && <span className="signal-bars" aria-label={`信号强度 ${currentStatus.wifi.rssi} dBm`}>{[1, 2, 3, 4].map((level) => <i key={level} className={wifiSignalLevel(currentStatus.wifi.rssi) >= level ? '' : 'signal-muted'} />)}</span>}</div>
                 </article>
                 <article className="status-card panel">
@@ -891,7 +899,7 @@ export default function App(): React.JSX.Element {
               <article className="diagnostic-card panel">
                 <div className="panel-heading">
                   <div><div className="section-kicker">WI-FI DIAGNOSTICS</div><h3>Wi-Fi 连接诊断</h3></div>
-                  <span className={`diagnostic-chip ${stateClass(currentStatus.wifi.state)}`}>{stateLabel(currentStatus.wifi.state)}</span>
+                  <span className={`diagnostic-chip ${stateClass(currentStatus.wifi.state)}`}>{wifiStatusLabel}</span>
                 </div>
                 <div className="network-details">
                   <div><span>SSID</span><strong>{currentStatus.wifi.ssid ?? (currentStatus.wifi.configured ? '正在获取…' : '尚未配置')}</strong></div>
@@ -902,22 +910,15 @@ export default function App(): React.JSX.Element {
                   <div><span>重连 / 断线次数</span><strong>{currentStatus.wifi.retries ?? '—'} / {currentStatus.wifi.disconnects ?? '—'}</strong></div>
                   <div className="network-reason"><span>最近断线原因</span><strong>{wifiDisconnectReason(currentStatus.wifi.disconnect_code)}</strong></div>
                 </div>
+                {wifiRetrying && <p className="wifi-retry-note" role="status">暂未连接，开发板仍在自动重试。最近原因：{wifiDisconnectReason(currentStatus.wifi.disconnect_code)}</p>}
                 <form className="wifi-config" id="wifi-config" onSubmit={(event) => { event.preventDefault(); void sendWifiCommand('wifi.configure') }}>
                   <div className="metric-section-heading"><Wifi size={14} /><strong>配置 Wi-Fi</strong></div>
                   <label>网络名称 (SSID)<input ref={wifiSsidRef} autoComplete="off" maxLength={32} value={wifiSsid} onChange={(event) => setWifiSsid(event.target.value)} placeholder="输入 2.4 GHz Wi-Fi 名称" /></label>
                   <label>密码<input autoComplete="new-password" maxLength={63} type="password" value={wifiPassword} onChange={(event) => setWifiPassword(event.target.value)} placeholder="WPA 密码；开放网络留空" /></label>
-                  <div className="wifi-actions"><button className="button button-primary" type="submit" disabled={!protocolOnline || wifiBusy}>{wifiBusy ? <LoaderCircle size={14} className="spin" /> : <Wifi size={14} />}保存并连接</button><button className="text-button" type="button" disabled={!protocolOnline || wifiBusy || !currentStatus.wifi.configured} onClick={() => void sendWifiCommand('wifi.clear')}>清除配置</button></div>
+                  <div className="wifi-actions"><button className="button button-primary" type="submit" disabled={!protocolOnline || wifiBusy}>{wifiBusy ? <LoaderCircle size={14} className="spin" /> : <Wifi size={14} />}保存并连接</button>{currentStatus.wifi.configured && currentStatus.wifi.state !== 'connected' && <button className="text-button" type="button" disabled={!protocolOnline || wifiBusy} onClick={() => void sendWifiCommand('wifi.connect_saved')}>{wifiBusy ? <LoaderCircle size={14} className="spin" /> : <RotateCw size={14} />}重试已保存配置</button>}<button className="text-button" type="button" disabled={!protocolOnline || wifiBusy || !currentStatus.wifi.configured} onClick={() => void sendWifiCommand('wifi.clear')}>清除配置</button></div>
                   {wifiResult && <p className={wifiResult.ok ? 'wifi-result' : 'wifi-result error'}>{wifiResult.message ?? (wifiResult.ok ? '操作完成。' : '操作失败。')}</p>}
                   <p className="metric-footnote">密码经 USB 发送并保存在开发板未加密的 NVS 中。界面不会回显密码；请仅在可信的本地 USB 连接上配网。</p>
                 </form>
-              </article>
-
-              <article className="diagnostic-card panel host-network-card">
-                <div className="panel-heading"><div><div className="section-kicker">HOST NETWORK</div><h3>本机网络地址</h3></div><Monitor size={16} className="host-network-icon" /></div>
-                <div className="host-address-list">
-                  {localAddresses.map((address) => <div className="host-address" key={`${address.name}-${address.address}`}><div><strong>{address.name}</strong><span>{address.family} · {address.address} · 掩码 {address.netmask}</span></div><code>{address.mac}</code></div>)}
-                  {localAddresses.length === 0 && <span className="metric-empty">未发现已连接的网络接口</span>}
-                </div>
               </article>
 
               <article className="diagnostic-card panel power-diagnostic-card">
@@ -928,7 +929,7 @@ export default function App(): React.JSX.Element {
             </div>
           </section>
 
-          <footer className="app-footer"><span>EasyInput V2.0 <span className="footer-separator">/</span> PCB AI Keyboard V2.1</span><span>本机应用 · v{appVersion}</span></footer>
+          <footer className="app-footer"><span>EasyInput V2.0 <span className="footer-separator">/</span> PCB AI Keyboard V2.1</span><span>浏览器 PWA · v{appVersion}</span></footer>
         </div>
       </section>
     </main>

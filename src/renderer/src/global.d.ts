@@ -1,3 +1,5 @@
+/// <reference types="vite-plugin-pwa/client" />
+
 import type { Serial } from 'w3c-web-serial'
 
 declare global {
@@ -35,23 +37,6 @@ declare global {
     readonly bluetooth?: EasyInputBluetooth
   }
 
-  interface Window {
-    easyinputDesktop?: {
-      version: string
-      platform: string
-      getDesktopWallpaper: () => Promise<{
-        dataUrl: string | null
-        source: string | null
-      }>
-      getNetworkAddresses: () => Promise<Array<{
-        name: string
-        address: string
-        family: string
-        netmask: string
-        mac: string
-      }>>
-    }
-  }
 }
 
 export {}

@@ -6,6 +6,7 @@
 
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -53,6 +54,9 @@
 #define USB_LINE_MAX 512
 #define PARTITION_COUNT_MAX 24
 #define BLE_TX_QUEUE_DEPTH 16
+#define WIFI_STARTED_BIT (1U << 0)
+#define WIFI_STOPPED_BIT (1U << 1)
+#define WIFI_TRANSITION_TIMEOUT_MS 3000
 
 static const char *TAG = "easyinput";
 static const gpio_num_t key_gpios[KEY_COUNT] = {2, 47, 38, 41, 1, 6, 7, 48};
@@ -64,6 +68,7 @@ static SemaphoreHandle_t usb_tx_mutex;
 static SemaphoreHandle_t ble_notify_tx_done;
 static QueueHandle_t ble_tx_queue;
 static QueueHandle_t ble_command_queue;
+static EventGroupHandle_t wifi_lifecycle_events;
 static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
 static char wifi_state[16] = "disconnected";
 static char wifi_ssid[33] = {0};
@@ -77,6 +82,7 @@ static int wifi_disconnect_code;
 static uint32_t wifi_disconnects;
 static uint32_t wifi_retries;
 static bool wifi_configured;
+static bool wifi_reconfiguring;
 static int ble_peers;
 static char ble_state[16] = "starting";
 static uint8_t ble_address_type;
@@ -695,6 +701,118 @@ static void input_task(void *arg)
     }
 }
 
+static void send_wifi_failure(const char *action, const char *stage, esp_err_t error, esp_err_t recovery_error)
+{
+    char message[256];
+    if (recovery_error == ESP_OK) {
+        snprintf(message, sizeof(message), "%s：%s (0x%X)。", stage, esp_err_to_name(error), (unsigned)error);
+    } else {
+        snprintf(message, sizeof(message), "%s：%s (0x%X)。恢复 Wi-Fi 失败：%s (0x%X)。",
+                 stage, esp_err_to_name(error), (unsigned)error,
+                 esp_err_to_name(recovery_error), (unsigned)recovery_error);
+    }
+    send_result(action, false, message);
+}
+
+static esp_err_t pause_wifi_for_command(void)
+{
+    portENTER_CRITICAL(&state_lock);
+    wifi_reconfiguring = true;
+    portEXIT_CRITICAL(&state_lock);
+
+    if ((xEventGroupGetBits(wifi_lifecycle_events) & WIFI_STOPPED_BIT) != 0) return ESP_OK;
+
+    const esp_err_t result = esp_wifi_stop();
+    if (result != ESP_OK) return result;
+
+    // Drain earlier connection/disconnection callbacks before changing configuration.
+    const EventBits_t bits = xEventGroupWaitBits(wifi_lifecycle_events, WIFI_STOPPED_BIT,
+                                               pdFALSE, pdTRUE, pdMS_TO_TICKS(WIFI_TRANSITION_TIMEOUT_MS));
+    return (bits & WIFI_STOPPED_BIT) != 0 ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+static esp_err_t resume_wifi_after_command(void)
+{
+    xEventGroupClearBits(wifi_lifecycle_events, WIFI_STARTED_BIT | WIFI_STOPPED_BIT);
+    esp_err_t result = esp_wifi_start();
+    if (result == ESP_OK) {
+        // Keep automatic connection paused until the START callback has finished.
+        const EventBits_t bits = xEventGroupWaitBits(wifi_lifecycle_events, WIFI_STARTED_BIT,
+                                                   pdFALSE, pdTRUE, pdMS_TO_TICKS(WIFI_TRANSITION_TIMEOUT_MS));
+        if ((bits & WIFI_STARTED_BIT) == 0) result = ESP_ERR_TIMEOUT;
+    } else {
+        xEventGroupSetBits(wifi_lifecycle_events, WIFI_STOPPED_BIT);
+    }
+
+    portENTER_CRITICAL(&state_lock);
+    wifi_reconfiguring = false;
+    const bool connect = result == ESP_OK && wifi_configured;
+    strlcpy(wifi_state, connect ? "connecting" : "disconnected", sizeof(wifi_state));
+    portEXIT_CRITICAL(&state_lock);
+
+    if (connect) {
+        result = esp_wifi_connect();
+        if (result != ESP_OK) {
+            portENTER_CRITICAL(&state_lock);
+            strlcpy(wifi_state, "disconnected", sizeof(wifi_state));
+            portEXIT_CRITICAL(&state_lock);
+        }
+    }
+    return result;
+}
+
+static void run_wifi_command(const char *action, wifi_config_t *config, const char *success_message)
+{
+    const esp_err_t pause_result = pause_wifi_for_command();
+    if (pause_result != ESP_OK) {
+        portENTER_CRITICAL(&state_lock);
+        wifi_reconfiguring = false;
+        portEXIT_CRITICAL(&state_lock);
+        send_wifi_failure(action, "暂停 Wi-Fi 连接失败", pause_result, ESP_OK);
+        return;
+    }
+
+    esp_err_t set_result = ESP_OK;
+    if (config != NULL) {
+        set_result = esp_wifi_set_config(WIFI_IF_STA, config);
+        memset(config->sta.password, 0, sizeof(config->sta.password));
+    }
+    if (set_result == ESP_OK) {
+        portENTER_CRITICAL(&state_lock);
+        if (config != NULL) {
+            wifi_configured = config->sta.ssid[0] != 0;
+            memcpy(wifi_ssid, config->sta.ssid, sizeof(config->sta.ssid));
+            wifi_ssid[sizeof(config->sta.ssid)] = '\0';
+        }
+        wifi_retries = 0;
+        wifi_disconnect_code = 0;
+        portEXIT_CRITICAL(&state_lock);
+    } else {
+        wifi_config_t remaining_config = {0};
+        if (esp_wifi_get_config(WIFI_IF_STA, &remaining_config) == ESP_OK) {
+            portENTER_CRITICAL(&state_lock);
+            wifi_configured = remaining_config.sta.ssid[0] != 0;
+            memcpy(wifi_ssid, remaining_config.sta.ssid, sizeof(remaining_config.sta.ssid));
+            wifi_ssid[sizeof(remaining_config.sta.ssid)] = '\0';
+            portEXIT_CRITICAL(&state_lock);
+        }
+        memset(remaining_config.sta.password, 0, sizeof(remaining_config.sta.password));
+    }
+
+    // Also resume the station with its remaining configuration if saving failed.
+    const esp_err_t resume_result = resume_wifi_after_command();
+    if (set_result != ESP_OK) {
+        const char *stage = strcmp(action, "wifi.clear") == 0 ? "删除 Wi-Fi 配置失败" : "保存 Wi-Fi 配置失败";
+        send_wifi_failure(action, stage, set_result, resume_result);
+    } else if (resume_result != ESP_OK) {
+        const char *stage = config == NULL ? "启动已保存的 Wi-Fi 连接失败"
+            : config->sta.ssid[0] != 0 ? "配置已保存，但恢复 Wi-Fi 连接失败" : "配置已删除，但恢复 Wi-Fi 失败";
+        send_wifi_failure(action, stage, resume_result, ESP_OK);
+    } else {
+        send_result(action, true, success_message);
+    }
+}
+
 static void handle_command(const char *line)
 {
     cJSON *command = cJSON_Parse(line);
@@ -723,43 +841,20 @@ static void handle_command(const char *line)
             config.sta.threshold.authmode = password_len == 0 ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
             config.sta.pmf_cfg.capable = true;
             config.sta.pmf_cfg.required = false;
-            const esp_err_t set_result = esp_wifi_set_config(WIFI_IF_STA, &config);
+            run_wifi_command("wifi.configure", &config, "已保存配置，正在连接。密码保存在开发板 NVS 中。");
             memset(config.sta.password, 0, sizeof(config.sta.password));
-            if (set_result == ESP_OK) {
-                portENTER_CRITICAL(&state_lock);
-                strlcpy(wifi_ssid, ssid->valuestring, sizeof(wifi_ssid));
-                wifi_configured = true;
-                wifi_retries = 0;
-                wifi_disconnect_code = 0;
-                wifi_ip[0] = wifi_netmask[0] = wifi_gateway[0] = wifi_dns[0] = '\0';
-                strlcpy(wifi_state, "connecting", sizeof(wifi_state));
-                portEXIT_CRITICAL(&state_lock);
-                (void)esp_wifi_disconnect();
-                const esp_err_t connect_result = esp_wifi_connect();
-                if (connect_result == ESP_OK) {
-                    send_result("wifi.configure", true, "已保存配置，正在连接。密码保存在开发板 NVS 中。");
-                } else {
-                    send_result("wifi.configure", false, "配置已保存，但启动连接失败。可查看 Wi-Fi 诊断并重试。");
-                }
-            } else {
-                send_result("wifi.configure", false, "保存 Wi-Fi 配置失败。");
-            }
         }
     } else if (strcmp(action->valuestring, "wifi.clear") == 0) {
         wifi_config_t empty_config = {0};
-        (void)esp_wifi_disconnect();
-        const esp_err_t result = esp_wifi_set_config(WIFI_IF_STA, &empty_config);
-        if (result == ESP_OK) {
-            portENTER_CRITICAL(&state_lock);
-            wifi_configured = false;
-            wifi_ssid[0] = wifi_ip[0] = wifi_netmask[0] = wifi_gateway[0] = wifi_dns[0] = '\0';
-            wifi_state[0] = '\0';
-            strlcpy(wifi_state, "disconnected", sizeof(wifi_state));
-            wifi_disconnect_code = 0;
-            portEXIT_CRITICAL(&state_lock);
-            send_result("wifi.clear", true, "已删除板端 Wi-Fi 配置。");
+        run_wifi_command("wifi.clear", &empty_config, "已删除板端 Wi-Fi 配置。");
+    } else if (strcmp(action->valuestring, "wifi.connect_saved") == 0) {
+        portENTER_CRITICAL(&state_lock);
+        const bool configured = wifi_configured;
+        portEXIT_CRITICAL(&state_lock);
+        if (!configured) {
+            send_result("wifi.connect_saved", false, "开发板没有已保存的 Wi-Fi 配置。");
         } else {
-            send_result("wifi.clear", false, "删除 Wi-Fi 配置失败。");
+            run_wifi_command("wifi.connect_saved", NULL, "正在使用开发板已保存的配置连接 Wi-Fi。");
         }
     }
     clear_command_password(command);
@@ -861,19 +956,44 @@ static void status_task(void *arg)
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     (void)arg;
+    portENTER_CRITICAL(&state_lock);
+    const bool reconfiguring = wifi_reconfiguring;
+    portEXIT_CRITICAL(&state_lock);
+    if (reconfiguring && !(event_base == WIFI_EVENT &&
+        (event_id == WIFI_EVENT_STA_START || event_id == WIFI_EVENT_STA_STOP))) return;
+
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        if (reconfiguring) {
+            xEventGroupClearBits(wifi_lifecycle_events, WIFI_STOPPED_BIT);
+            xEventGroupSetBits(wifi_lifecycle_events, WIFI_STARTED_BIT);
+            return;
+        }
         wifi_config_t config = {0};
         const bool have_config = esp_wifi_get_config(WIFI_IF_STA, &config) == ESP_OK && config.sta.ssid[0] != 0;
         portENTER_CRITICAL(&state_lock);
         wifi_configured = have_config;
         if (have_config) {
-            strlcpy(wifi_ssid, (const char *)config.sta.ssid, sizeof(wifi_ssid));
+            memcpy(wifi_ssid, config.sta.ssid, sizeof(config.sta.ssid));
+            wifi_ssid[sizeof(config.sta.ssid)] = '\0';
             strlcpy(wifi_state, "connecting", sizeof(wifi_state));
         } else {
+            wifi_ssid[0] = '\0';
             strlcpy(wifi_state, "disconnected", sizeof(wifi_state));
         }
         portEXIT_CRITICAL(&state_lock);
+        memset(config.sta.password, 0, sizeof(config.sta.password));
         if (have_config) (void)esp_wifi_connect();
+        xEventGroupClearBits(wifi_lifecycle_events, WIFI_STOPPED_BIT);
+        xEventGroupSetBits(wifi_lifecycle_events, WIFI_STARTED_BIT);
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_STOP) {
+        portENTER_CRITICAL(&state_lock);
+        wifi_rssi = 0;
+        wifi_channel = 0;
+        wifi_ip[0] = wifi_netmask[0] = wifi_gateway[0] = wifi_dns[0] = '\0';
+        strlcpy(wifi_state, "disconnected", sizeof(wifi_state));
+        portEXIT_CRITICAL(&state_lock);
+        xEventGroupClearBits(wifi_lifecycle_events, WIFI_STARTED_BIT);
+        xEventGroupSetBits(wifi_lifecycle_events, WIFI_STOPPED_BIT);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
         wifi_ap_record_t ap = {0};
         (void)esp_wifi_sta_get_ap_info(&ap);
@@ -896,13 +1016,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         } else {
             strlcpy(wifi_state, "disconnected", sizeof(wifi_state));
         }
-        const bool reconnect = wifi_configured;
+        const bool reconnect = wifi_configured && !wifi_reconfiguring;
         portEXIT_CRITICAL(&state_lock);
         if (reconnect) (void)esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *event = event_data;
         esp_netif_ip_info_t info = {0};
-        if (wifi_netif != NULL && esp_netif_get_ip_info(wifi_netif, &info) == ESP_OK) {
+        if (wifi_netif != NULL && esp_netif_get_ip_info(wifi_netif, &info) == ESP_OK && info.ip.addr != 0) {
             char ip[16], netmask[16], gateway[16], dns[16] = {0};
             esp_ip4addr_ntoa(&info.ip, ip, sizeof(ip));
             esp_ip4addr_ntoa(&info.netmask, netmask, sizeof(netmask));
@@ -925,6 +1045,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 
 static void init_wifi_monitor(void)
 {
+    wifi_lifecycle_events = xEventGroupCreate();
+    ESP_ERROR_CHECK(wifi_lifecycle_events != NULL ? ESP_OK : ESP_ERR_NO_MEM);
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     wifi_netif = esp_netif_create_default_wifi_sta();

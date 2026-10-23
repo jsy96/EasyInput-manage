@@ -1,28 +1,31 @@
 # EasyInput Studio
 
-EasyInput Studio is a local desktop monitor and firmware manager for the EasyInput V2.0 development board (firmware board alias `v2`, PCB marking `AI Keyboard V2.1`). The app uses the board's single native USB-C connection to receive state and input events, and can flash a local firmware bundle to an ESP32-S3.
+EasyInput Studio is a browser PWA for monitoring and managing the EasyInput V2.0 development board (firmware board alias `v2`, PCB marking `AI Keyboard V2.1`). It is a static web app with no desktop runtime or backend.
 
-## Current features
+## Features
 
-- USB Serial/JTAG or BLE GATT connection for protocol heartbeat, telemetry, events, and Wi-Fi commands.
-- Wi-Fi diagnostics (SSID, signal, channel, IP/mask/gateway/DNS, disconnect code, retry counters), USB- or BLE-based Wi-Fi setup and configuration clearing.
-- BLE advertising/connection state, status LED, shared peripheral power, five WS2812 pixels, microphone level/VAD fields, and speaker state when reported by firmware.
-- Live CPU usage by core, frequency and chip temperature; internal RAM and PSRAM totals/free space/fragmentation; Flash partitions, application image headroom, NVS entry headroom, and Flash API read/write/erase rates.
-- Host network adapter addresses, masks, and MAC addresses, plus board battery voltage, external-power, and charging state.
-- Live S1–S8 press/release events, encoder rotation and press events, plus microphone event slots in the protocol.
-- Local firmware bundle import, SHA-256 and target checks, ESP32-S3/MAC identification, explicit write confirmation, per-image progress, and no whole-flash erase.
-- A clearly marked interface preview mode that uses synthetic data without connecting to hardware.
+- Board telemetry and input events over USB Serial/JTAG or encrypted BLE GATT.
+- Wi-Fi configuration, saved-credential reconnection, and connection diagnostics.
+- Firmware package validation, ESP32-S3 identification, explicit write confirmation, progress, and per-image flashing without whole-flash erase.
+- A clearly marked interface preview mode that works without connecting to hardware.
+- Installable PWA shell with offline-cached static application assets. Device telemetry and credentials are not cached.
 
-The monitor firmware intentionally holds GPIO8 low because the shared LED/microphone/speaker rail still needs a board-qualified ready condition. Until that qualification exists, the app reports those consumers as unavailable rather than showing guessed physical state. Mic audio capture, WS2812 control, and speaker playback are therefore not active in this firmware build. Wi-Fi can be configured from the app; the password travels over USB or an encrypted BLE session and is stored in the board's NVS. The current partition table does not enable NVS encryption, so configure Wi-Fi only from a trusted Studio session.
-
-## Run the desktop app
+## Run the web app
 
 ```sh
 npm install
 npm run dev
 ```
 
-The app is local-only. Connect from the Bluetooth LE card or choose **连接开发板** and select the EasyInput ESP32-S3 USB Serial/JTAG port. Firmware flashing still uses the USB Serial/JTAG port. The expected application protocol is documented in [PROTOCOL.md](PROTOCOL.md).
+Open `http://127.0.0.1:5173`. For production, `npm run build` writes static files to `dist/`; serve those files from an HTTPS origin to enable PWA installation and device APIs. `npm run preview` serves the production build locally.
+
+USB Serial and Web Bluetooth require a secure browser context and an explicit browser permission. Use a current desktop Chrome or Edge browser for board connection and firmware flashing. Safari and iOS browsers do not provide the required device APIs. The firmware package importer uses Chromium's directory picker.
+
+The service worker caches the versioned static app shell and build assets. While the app is visible, it checks for new deployments every 30 minutes. A detected update activates automatically and reloads once USB, BLE, Wi-Fi command, and firmware operations are idle. It does not cache Wi-Fi passwords, board telemetry, or device commands. The browser owns USB/Bluetooth device selection and permission prompts.
+
+## Wi-Fi credentials
+
+Wi-Fi credentials are stored in the board's NVS and automatically retried after startup. The PWA does not save the password on the host. Use **重试已保存配置** to retry without entering the password again. The current partition table does not enable NVS encryption, so configure Wi-Fi only from a trusted session.
 
 ## Build board firmware
 
@@ -32,17 +35,15 @@ The board-side project targets ESP32-S3 and uses ESP-IDF 5.5 or later. Defaults 
 cd firmware/easyinput-monitor
 idf.py set-target esp32s3
 idf.py build
-python3 ../../scripts/export-firmware.py --version 0.1.0 --output ../../dist/firmware/0.1.0-v2-monitor
+python3 ../../scripts/export-firmware.py --version 0.1.1 --output ../../dist/firmware/0.1.1-v2-monitor
 ```
 
-The export command writes `dist/firmware/0.1.0-v2-monitor` containing `firmware.json` and the bootloader, partition table, and app images. The app version is embedded in the firmware build and the export command rejects a mismatched package version. Select that directory in the app. The manifest contains byte sizes and SHA-256 hashes for accidental-corruption checks; it is not a signed publisher identity.
+The export command writes `dist/firmware/0.1.1-v2-monitor` containing `firmware.json` and the bootloader, partition table, and app images. The app checks the manifest, image sizes and SHA-256 hashes before flashing; the manifest is not a signed publisher identity.
 
 ## Flashing behavior
 
-The app filters to the board's native ESP32-S3 USB Serial/JTAG port, reads the chip and MAC from the ROM loader, then requires a separate user confirmation showing the detected target. It writes only the listed images at their declared offsets and never issues an erase-all operation. It uses the no-reset connect mode because this board's boot circuit has a specific physical flow.
+The browser filters device access through the Web Serial permission prompt. Firmware flashing uses the board's USB Serial/JTAG connection. The app first attempts automatic entry into download mode using the USB reset sequence. If that connection fails, keep the board powered on, short-press/release **BOOT**, then retry and select its download port. After writing, switch the board off and on to return to normal startup. Do not use the generic “hold BOOT while powering on” sequence. The app requires a separate confirmation after identifying the ESP32-S3 and reading its MAC address.
 
-For this board, keep it powered on and short-press/release **BOOT** to enter download mode. After writing, switch the board off and on to return to normal startup. Do not use the generic “hold BOOT while powering on” sequence. The desktop interface does not flash a connected board automatically.
+## Hardware validation boundary
 
-## Current hardware validation boundary
-
-The firmware can be built without connecting a board. No physical EasyInput device is available in this workspace session, so USB enumeration, Wi-Fi provisioning/recovery, PSRAM initialization, ADC voltage accuracy and sampling, power/charge detection, CPU/temperature readings, key/encoder polarity, BLE radio behavior, and flash/resume behavior still need a board-side check. The encoder direction is a project choice and should be checked against the actual knob. Shared-rail audio and LED behavior require separate electrical qualification before GPIO8 is enabled. Flash rates count SPI Flash API calls, CPU usage is inferred from idle-task runtime, and chip temperature comes from the ESP32-S3 internal sensor.
+No physical EasyInput device is available in this workspace session, so USB enumeration, Wi-Fi provisioning/recovery, PSRAM initialization, ADC voltage accuracy and sampling, power/charge detection, CPU/temperature readings, key/encoder polarity, BLE radio behavior, and flash/resume behavior still need a board-side check. The encoder direction is a project choice and should be checked against the actual knob. Shared-rail audio and LED behavior require separate electrical qualification before GPIO8 is enabled.
