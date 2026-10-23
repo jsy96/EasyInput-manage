@@ -54,7 +54,7 @@ def collect_flash_settings(build_dir: Path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--version", required=True, help="Firmware version stored in the local bundle")
-    parser.add_argument("--output", help="Package output folder; defaults to dist/firmware/<version>")
+    parser.add_argument("--output", help="Package output folder; defaults to release/firmware/<version>-v2-monitor")
     args = parser.parse_args()
 
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}", args.version):
@@ -72,7 +72,7 @@ def main():
 
     images = collect_images(build_dir)
     flash_settings = collect_flash_settings(build_dir)
-    output_dir = Path(args.output).resolve() if args.output else PROJECT.parents[1] / "dist" / "firmware" / args.version
+    output_dir = Path(args.output).resolve() if args.output else PROJECT.parents[1] / "release" / "firmware" / f"{args.version}-v2-monitor"
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_images = []
 

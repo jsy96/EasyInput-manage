@@ -41,7 +41,7 @@ button { color: inherit; }
 .eyebrow-line { display: inline-block; height: 1px; width: 18px; background: #3bb9c7; opacity: .8; }
 .topbar h1 { margin: 3px 0 0; color: #ebf2fa; font: 700 30px 'Manrope', sans-serif; letter-spacing: -.04em; }
 .topbar h1 span { color: #9aaabe; font-weight: 500; }
-.topbar-actions { display: flex; align-items: center; gap: 13px; }
+.topbar-actions { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 13px; }
 .button { height: 38px; padding: 0 15px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; border-radius: 8px; border: 1px solid transparent; font-size: 18px; font-weight: 600; cursor: pointer; transition: .17s ease; white-space: nowrap; }
 .button:disabled { opacity: .46; cursor: not-allowed; }
 .button-primary { color: #07151c; background: #6cd7dd; box-shadow: 0 5px 15px rgba(75, 202, 208, .1); }
@@ -97,6 +97,7 @@ button { color: inherit; }
 .card-connect-button:hover { color: #d8f5f4; border-color: rgba(112, 205, 212, .42); background: rgba(66, 164, 175, .18); }
 .card-connect-button:disabled { opacity: .55; cursor: wait; }
 .ble-notice { margin: 9px 0 0; color: #d6b985; font-size: 12px; line-height: 1.45; }
+.ble-select-button { margin-top: 8px; font-size: 12px; }
 .card-label { margin-top: 10px; color: #8798aa; font-size: 15px; }
 .status-value-row { display: flex; align-items: center; justify-content: space-between; margin-top: 4px; }
 .status-value-row strong { font: 600 24px 'Manrope', sans-serif; letter-spacing: -.03em; }
@@ -282,6 +283,9 @@ button { color: inherit; }
 .network-details strong { overflow-wrap: anywhere; color: #b1c1cf; font: 500 12px 'DM Mono', monospace; }
 .network-details .network-reason { grid-column: 1 / -1; padding: 8px 9px; border-radius: 6px; background: rgba(8, 17, 27, .22); }
 .wifi-config { padding-top: 13px; margin-top: 12px; border-top: 1px solid rgba(134, 156, 182, .09); }
+.wifi-monitor-heading { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.wifi-monitor-heading > span { font-size: 12px; white-space: nowrap; }
+.wifi-form-heading { margin-top: 14px; }
 .wifi-config label { display: flex; flex-direction: column; gap: 5px; margin-top: 10px; color: #72879b; font-size: 12px; }
 .wifi-config input { width: 100%; height: 33px; padding: 0 9px; border: 1px solid rgba(132, 155, 180, .14); border-radius: 6px; outline: 0; color: #c6d3df; background: rgba(7, 15, 24, .52); font-size: 13.5px; }
 .wifi-config input:focus { border-color: rgba(96, 201, 211, .48); box-shadow: 0 0 0 2px rgba(96, 201, 211, .07); }

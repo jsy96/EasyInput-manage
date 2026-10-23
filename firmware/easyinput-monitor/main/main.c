@@ -23,6 +23,7 @@
 #include "esp_event.h"
 #include "esp_flash.h"
 #include "esp_heap_caps.h"
+#include "esp_http_server.h"
 #include "esp_image_format.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -41,10 +42,13 @@
 #include "host/ble_att.h"
 #include "host/ble_gatt.h"
 #include "host/ble_hs.h"
+#include "host/ble_store.h"
 #include "host/ble_uuid.h"
 #include "os/os_mbuf.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
+
+void ble_store_config_init(void);
 
 #define PROTOCOL_VERSION 2
 #define KEY_COUNT 8
@@ -57,6 +61,8 @@
 #define WIFI_STARTED_BIT (1U << 0)
 #define WIFI_STOPPED_BIT (1U << 1)
 #define WIFI_TRANSITION_TIMEOUT_MS 3000
+#define WIFI_WS_MAX_CLIENTS 3
+#define WIFI_WS_PENDING_LIMIT 16
 
 static const char *TAG = "easyinput";
 static const gpio_num_t key_gpios[KEY_COUNT] = {2, 47, 38, 41, 1, 6, 7, 48};
@@ -67,8 +73,11 @@ static const gpio_num_t encoder_button_gpio = 18;
 static SemaphoreHandle_t usb_tx_mutex;
 static SemaphoreHandle_t ble_notify_tx_done;
 static QueueHandle_t ble_tx_queue;
-static QueueHandle_t ble_command_queue;
+static QueueHandle_t board_command_queue;
 static EventGroupHandle_t wifi_lifecycle_events;
+static httpd_handle_t wifi_websocket_server;
+static unsigned wifi_websocket_peers;
+static unsigned wifi_websocket_pending;
 static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
 static char wifi_state[16] = "disconnected";
 static char wifi_ssid[33] = {0};
@@ -172,6 +181,146 @@ typedef struct {
     int64_t changed_at_us;
 } debounced_input_t;
 
+static void wifi_websocket_broadcast(void *arg)
+{
+    char *line = arg;
+    int clients[WIFI_WS_MAX_CLIENTS];
+    size_t count = WIFI_WS_MAX_CLIENTS;
+    if (httpd_get_client_list(wifi_websocket_server, &count, clients) == ESP_OK) {
+        httpd_ws_frame_t frame = {.type = HTTPD_WS_TYPE_TEXT, .payload = (uint8_t *)line, .len = strlen(line)};
+        for (size_t i = 0; i < count; i++) {
+            if (httpd_ws_get_fd_info(wifi_websocket_server, clients[i]) != HTTPD_WS_CLIENT_WEBSOCKET ||
+                httpd_sess_get_ctx(wifi_websocket_server, clients[i]) == NULL) continue;
+            if (httpd_ws_send_frame_async(wifi_websocket_server, clients[i], &frame) != ESP_OK) {
+                (void)httpd_sess_trigger_close(wifi_websocket_server, clients[i]);
+            }
+        }
+    }
+    free(line);
+    portENTER_CRITICAL(&state_lock);
+    wifi_websocket_pending--;
+    portEXIT_CRITICAL(&state_lock);
+}
+
+static void queue_wifi_line(const char *line)
+{
+    if (wifi_websocket_server == NULL) return;
+    portENTER_CRITICAL(&state_lock);
+    const bool ready = wifi_websocket_peers > 0 && wifi_websocket_pending < WIFI_WS_PENDING_LIMIT;
+    if (ready) wifi_websocket_pending++;
+    portEXIT_CRITICAL(&state_lock);
+    if (!ready) return;
+
+    const size_t length = strlen(line);
+    char *copy = malloc(length + 2);
+    if (copy != NULL) {
+        memcpy(copy, line, length);
+        copy[length] = '\n';
+        copy[length + 1] = '\0';
+        // Queueing keeps network writes out of the input scanner and USB/BLE tasks.
+        if (httpd_queue_work(wifi_websocket_server, wifi_websocket_broadcast, copy) == ESP_OK) return;
+        free(copy);
+    }
+    portENTER_CRITICAL(&state_lock);
+    wifi_websocket_pending--;
+    portEXIT_CRITICAL(&state_lock);
+}
+
+static bool wifi_websocket_origin_allowed(httpd_req_t *request)
+{
+    char origin[96];
+    if (httpd_req_get_hdr_value_str(request, "Origin", origin, sizeof(origin)) != ESP_OK) return false;
+    const char *hosts[] = {"http://127.0.0.1", "http://localhost", "http://[::1]"};
+    for (size_t i = 0; i < sizeof(hosts) / sizeof(hosts[0]); i++) {
+        const size_t length = strlen(hosts[i]);
+        if (strncmp(origin, hosts[i], length) != 0) continue;
+        const char *suffix = origin + length;
+        if (*suffix == '\0') return true;
+        if (*suffix++ != ':' || *suffix == '\0') continue;
+        char *end;
+        const unsigned long port = strtoul(suffix, &end, 10);
+        if (*suffix >= '0' && *suffix <= '9' && *end == '\0' && port > 0 && port <= 65535) return true;
+    }
+    return false;
+}
+
+static void wifi_websocket_session_free(void *context)
+{
+    free(context);
+    portENTER_CRITICAL(&state_lock);
+    wifi_websocket_peers--;
+    portEXIT_CRITICAL(&state_lock);
+}
+
+static esp_err_t wifi_websocket_pre_handshake(httpd_req_t *request)
+{
+    if (wifi_websocket_origin_allowed(request)) return ESP_OK;
+    httpd_resp_set_status(request, "403 Forbidden");
+    (void)httpd_resp_sendstr(request, "Use the local EasyInput Studio page.");
+    return ESP_FAIL;
+}
+
+static esp_err_t wifi_websocket_post_handshake(httpd_req_t *request)
+{
+    request->sess_ctx = malloc(1);
+    if (request->sess_ctx == NULL) return ESP_ERR_NO_MEM;
+    request->free_ctx = wifi_websocket_session_free;
+    portENTER_CRITICAL(&state_lock);
+    wifi_websocket_peers++;
+    portEXIT_CRITICAL(&state_lock);
+    return ESP_OK;
+}
+
+static esp_err_t wifi_websocket_handler(httpd_req_t *request)
+{
+    char line[USB_LINE_MAX] = {0};
+    httpd_ws_frame_t frame = {0};
+    esp_err_t result = httpd_ws_recv_frame(request, &frame, 0);
+    if (result != ESP_OK) return result;
+    if (frame.type == HTTPD_WS_TYPE_PING || frame.type == HTTPD_WS_TYPE_PONG || frame.type == HTTPD_WS_TYPE_CLOSE) return ESP_OK;
+    if (frame.type != HTTPD_WS_TYPE_TEXT || !frame.final || frame.len == 0 || frame.len >= sizeof(line)) return ESP_FAIL;
+    frame.payload = (uint8_t *)line;
+    result = httpd_ws_recv_frame(request, &frame, sizeof(line) - 1);
+    if (result != ESP_OK) return result;
+
+    // Monitoring only: credentials and network changes require USB or encrypted BLE.
+    cJSON *command = cJSON_Parse(line);
+    const cJSON *protocol = cJSON_GetObjectItemCaseSensitive(command, "protocol");
+    const cJSON *action = cJSON_GetObjectItemCaseSensitive(command, "action");
+    const bool allowed = cJSON_IsNumber(protocol) && protocol->valueint == PROTOCOL_VERSION && cJSON_IsString(action) &&
+        (strcmp(action->valuestring, "hello.get") == 0 || strcmp(action->valuestring, "status.get") == 0);
+    cJSON_Delete(command);
+    result = allowed && xQueueSend(board_command_queue, line, 0) == pdTRUE ? ESP_OK : ESP_FAIL;
+    memset(line, 0, sizeof(line));
+    return result;
+}
+
+static void init_wifi_websocket(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_open_sockets = WIFI_WS_MAX_CLIENTS;
+    config.max_uri_handlers = 1;
+    config.stack_size = 6144;
+    config.send_wait_timeout = 1;
+    config.recv_wait_timeout = 1;
+    config.lru_purge_enable = true;
+    esp_err_t result = httpd_start(&wifi_websocket_server, &config);
+    if (result == ESP_OK) {
+        const httpd_uri_t endpoint = {
+            .uri = "/ws", .method = HTTP_GET, .handler = wifi_websocket_handler, .is_websocket = true,
+            .ws_pre_handshake_cb = wifi_websocket_pre_handshake,
+            .ws_post_handshake_cb = wifi_websocket_post_handshake,
+        };
+        result = httpd_register_uri_handler(wifi_websocket_server, &endpoint);
+        if (result != ESP_OK) {
+            (void)httpd_stop(wifi_websocket_server);
+            wifi_websocket_server = NULL;
+        }
+    }
+    if (result != ESP_OK) ESP_LOGE(TAG, "Wi-Fi monitoring server unavailable: %s", esp_err_to_name(result));
+    else ESP_LOGI(TAG, "Wi-Fi monitoring available at ws://<station-ip>/ws (local Studio origins)");
+}
+
 static void queue_ble_line(const char *line)
 {
     if (ble_tx_queue == NULL || line == NULL) return;
@@ -199,12 +348,13 @@ static void queue_ble_line(const char *line)
 static void send_line(const char *line)
 {
     if (line == NULL) return;
-    if (usb_tx_mutex != NULL && xSemaphoreTake(usb_tx_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    queue_ble_line(line);
+    queue_wifi_line(line);
+    if (usb_serial_jtag_is_connected() && usb_tx_mutex != NULL && xSemaphoreTake(usb_tx_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         usb_serial_jtag_write_bytes(line, strlen(line), pdMS_TO_TICKS(80));
         usb_serial_jtag_write_bytes("\n", 1, pdMS_TO_TICKS(80));
         xSemaphoreGive(usb_tx_mutex);
     }
-    queue_ble_line(line);
 }
 
 static bool ble_frame_is_current(const ble_tx_frame_t *frame)
@@ -825,7 +975,10 @@ static void handle_command(const char *line)
         return;
     }
 
-    if (strcmp(action->valuestring, "status.get") == 0) {
+    if (strcmp(action->valuestring, "hello.get") == 0) {
+        emit_hello();
+        emit_status();
+    } else if (strcmp(action->valuestring, "status.get") == 0) {
         emit_status();
     } else if (strcmp(action->valuestring, "wifi.configure") == 0) {
         const cJSON *ssid = cJSON_GetObjectItemCaseSensitive(command, "ssid");
@@ -888,7 +1041,7 @@ static int ble_command_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         if (byte == '\n') {
             if (ble_command_length > 0) {
                 ble_command_buffer[ble_command_length] = '\0';
-                if (ble_command_queue == NULL || xQueueSend(ble_command_queue, ble_command_buffer, 0) != pdTRUE) {
+                if (board_command_queue == NULL || xQueueSend(board_command_queue, ble_command_buffer, 0) != pdTRUE) {
                     memset(ble_command_buffer, 0, sizeof(ble_command_buffer));
                     ble_command_length = 0;
                     memset(chunk, 0, sizeof(chunk));
@@ -919,7 +1072,7 @@ static void usb_task(void *arg)
     char ble_line[USB_LINE_MAX];
     size_t line_length = 0;
     while (true) {
-        if (ble_command_queue != NULL && xQueueReceive(ble_command_queue, ble_line, 0) == pdTRUE) {
+        if (board_command_queue != NULL && xQueueReceive(board_command_queue, ble_line, 0) == pdTRUE) {
             handle_command(ble_line);
             memset(ble_line, 0, sizeof(ble_line));
         }
@@ -1209,10 +1362,13 @@ static void init_ble_monitor(void)
     }
     ble_hs_cfg.sync_cb = ble_sync_handler;
     ble_hs_cfg.reset_cb = ble_reset_handler;
+    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
     ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
-    ble_hs_cfg.sm_bonding = 0;
+    ble_hs_cfg.sm_bonding = 1;
     ble_hs_cfg.sm_mitm = 0;
     ble_hs_cfg.sm_sc = 1;
+    ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
     ble_svc_gap_init();
     ble_svc_gatt_init();
     ESP_ERROR_CHECK(ble_svc_gap_device_name_set("EasyInput"));
@@ -1228,6 +1384,7 @@ static void init_ble_monitor(void)
         strlcpy(ble_state, "disabled", sizeof(ble_state));
         return;
     }
+    ble_store_config_init();
     nimble_port_freertos_init(ble_host_task);
 }
 
@@ -1256,9 +1413,9 @@ void app_main(void)
         return;
     }
     ble_tx_queue = xQueueCreate(BLE_TX_QUEUE_DEPTH, sizeof(ble_tx_frame_t));
-    ble_command_queue = xQueueCreate(4, USB_LINE_MAX);
+    board_command_queue = xQueueCreate(4, USB_LINE_MAX);
     ble_notify_tx_done = xSemaphoreCreateBinary();
-    if (ble_tx_queue == NULL || ble_command_queue == NULL || ble_notify_tx_done == NULL) {
+    if (ble_tx_queue == NULL || board_command_queue == NULL || ble_notify_tx_done == NULL) {
         ESP_LOGE(TAG, "BLE transport queue allocation failed");
         return;
     }
@@ -1271,6 +1428,7 @@ void app_main(void)
 
     configure_system_sensors();
     init_wifi_monitor();
+    init_wifi_websocket();
     init_ble_monitor();
     xTaskCreate(ble_tx_task, "ble_tx", 4096, NULL, 6, NULL);
     emit_hello();

@@ -21,11 +21,13 @@ declare global {
   }
 
   interface EasyInputBluetoothDevice extends EventTarget {
+    readonly id: string
     readonly name: string | null
     readonly gatt: EasyInputBluetoothServer | null
   }
 
-  interface EasyInputBluetooth {
+  interface EasyInputBluetooth extends EventTarget {
+    getDevices?(): Promise<EasyInputBluetoothDevice[]>
     requestDevice(options: {
       filters: Array<{ namePrefix: string }>
       optionalServices: string[]
