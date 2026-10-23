@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "cJSON.h"
+#include "lights.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/idf_additions.h"
@@ -411,7 +412,7 @@ static void ble_tx_task(void *arg)
     }
 }
 
-static void send_result(const char *action, bool ok, const char *message)
+static void send_result_with_id(const char *action, bool ok, const char *message, const char *request_id)
 {
     cJSON *root = cJSON_CreateObject();
     if (root == NULL) return;
@@ -419,6 +420,7 @@ static void send_result(const char *action, bool ok, const char *message)
     cJSON_AddNumberToObject(root, "protocol", PROTOCOL_VERSION);
     cJSON_AddStringToObject(root, "action", action);
     cJSON_AddBoolToObject(root, "ok", ok);
+    if (request_id != NULL) cJSON_AddStringToObject(root, "request_id", request_id);
     if (message != NULL) cJSON_AddStringToObject(root, "message", message);
     char *line = cJSON_PrintUnformatted(root);
     if (line != NULL) {
@@ -426,6 +428,11 @@ static void send_result(const char *action, bool ok, const char *message)
         cJSON_free(line);
     }
     cJSON_Delete(root);
+}
+
+static void send_result(const char *action, bool ok, const char *message)
+{
+    send_result_with_id(action, ok, message, NULL);
 }
 
 static void clear_command_password(cJSON *command)
@@ -638,12 +645,30 @@ static void emit_status(void)
     cJSON_AddStringToObject(ble, "state", ble_state_copy);
     cJSON_AddStringToObject(ble, "name", "EasyInput");
     cJSON_AddNumberToObject(ble, "peers", ble_peers_copy);
+    lights_snapshot_t light_state;
+    lights_get_snapshot(&light_state);
     cJSON *peripherals = cJSON_AddObjectToObject(root, "peripherals");
-    cJSON_AddStringToObject(peripherals, "shared_rail", "off");
+    cJSON_AddStringToObject(peripherals, "shared_rail", light_state.rail_on ? "on" : "off");
     cJSON *lights = cJSON_AddObjectToObject(root, "lights");
-    cJSON_AddStringToObject(lights, "status_led", "off");
+    cJSON_AddStringToObject(lights, "status_led", light_state.ready ? (light_state.status_brightness ? "on" : "off") : "unknown");
     cJSON *pixels = cJSON_AddArrayToObject(lights, "pixels");
-    for (int index = 0; index < 5; index++) cJSON_AddItemToArray(pixels, cJSON_CreateString("off"));
+    cJSON *control = cJSON_AddObjectToObject(lights, "control");
+    cJSON_AddBoolToObject(control, "ready", light_state.ready);
+    cJSON_AddNumberToObject(control, "status_led_brightness", light_state.status_brightness);
+    if (light_state.error != ESP_OK) cJSON_AddStringToObject(control, "error", esp_err_to_name(light_state.error));
+    cJSON *settings = cJSON_AddArrayToObject(control, "pixels");
+    for (int index = 0; index < LIGHT_PIXEL_COUNT; index++) {
+        const light_pixel_t *pixel = &light_state.pixels[index];
+        const bool lit = light_state.rail_on && lights_pixel_is_lit(pixel);
+        cJSON_AddItemToArray(pixels, cJSON_CreateString(!light_state.ready && light_state.rail_on ? "unknown" : lit ? "on" : "off"));
+        cJSON *setting = cJSON_CreateObject();
+        char color[8];
+        snprintf(color, sizeof(color), "#%06lX", (unsigned long)pixel->rgb);
+        cJSON_AddStringToObject(setting, "color", color);
+        cJSON_AddNumberToObject(setting, "brightness", pixel->brightness);
+        cJSON_AddBoolToObject(setting, "on", pixel->on);
+        cJSON_AddItemToArray(settings, setting);
+    }
     cJSON *speaker = cJSON_AddObjectToObject(root, "speaker");
     cJSON_AddStringToObject(speaker, "state", "unavailable");
     cJSON *microphone = cJSON_AddObjectToObject(root, "microphone");
@@ -963,6 +988,64 @@ static void run_wifi_command(const char *action, wifi_config_t *config, const ch
     }
 }
 
+static bool command_integer(const cJSON *command, const char *name, int maximum, int *value)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(command, name);
+    if (!cJSON_IsNumber(item) || !(item->valuedouble >= 0 && item->valuedouble <= maximum) || item->valuedouble != item->valueint) return false;
+    *value = item->valueint;
+    return true;
+}
+
+static bool handle_light_command(const cJSON *command, const char *action)
+{
+    const bool single = strcmp(action, "lights.pixel.set") == 0;
+    const bool all = strcmp(action, "lights.all.set") == 0;
+    const bool off = strcmp(action, "lights.off") == 0;
+    const bool indicator = strcmp(action, "lights.status.set") == 0;
+    const bool power = strcmp(action, "peripherals.power.set") == 0;
+    if (!single && !all && !off && !indicator && !power) return false;
+    const cJSON *id = cJSON_GetObjectItemCaseSensitive(command, "request_id");
+    if (id && (!cJSON_IsString(id) || strlen(id->valuestring) == 0 || strlen(id->valuestring) > 64)) {
+        send_result(action, false, "request_id 必须为 1～64 字节字符串。");
+        return true;
+    }
+    const char *request_id = id ? id->valuestring : NULL;
+    esp_err_t result = ESP_ERR_INVALID_ARG;
+    int brightness = 0;
+    if (off) {
+        result = lights_off();
+    } else if (power) {
+        const cJSON *on = cJSON_GetObjectItemCaseSensitive(command, "on");
+        if (cJSON_IsBool(on)) result = lights_set_power(cJSON_IsTrue(on));
+    } else if (command_integer(command, "brightness", 100, &brightness)) {
+        if (indicator) {
+            result = lights_set_status(brightness);
+        } else {
+            const cJSON *color = cJSON_GetObjectItemCaseSensitive(command, "color");
+            const cJSON *on = cJSON_GetObjectItemCaseSensitive(command, "on");
+            int index = 0;
+            bool valid_color = cJSON_IsString(color) && strlen(color->valuestring) == 7 && color->valuestring[0] == '#';
+            if (valid_color) {
+                for (int i = 1; i < 7; i++) {
+                    const char ch = color->valuestring[i];
+                    if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F'))) valid_color = false;
+                }
+            }
+            if (valid_color && cJSON_IsBool(on) && (!single || command_integer(command, "index", LIGHT_PIXEL_COUNT - 1, &index))) {
+                const light_pixel_t pixel = {
+                    .rgb = strtoul(color->valuestring + 1, NULL, 16), .brightness = brightness, .on = cJSON_IsTrue(on),
+                };
+                result = single ? lights_set_pixel(index, &pixel) : lights_set_all(&pixel);
+            }
+        }
+    }
+    // Broadcast the committed state before acknowledging the command.
+    emit_status();
+    const char *message = result == ESP_OK ? "设置已应用。" : result == ESP_ERR_INVALID_ARG ? "参数无效：灯珠编号 0～4，颜色 #RRGGBB，亮度整数 0～100，开关为布尔值。" : esp_err_to_name(result);
+    send_result_with_id(action, result == ESP_OK, message, request_id);
+    return true;
+}
+
 static void handle_command(const char *line)
 {
     cJSON *command = cJSON_Parse(line);
@@ -980,6 +1063,8 @@ static void handle_command(const char *line)
         emit_status();
     } else if (strcmp(action->valuestring, "status.get") == 0) {
         emit_status();
+    } else if (handle_light_command(command, action->valuestring)) {
+        // Light commands share the serialized USB/BLE command task.
     } else if (strcmp(action->valuestring, "wifi.configure") == 0) {
         const cJSON *ssid = cJSON_GetObjectItemCaseSensitive(command, "ssid");
         cJSON *password = cJSON_GetObjectItemCaseSensitive(command, "password");
@@ -1405,6 +1490,8 @@ static bool init_nvs_safely(void)
 void app_main(void)
 {
     configure_board_gpio();
+    const esp_err_t light_result = lights_init();
+    if (light_result != ESP_OK) ESP_LOGE(TAG, "Light control init failed: %s", esp_err_to_name(light_result));
     if (!init_nvs_safely()) return;
 
     usb_tx_mutex = xSemaphoreCreateMutex();
@@ -1435,5 +1522,5 @@ void app_main(void)
     xTaskCreate(input_task, "input_scan", 4096, NULL, 8, NULL);
     xTaskCreate(usb_task, "usb_command", 6144, NULL, 6, NULL);
     xTaskCreate(status_task, "status_stream", 6144, NULL, 5, NULL);
-    ESP_LOGI(TAG, "EasyInput monitor firmware started; GPIO8 shared rail stays off pending board qualification");
+    ESP_LOGI(TAG, "EasyInput monitor firmware started; lights controllable, shared rail off until requested");
 }

@@ -73,12 +73,41 @@ Studio learns and remembers a local IPv4 address from USB/BLE status. A manual c
 
 The computer and board must share a reachable LAN. The current client requires an HTTP loopback Studio page, such as `http://127.0.0.1:5173`; HTTPS pages display a clear limitation instead of repeatedly attempting a blocked insecure connection. Browser local-network permission and router client isolation can also affect connectivity. The battery must keep the board powered after unplugging USB.
 
+## Light control (firmware 0.1.5+)
+
+Protocol stays at version 2. Existing `lights.status_led`, `lights.pixels` and `peripherals.shared_rail` fields remain compatible. New firmware additionally includes this `lights.control` object in every status frame:
+
+```json
+{"ready":true,"status_led_brightness":0,"pixels":[{"color":"#FF0000","brightness":20,"on":true},{"color":"#FFFFFF","brightness":20,"on":false},{"color":"#FFFFFF","brightness":20,"on":false},{"color":"#FFFFFF","brightness":20,"on":false},{"color":"#FFFFFF","brightness":20,"on":false}]}
+```
+
+The five settings use 0-based wire order; Studio labels them 1–5. Colors use `#RRGGBB`, brightness is an integer 0–100, and `on` is boolean. Legacy `pixels` report emitted on/off state after rail gating and RGB scaling; a black color, zero brightness, or channels rounded to zero can be off even when the enable flag is true. Control values describe the last committed firmware settings, not optical or electrical sensor feedback. Without this object Studio requires a firmware upgrade; `ready:false` disables control and an optional string `error` names the driver error. Driver failures attempt to stop RMT and safely power down, mark affected output state unknown if power remains on, and require reboot before further control.
+
+Send light commands only through USB or encrypted BLE. Wi-Fi accepts only its existing monitoring requests. Studio sends one operation at a time, prefers healthy USB then BLE, and does not replay failed writes. Each UI operation has a unique ASCII UUID `request_id` (firmware accepts strings of 1–64 UTF-8 bytes); firmware echoes it with the same action in the broadcast result. Matching both fields prevents duplicate transport results or another client's operation from completing the wrong UI request. Requests without an ID are allowed for manual clients; results omit it. Status is emitted before the result. On timeout, check the current status before retrying because the write may already have taken effect.
+
+```json
+{"type":"command","protocol":2,"action":"lights.pixel.set","index":0,"color":"#FF0000","brightness":20,"on":true,"request_id":"example-1"}
+{"type":"command","protocol":2,"action":"lights.all.set","color":"#0088FF","brightness":20,"on":true,"request_id":"example-2"}
+{"type":"command","protocol":2,"action":"lights.off","request_id":"example-3"}
+{"type":"command","protocol":2,"action":"lights.status.set","brightness":30,"request_id":"example-4"}
+{"type":"command","protocol":2,"action":"peripherals.power.set","on":false,"request_id":"example-5"}
+{"type":"result","protocol":2,"action":"lights.pixel.set","request_id":"example-1","ok":true,"message":"设置已应用。"}
+```
+
+Pixel set changes exactly one setting; all set copies one setting to five pixels. `lights.off` clears only enable flags and sends a black frame when powered. It does not switch off GPIO8 or alter per-pixel colors/brightness. Indicator brightness 0 switches GPIO42 off; positive values set its independent 5 kHz/13-bit PWM output. Invalid indexes, colors, brightness values or boolean flags are rejected before changing output.
+
+The shared rail defaults off. A nonzero emitted pixel automatically enables it. At cold start, GPIO8 and downstream command outputs are latched low before output direction is enabled; GPIO11 stays disabled/floating without pulls. On every rail enable the firmware restores downstream safe levels, raises GPIO8, waits `SHARED_RAIL_SETTLE_MS=100` plus one scheduler tick, then creates/enables RMT and sends a black frame before colors. This is a **provisional project bring-up wait**, not a measurement or proof that all components/batches have stabilized. The board exposes no rail-ready feedback in this implementation. Qualify the settling waveform and voltage/DIN margins on the actual assembled board before accepting the result.
+
+RMT transmits GRB at 800 kbit/s (T0H/T0L 0.40/0.85 µs, T1H/T1L 0.80/0.45 µs) plus a 300 µs low latch. The entire five-pixel frame and end marker fit in RMT memory. Each channel is scaled with `(value * brightness + 50) / 100` when enabled. Shared shutdown sends black, stops/detaches RMT, restores GPIO9/10/12/13/14/15 low and GPIO11 disabled/floating, then lowers GPIO8. Pixel enable flags are cleared; powering back on alone does not restore previously lit pixels. The independent GPIO42 PWM is unaffected. One mutex serializes driver operations and status snapshots. Audio has no active I2S consumers; future audio drivers must coordinate with this same rail ownership/stop gate before using or releasing GPIO8.
+
+Settings are volatile and reset on reboot. Disconnecting a monitoring transport does not switch the lights off. Microphone/speaker remain `unavailable` regardless of shared-power state until audio drivers are implemented and qualified.
+
 ## Hardware truth and limits
 
 - The board has one native USB-C port. The app filters for Espressif USB Serial/JTAG (`VID 303A`, `PID 1001`) and asks the user to select a port; it does not infer identity from a path such as `/dev/cu.usbmodem…`.
 - Wi-Fi uses the ESP32-S3 2.4 GHz station radio. Disconnect reason codes come from ESP-IDF; the app names common authentication, access point, beacon, and handshake failures and retains the numeric code for other reasons.
 - BLE advertises as `EasyInput`, reports link state, and exposes the Studio GATT service documented above. BLE command writes require an encrypted link.
-- GPIO8 remains low. The hardware knowledge pack has no qualified shared-rail settling condition, so LEDs on GPIO12, microphone input on GPIO11, and speaker output on GPIO15 are reported unavailable/off. The independent status LED GPIO42 is held low.
+- GPIO8 defaults low, and 0.1.5+ implements explicit/automatic light power control with the provisional project timing described above. Rail settling and 3.3 V LED-DIN margins have not been electrically qualified. GPIO12 drives five serial GRB pixels; GPIO42 is an independent green status LED. Audio drivers remain unavailable.
 - The speaker has no physical activity feedback pin. A future status can only report firmware playback state unless hardware feedback is added.
 - Battery reporting is limited to calibrated voltage and board power/charge pins. There is no qualified battery chemistry or fuel gauge for a remaining-capacity percentage.
 - PSRAM initialization, ADC voltage accuracy and sampling window, GPIO power/charge polarity, Wi-Fi recovery behavior, and CPU/temperature measurements still need verification on the assembled board.

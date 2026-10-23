@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { describeInputEvent, parseBoardMessage } from './protocol'
+import { describeInputEvent, lightResultMatches, parseBoardMessage, pixelIsLit } from './protocol'
 
 describe('board protocol', () => {
   it('accepts complete status frames for protocol v2 and rejects old or unknown versions', () => {
@@ -15,6 +15,22 @@ describe('board protocol', () => {
       power: {},
     }
     expect(parseBoardMessage(JSON.stringify(status))).toEqual(status)
+    const control = {
+      ready: true, status_led_brightness: 25,
+      pixels: Array.from({ length: 5 }, () => ({ color: '#fF8000', brightness: 20, on: true })),
+    }
+    const extended = { ...status, lights: { ...status.lights, control } }
+    expect(parseBoardMessage(JSON.stringify(extended))).toEqual(extended)
+    for (const invalid of [
+      { ...control, ready: 'yes' },
+      { ...control, status_led_brightness: 101 },
+      { ...control, status_led_brightness: -1 },
+      { ...control, pixels: control.pixels.slice(1) },
+      { ...control, pixels: [...control.pixels.slice(1), { color: 'red', brightness: 20, on: true }] },
+      { ...control, pixels: [...control.pixels.slice(1), { color: '#ffffff', brightness: 1.5, on: true }] },
+      { ...control, pixels: [...control.pixels.slice(1), { color: '#ffffff', brightness: 20, on: 'on' }] },
+    ]) expect(parseBoardMessage(JSON.stringify({ ...extended, lights: { ...status.lights, control: invalid } }))).toBeNull()
+    expect(parseBoardMessage(JSON.stringify({ ...extended, lights: { ...status.lights, control: { ...control, ready: false, error: 'ESP_ERR_TIMEOUT' } } }))).not.toBeNull()
     expect(parseBoardMessage(JSON.stringify({ ...status, protocol: 1 }))).toBeNull()
     expect(parseBoardMessage(JSON.stringify({ ...status, protocol: 3 }))).toBeNull()
     expect(parseBoardMessage(JSON.stringify({ ...status, storage: { ...status.storage, partitions: [{ label: 'bad', address: 'unknown' }] } }))).toBeNull()
@@ -27,5 +43,27 @@ describe('board protocol', () => {
 
   it('turns encoder deltas into readable event text', () => {
     expect(describeInputEvent({ type: 'event', protocol: 2, source: 'encoder', action: 'rotate', delta: -1, uptime_ms: 10 })).toBe('旋钮 -1')
+  })
+
+  it('matches only the action and request ID of the outstanding light operation', () => {
+    const pending = { action: 'lights.pixel.set', requestId: 'operation-2' }
+    const result = { type: 'result' as const, protocol: 2, action: pending.action, ok: true, request_id: pending.requestId }
+    expect(parseBoardMessage(JSON.stringify(result))).toEqual(result)
+    expect(lightResultMatches(result, pending)).toBe(true)
+    expect(lightResultMatches({ ...result, request_id: 'operation-1' }, pending)).toBe(false)
+    expect(lightResultMatches({ ...result, action: 'lights.all.set' }, pending)).toBe(false)
+    expect(lightResultMatches({ ...result, request_id: undefined }, pending)).toBe(false)
+    expect(lightResultMatches(result, null)).toBe(false)
+    expect(parseBoardMessage(JSON.stringify({ ...result, request_id: 12 }))).toBeNull()
+    expect(parseBoardMessage(JSON.stringify({ ...result, request_id: '' }))).toBeNull()
+  })
+
+  it('treats disabled, black and sub-byte dim pixels as off after scaling', () => {
+    expect(pixelIsLit({ color: '#ff0000', brightness: 20, on: true })).toBe(true)
+    expect(pixelIsLit({ color: '#ff0000', brightness: 20, on: false })).toBe(false)
+    expect(pixelIsLit({ color: '#ff0000', brightness: 0, on: true })).toBe(false)
+    expect(pixelIsLit({ color: '#000000', brightness: 100, on: true })).toBe(false)
+    expect(pixelIsLit({ color: '#010101', brightness: 20, on: true })).toBe(false)
+    expect(pixelIsLit({ color: '#000001', brightness: 50, on: true })).toBe(true)
   })
 })

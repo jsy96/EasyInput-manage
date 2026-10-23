@@ -11,8 +11,8 @@ import { BluetoothConnection } from './services/bluetooth'
 import { WifiConnection } from './services/wifi'
 import { BoardConnections } from '@shared/connections'
 import type { BoardTransport } from '@shared/connections'
-import type { BoardHello, BoardMessage, BoardResult, BoardStatus, InputEvent } from '@shared/protocol'
-import { describeInputEvent, PROTOCOL_VERSION } from '@shared/protocol'
+import type { BoardHello, BoardMessage, BoardResult, BoardStatus, InputEvent, LightCommand, PixelSetting } from '@shared/protocol'
+import { describeInputEvent, lightResultMatches, pixelIsLit, PROTOCOL_VERSION } from '@shared/protocol'
 
 const FLASH_BYTES = 16 * 1024 * 1024
 
@@ -169,6 +169,13 @@ export default function App(): React.JSX.Element {
   const [wifiPassword, setWifiPassword] = useState('')
   const [wifiEditing, setWifiEditing] = useState(false)
   const [wifiBusy, setWifiBusy] = useState(false)
+  const [lightBusy, setLightBusy] = useState(false)
+  const [lightResult, setLightResult] = useState<BoardResult | null>(null)
+  const [selectedPixel, setSelectedPixel] = useState(0)
+  const [pixelDraft, setPixelDraft] = useState<PixelSetting>({ color: '#ffffff', brightness: 20, on: true })
+  const [pixelDirty, setPixelDirty] = useState(false)
+  const [indicatorDraft, setIndicatorDraft] = useState(0)
+  const [indicatorDirty, setIndicatorDirty] = useState(false)
   const [bleConnected, setBleConnected] = useState(false)
   const [bleConnecting, setBleConnecting] = useState(false)
   const [bleRetrying, setBleRetrying] = useState(false)
@@ -201,6 +208,8 @@ export default function App(): React.JSX.Element {
   const pendingWifiActionRef = useRef<string | null>(null)
   const pendingWifiTransportRef = useRef<BoardTransport | null>(null)
   const wifiTimeoutRef = useRef<number | null>(null)
+  const pendingLightRef = useRef<{ action: string; requestId: string } | null>(null)
+  const lightTimeoutRef = useRef<number | null>(null)
   const flashFolderRef = useRef<HTMLInputElement | null>(null)
   const wifiSsidRef = useRef<HTMLInputElement | null>(null)
   const eventCounter = useRef(0)
@@ -215,7 +224,7 @@ export default function App(): React.JSX.Element {
   const currentStatus = status ?? emptyStatus
   const dataTransportOpen = serialOpen || bleConnected || wifiMonitorConnected || wifiMonitorConnecting
   const deviceBusy = flashing || flashPreparing || flashCandidate !== null
-  const updateBlocked = dataTransportOpen || serialConnecting || bleConnecting || wifiBusy || flashing || flashPreparing || flashCandidate !== null
+  const updateBlocked = dataTransportOpen || serialConnecting || bleConnecting || wifiBusy || lightBusy || flashing || flashPreparing || flashCandidate !== null
   const usbProtocolOnline = serialOpen && connectionsRef.current.isOnline('usb', clock)
   const bleProtocolOnline = bleConnected && connectionsRef.current.isOnline('ble', clock)
   const wifiProtocolOnline = wifiMonitorConnected && connectionsRef.current.isOnline('wifi', clock)
@@ -227,8 +236,23 @@ export default function App(): React.JSX.Element {
   const bleStateClass = bleConnecting || bleRetrying || (bleConnected && !bleProtocolOnline) ? 'is-warn'
     : bleConnected ? 'is-live' : demoMode ? stateClass(currentStatus.ble.state) : 'is-muted'
   const micLevel = Math.max(0, Math.min(100, Math.round(((currentStatus.microphone.rms ?? 0) / 32768) * 100)))
+  const lightControl = currentStatus.lights.control
+  const lightsEditable = Boolean(lightControl?.ready && (demoMode || wifiConfigOnline) && !deviceBusy && !wifiBusy && !lightBusy)
+  const selectedSetting = lightControl?.pixels[selectedPixel]
 
   const latestEvents = useMemo(() => events.slice(0, 28), [events])
+
+  useEffect(() => {
+    if (!pixelDirty && selectedSetting) setPixelDraft({ ...selectedSetting })
+  }, [selectedPixel, selectedSetting?.color, selectedSetting?.brightness, selectedSetting?.on, pixelDirty])
+
+  useEffect(() => {
+    if (!indicatorDirty && lightControl) setIndicatorDraft(lightControl.status_led_brightness)
+  }, [lightControl?.status_led_brightness, indicatorDirty])
+
+  useEffect(() => () => {
+    if (lightTimeoutRef.current !== null) window.clearTimeout(lightTimeoutRef.current)
+  }, [])
 
   useEffect(() => {
     const connection = new BluetoothConnection({
@@ -296,9 +320,12 @@ export default function App(): React.JSX.Element {
       wifi: { state: 'connected', ssid: 'Studio-WiFi', rssi: -48, channel: 6, configured: true, ip: '192.168.1.82', netmask: '255.255.255.0', gateway: '192.168.1.1', dns: '192.168.1.1', disconnect_code: 0, disconnects: 1, retries: 1 },
       ble: { state: 'advertising', name: 'EasyInput' },
       peripherals: { shared_rail: 'on' },
-      lights: { status_led: 'on', pixels: ['on', 'off', 'on', 'off', 'off'] },
-      speaker: { state: 'idle', volume: 45 },
-      microphone: { state: 'active', rms: 5700, vad: true },
+      lights: {
+        status_led: 'on', pixels: ['on', 'off', 'on', 'off', 'off'],
+        control: { ready: true, status_led_brightness: 20, pixels: Array.from({ length: 5 }, (_, index) => ({ color: index === 2 ? '#49aaff' : '#ffffff', brightness: 20, on: index === 0 || index === 2 })) },
+      },
+      speaker: { state: 'unavailable' },
+      microphone: { state: 'unavailable', rms: 0, vad: false },
       cpu: { frequency_mhz: 160, usage_percent: [18, 11], temperature_c: 43.5 },
       memory: {
         internal: { total_bytes: 328000, free_bytes: 176000, minimum_free_bytes: 148000, largest_block_bytes: 132000 },
@@ -349,6 +376,10 @@ export default function App(): React.JSX.Element {
     setWifiEditing(false)
     setWifiPassword('')
     finishWifiCommand()
+    finishLightCommand()
+    setLightResult(null)
+    setPixelDirty(false)
+    setIndicatorDirty(false)
     setDemoLastSeen('')
     setDemoLastSeenAt(null)
     setEvents([])
@@ -364,6 +395,14 @@ export default function App(): React.JSX.Element {
   function handleBoardMessage(transport: BoardTransport, message: BoardMessage): void {
     if (transport !== 'wifi' && message.type === 'status' && message.wifi.state === 'connected' && message.wifi.ip) {
       wifiConnectionRef.current?.rememberAddress(message.wifi.ip)
+    }
+    if (message.type === 'result' && lightResultMatches(message, pendingLightRef.current)) {
+      setLightResult(message)
+      if (message.ok) {
+        if (message.action !== 'lights.status.set') setPixelDirty(false)
+        if (message.action === 'lights.status.set') setIndicatorDirty(false)
+      }
+      finishLightCommand()
     }
     if (message.type === 'result' && message.action === pendingWifiActionRef.current && transport === pendingWifiTransportRef.current) {
       setWifiResult(message)
@@ -514,7 +553,7 @@ export default function App(): React.JSX.Element {
     const port = portRef.current
     const transport = connectionsRef.current.commandTransport(Date.now())
     const useBle = transport === 'ble'
-    if (!transport || (!useBle && !port?.writable) || (useBle && !bleConnectionRef.current?.writable) || deviceBusy || pendingWifiActionRef.current) return
+    if (!transport || (!useBle && !port?.writable) || (useBle && !bleConnectionRef.current?.writable) || deviceBusy || pendingWifiActionRef.current || pendingLightRef.current) return
     if (action === 'wifi.configure') {
       const ssid = wifiSsid
       const password = wifiPassword
@@ -564,6 +603,67 @@ export default function App(): React.JSX.Element {
       finishWifiCommand()
       if (action === 'wifi.configure') setWifiPassword('')
       setWifiResult({ type: 'result', protocol: PROTOCOL_VERSION, action, ok: false, message: useBle ? '蓝牙命令发送失败，请确认连接仍有效。' : 'USB 命令发送失败，请确认串口仍连接。' })
+    }
+  }
+
+  function finishLightCommand(): void {
+    if (lightTimeoutRef.current !== null) window.clearTimeout(lightTimeoutRef.current)
+    lightTimeoutRef.current = null
+    pendingLightRef.current = null
+    setLightBusy(false)
+  }
+
+  async function sendLightCommand(command: LightCommand): Promise<void> {
+    if (!lightsEditable || pendingLightRef.current || pendingWifiActionRef.current) return
+    setLightResult(null)
+    if (demoMode) {
+      setDemoStatus((previous) => {
+        if (!previous?.lights.control) return previous
+        const next = structuredClone(previous)
+        const control = next.lights.control!
+        if (command.action === 'lights.pixel.set') control.pixels[command.index] = { color: command.color, brightness: command.brightness, on: command.on }
+        if (command.action === 'lights.all.set') control.pixels = control.pixels.map(() => ({ color: command.color, brightness: command.brightness, on: command.on }))
+        if (command.action === 'lights.off') control.pixels.forEach((pixel) => { pixel.on = false })
+        if (command.action === 'lights.status.set') control.status_led_brightness = command.brightness
+        if (command.action === 'peripherals.power.set') {
+          next.peripherals.shared_rail = command.on ? 'on' : 'off'
+          if (!command.on) control.pixels.forEach((pixel) => { pixel.on = false })
+        } else if (command.action !== 'lights.status.set' && control.pixels.some(pixelIsLit)) next.peripherals.shared_rail = 'on'
+        next.lights.pixels = control.pixels.map((pixel) => next.peripherals.shared_rail === 'on' && pixelIsLit(pixel) ? 'on' : 'off')
+        next.lights.status_led = control.status_led_brightness > 0 ? 'on' : 'off'
+        return next
+      })
+      setPixelDirty(false)
+      setIndicatorDirty(false)
+      setLightResult({ type: 'result', protocol: PROTOCOL_VERSION, action: command.action, ok: true, message: '演示设置已更新。' })
+      return
+    }
+    const transport = connectionsRef.current.commandTransport(Date.now())
+    if (!transport) return
+    const requestId = crypto.randomUUID()
+    pendingLightRef.current = { action: command.action, requestId }
+    setLightBusy(true)
+    lightTimeoutRef.current = window.setTimeout(() => {
+      finishLightCommand()
+      setLightResult({ type: 'result', protocol: PROTOCOL_VERSION, action: command.action, ok: false, message: '等待响应超时，设置可能已生效，请查看最新状态后重试。' })
+    }, 12000)
+    try {
+      const frame = new TextEncoder().encode(`${JSON.stringify({ type: 'command', protocol: PROTOCOL_VERSION, ...command, request_id: requestId })}\n`)
+      if (transport === 'ble') {
+        const connection = bleConnectionRef.current
+        if (!connection?.writable) throw new Error('蓝牙命令通道已断开。')
+        await connection.write(frame)
+      } else {
+        const writer = portRef.current?.writable?.getWriter()
+        if (!writer) throw new Error('USB 命令通道已断开。')
+        try { await writer.write(frame) } finally { writer.releaseLock() }
+      }
+    } catch {
+      // Do not replay an uncertain write through another transport.
+      if (pendingLightRef.current?.requestId !== requestId) return
+      finishLightCommand()
+      setLightResult({ type: 'result', protocol: PROTOCOL_VERSION, action: command.action, ok: false, message: '发送失败，设置可能已生效，请检查连接和最新状态后重试。' })
+      if (transport === 'ble') bleConnectionRef.current?.recover()
     }
   }
 
@@ -836,18 +936,44 @@ export default function App(): React.JSX.Element {
                 </div>
                 <div className="led-row">
                   <div className="led-title"><span className="led-symbol"><Lightbulb size={16} /></span><div><strong>WS2812 灯带</strong><small>5 颗串联 · GPIO12</small></div></div>
-                  <div className="pixel-list" aria-label="五颗灯珠状态">
+                  <div className="pixel-list" role="group" aria-label="选择灯珠">
                     {Array.from({ length: 5 }, (_, index) => {
                       const pixelState = currentStatus.lights.pixels[index] ?? 'unknown'
-                      return <span key={index} className={`pixel ${pixelState === 'on' ? 'pixel-on' : ''} ${pixelState === 'unknown' ? 'pixel-unknown' : ''}`} />
+                      const setting = lightControl?.pixels[index]
+                      return <button key={index} className={`pixel-select ${selectedPixel === index ? 'selected' : ''}`} aria-label={`第 ${index + 1} 颗灯，${stateLabel(pixelState)}`} aria-pressed={selectedPixel === index} disabled={lightBusy || deviceBusy} onClick={() => { setSelectedPixel(index); setPixelDirty(false) }}>
+                        <span className={`pixel ${pixelState === 'on' ? 'pixel-on' : ''} ${pixelState === 'unknown' ? 'pixel-unknown' : ''}`} style={pixelState === 'on' && setting ? { background: setting.color, borderColor: setting.color, boxShadow: `0 0 10px ${setting.color}`, opacity: Math.max(0.25, setting.brightness / 100) } : undefined} />
+                        <small>{index + 1}</small>
+                      </button>
                     })}
                   </div>
                 </div>
+                <fieldset className="light-editor" disabled={!lightsEditable}>
+                  <legend>第 {selectedPixel + 1} 颗灯</legend>
+                  <div className="light-setting-row">
+                    <label className="light-color">颜色<input type="color" aria-label="灯珠颜色" value={pixelDraft.color.toLowerCase()} onChange={(event) => { setPixelDraft({ ...pixelDraft, color: event.target.value }); setPixelDirty(true) }} /></label>
+                    <label className="light-switch"><input type="checkbox" checked={pixelDraft.on} onChange={(event) => { setPixelDraft({ ...pixelDraft, on: event.target.checked }); setPixelDirty(true) }} />开启</label>
+                    <span className="light-color-code">{pixelDraft.color.toUpperCase()}</span>
+                  </div>
+                  <label className="light-brightness">亮度<input type="range" min="0" max="100" value={pixelDraft.brightness} onChange={(event) => { setPixelDraft({ ...pixelDraft, brightness: Number(event.target.value) }); setPixelDirty(true) }} /><output>{pixelDraft.brightness}%</output></label>
+                  <div className="light-actions">
+                    <button className="button button-primary" onClick={() => void sendLightCommand({ action: 'lights.pixel.set', index: selectedPixel, ...pixelDraft })}>应用此灯</button>
+                    <button className="button button-subtle" onClick={() => void sendLightCommand({ action: 'lights.all.set', ...pixelDraft })}>应用到全部</button>
+                    <button className="text-button" onClick={() => void sendLightCommand({ action: 'lights.off' })}>全部熄灭</button>
+                  </div>
+                </fieldset>
                 <div className="led-row led-row-last">
                   <div className="led-title"><span className="green-indicator"><i /></span><div><strong>状态指示灯</strong><small>GPIO42 · PWM</small></div></div>
-                  <div className="status-inline"><span className={`tiny-dot ${currentStatus.lights.status_led === 'on' ? 'tiny-dot-on' : ''}`} />{stateLabel(currentStatus.lights.status_led)}</div>
+                  <button className="button button-subtle light-toggle" disabled={!lightsEditable} onClick={() => void sendLightCommand({ action: 'lights.status.set', brightness: currentStatus.lights.status_led === 'on' ? 0 : indicatorDraft || 20 })}><span className={`tiny-dot ${currentStatus.lights.status_led === 'on' ? 'tiny-dot-on' : ''}`} />{stateLabel(currentStatus.lights.status_led)}</button>
                 </div>
-                <div className="power-note"><span className="power-line" />GPIO8 控制灯、麦克风与扬声器共享电源</div>
+                <fieldset className="indicator-editor" disabled={!lightsEditable}>
+                  <label className="light-brightness">亮度<input aria-label="状态指示灯亮度" type="range" min="0" max="100" value={indicatorDraft} onChange={(event) => { setIndicatorDraft(Number(event.target.value)); setIndicatorDirty(true) }} /><output>{indicatorDraft}%</output></label>
+                  <button className="button button-subtle" onClick={() => void sendLightCommand({ action: 'lights.status.set', brightness: indicatorDraft })}>应用亮度</button>
+                </fieldset>
+                <div className="power-control"><span>共享外设电源</span><button className="button button-subtle" disabled={!lightsEditable} onClick={() => void sendLightCommand({ action: 'peripherals.power.set', on: currentStatus.peripherals.shared_rail !== 'on' })}>{currentStatus.peripherals.shared_rail === 'on' ? '关闭共享电源' : '开启共享电源'}</button></div>
+                <div className="power-note"><span className="power-line" />点亮灯带时自动供电；全部熄灭保留供电。GPIO8 同时影响麦克风与扬声器。</div>
+                <p className="light-note">{demoMode ? '演示模式：操作仅更新预览。' : !lightControl ? hello ? '灯光控制需要 0.1.5 或更新固件，请先升级开发板。' : '连接 USB 或蓝牙后可控制灯光。' : !lightControl.ready ? `灯光驱动不可用：${lightControl.error ?? '请重启开发板后重试'}。` : !wifiConfigOnline ? '当前仅查看状态，控制灯光请连接 USB 或蓝牙。' : '颜色与亮度在点击应用后生效；状态来自固件回报。'}</p>
+                {lightBusy && <p className="light-note" role="status">正在应用设置…</p>}
+                {lightResult && <p className={`wifi-result ${lightResult.ok ? '' : 'error'}`} role="status">{lightResult.message}</p>}
               </article>
 
               <article className="audio-card panel">
@@ -866,7 +992,7 @@ export default function App(): React.JSX.Element {
                   </div>
                 </div>
                 <div className="audio-foot"><span><span className={`tiny-dot ${currentStatus.microphone.vad ? 'tiny-dot-on' : ''}`} />语音活动 {currentStatus.microphone.vad ? '检测中' : '未检测'}</span><span>{typeof currentStatus.speaker.volume === 'number' ? `音量 ${currentStatus.speaker.volume}%` : '音频状态由固件上报'}</span></div>
-                {(currentStatus.peripherals.shared_rail === 'off' || currentStatus.microphone.state === 'unavailable' || currentStatus.speaker.state === 'unavailable') && <p className="audio-protection-note">固件保护：GPIO8 是灯光、麦克风和扬声器的共享电源，目前保持关闭；完成共享电源时序验证后，固件才会启用音频设备。</p>}
+                {(currentStatus.microphone.state === 'unavailable' || currentStatus.speaker.state === 'unavailable') && <p className="audio-protection-note">当前固件尚未启用麦克风采集和扬声器播放；开启共享电源后仍需音频驱动才能使用。</p>}
               </article>
             </div>
 

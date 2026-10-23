@@ -10,6 +10,7 @@ File locations and collaboration rules are defined in [AGENTS.md](AGENTS.md). Pr
 - Independent USB, BLE and Wi-Fi monitoring sessions, with duplicate input events suppressed and USB preferred for network configuration commands.
 - Remembered Bluetooth authorization, automatic reconnection, and persistent board-side pairing.
 - Wi-Fi configuration, saved-credential reconnection, and connection diagnostics.
+- Individual RGB color, brightness and on/off control for five WS2812 pixels, independent status LED dimming, and explicit shared-power control (firmware 0.1.5+; USB/BLE commands).
 - Firmware package validation, ESP32-S3 identification, explicit write confirmation, progress, and per-image flashing without whole-flash erase.
 - A clearly marked interface preview mode that works without connecting to hardware.
 - Installable PWA shell with offline-cached static application assets. Device telemetry and credentials are not cached.
@@ -27,7 +28,7 @@ USB Serial and Web Bluetooth require a secure browser context and an explicit br
 
 USB and Bluetooth can connect to the same board simultaneously. Connecting or disconnecting one does not close the other. Each connection has its own handshake and protocol state; commands use healthy USB first and fall back to healthy Bluetooth. Each USB connection requests a fresh board handshake, allowing Wi-Fi configuration after a late connection or reconnect without restarting the board. This requires monitor firmware 0.1.2 or later with `hello.get` support.
 
-The service worker caches the versioned static app shell and build assets. While the app is visible, it checks for new deployments every 30 minutes. A detected update activates automatically and reloads once USB, BLE, Wi-Fi monitoring, Wi-Fi command, and firmware operations are idle. It does not cache Wi-Fi passwords, board telemetry, or device commands. The browser owns USB/Bluetooth device selection and permission prompts.
+The service worker caches the versioned static app shell and build assets. While the app is visible, it checks for new deployments every 30 minutes. A detected update activates automatically and reloads once USB, BLE, Wi-Fi monitoring, Wi-Fi/light commands, and firmware operations are idle. It does not cache Wi-Fi passwords, board telemetry, or device commands. The browser owns USB/Bluetooth device selection and permission prompts.
 
 ## Automatic Bluetooth connection
 
@@ -63,10 +64,10 @@ The board-side project targets ESP32-S3 and uses ESP-IDF 5.5.5 or later. Default
 cd firmware/easyinput-monitor
 idf.py set-target esp32s3
 idf.py build
-python3 ../../scripts/export-firmware.py --version 0.1.4
+python3 ../../scripts/export-firmware.py --version 0.1.5
 ```
 
-The export command writes `release/firmware/0.1.4-v2-monitor` containing `firmware.json` and the bootloader, partition table, and app images. The output is relative to the repository root, regardless of the shell's current directory. Firmware packages stay outside the website build output and are excluded from Git. The app checks the manifest, image sizes and SHA-256 hashes before flashing; the manifest is not a signed publisher identity. The WebSocket options in `sdkconfig.defaults` require ESP-IDF 5.5.5 or later. When reusing older generated configurations, regenerate them from these defaults before building so WebSocket support and both handshake callbacks are enabled.
+The export command writes `release/firmware/0.1.5-v2-monitor` containing `firmware.json` and the bootloader, partition table, and app images. The output is relative to the repository root, regardless of the shell's current directory. Firmware packages stay outside the website build output and are excluded from Git. The app checks the manifest, image sizes and SHA-256 hashes before flashing; the manifest is not a signed publisher identity. The WebSocket options in `sdkconfig.defaults` require ESP-IDF 5.5.5 or later. When reusing older generated configurations, regenerate them from these defaults before building so WebSocket support and both handshake callbacks are enabled.
 
 ## Automatic connection hardware check
 
@@ -89,10 +90,20 @@ Use the updated Studio with monitor firmware 0.1.2 or later:
 
 With firmware 0.1.4, also connect Wi-Fi monitoring before step 5 and verify that it continues updating after both USB and BLE disconnect. Press and rotate inputs, reconnect USB/BLE, and confirm each input appears once. Power-cycle the board or briefly interrupt the router, confirm Wi-Fi monitoring reconnects, then deliberately disconnect it and reload to confirm it stays disconnected. If Wi-Fi cannot connect, verify the IP, local-network browser permission and router client isolation rather than repeatedly reinstalling dependencies.
 
+## Light and shared-power control (firmware 0.1.5+)
+
+Update the board using `release/firmware/0.1.5-v2-monitor/firmware.json` and all three adjacent images. Connect USB or encrypted Bluetooth; Wi-Fi monitoring remains read-only. Older firmware still reports telemetry but shows an upgrade prompt for light control.
+
+In **灯光与电源**, select pixel **1–5**, choose a color, enable **开启**, choose brightness, then click **应用此灯**. **应用到全部** copies that color, brightness and on/off setting to all five. **全部熄灭** preserves each pixel's color/brightness while switching all five off. Wire index 0 is displayed as pixel 1; the physical order needs checking on the board. Status LED GPIO42 has an independent toggle and brightness slider with **应用亮度**; it can work while shared power is off. Changes take effect only after applying. Preview mode simulates these operations without controlling hardware.
+
+Shared power starts off after reboot. A lit pixel automatically enables GPIO8; **全部熄灭** leaves power on. **关闭共享电源** sends a black frame, stops RMT, returns downstream outputs low and GPIO11 floating, then lowers GPIO8. It also clears pixel enable flags, so explicitly enabling power again does not restore old lights. Status LED GPIO42 is unaffected. Microphone and speaker drivers remain unavailable even when shared power is on. Settings live in RAM and reset on reboot; disconnecting the page leaves the last settings running.
+
+The project currently waits at least **100 ms** after GPIO8 rises, then creates/enables the RMT driver, sends a black frame, and applies colors. This is a provisional bring-up parameter, not a measured board guarantee. Before accepting the hardware behavior, verify rail settling, USB/battery voltage and 3.3 V DIN margin. RMT sends five GRB pixels at 800 kbit/s with a 300 µs low latch; GPIO42 PWM uses 5 kHz/13-bit resolution. Start board checks at 20% brightness: test red/green/blue and off on each pixel, copy to all, switch all off while power stays on, then power off/on and test status LED independently. Verify USB/BLE status follows changes and key events still arrive.
+
 ## Flashing behavior
 
 The browser filters device access through the Web Serial permission prompt. Firmware flashing uses the board's USB Serial/JTAG connection. The app first attempts automatic entry into download mode using the USB reset sequence. If that connection fails, keep the board powered on, short-press/release **BOOT**, then retry and select its download port. After writing, switch the board off and on to return to normal startup. Do not use the generic “hold BOOT while powering on” sequence. The app requires a separate confirmation after identifying the ESP32-S3 and reading its MAC address.
 
 ## Hardware validation boundary
 
-Physical USB enumeration, simultaneous USB/BLE/Wi-Fi sessions, Wi-Fi provisioning/recovery and WebSocket monitoring on battery power, PSRAM initialization, ADC voltage accuracy and sampling, power/charge detection, CPU/temperature readings, key/encoder polarity, BLE radio behavior, and flash/resume behavior still need a board-side check. The encoder direction is a project choice and should be checked against the actual knob. Shared-rail audio and LED behavior require separate electrical qualification before GPIO8 is enabled.
+Physical USB enumeration, simultaneous USB/BLE/Wi-Fi sessions, Wi-Fi provisioning/recovery and WebSocket monitoring on battery power, PSRAM initialization, ADC voltage accuracy and sampling, power/charge detection, CPU/temperature readings, key/encoder polarity, BLE radio behavior, and flash/resume behavior still need a board-side check. The encoder direction is a project choice and should be checked against the actual knob. Light control is implemented for board bring-up; the 100 ms shared-rail wait, electrical margins, pixel order and visible behavior still require assembled-board validation. Compilation and software tests do not qualify the circuit. Shared-rail audio drivers remain unimplemented.

@@ -134,6 +134,36 @@ button { color: inherit; }
 .tiny-dot-on { background: #65d0a3; box-shadow: 0 0 7px rgba(101, 208, 163, .38); }
 .power-note { display: flex; align-items: center; gap: 8px; padding-top: 8px; color: #60758a; font-size: 12px; }
 .power-line { display: inline-block; width: 12px; height: 1px; background: #526c83; }
+.pixel-select { min-width: 27px; min-height: 39px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px; padding: 5px; color: #8095ab; border: 1px solid transparent; border-radius: 6px; background: transparent; cursor: pointer; }
+.pixel-select.selected { border-color: rgba(108, 215, 221, .4); background: rgba(108, 215, 221, .08); color: #9de7e8; }
+.pixel-select small { font: 500 10px 'DM Mono', monospace; }
+.light-editor, .indicator-editor { min-width: 0; margin: 8px 0 0; padding: 10px; border: 1px solid rgba(132, 155, 181, .12); border-radius: 8px; }
+.light-editor legend { padding: 0 5px; color: #9bafc1; font-size: 12px; }
+.light-setting-row { display: flex; align-items: center; gap: 16px; }
+.light-color, .light-switch { display: flex; align-items: center; gap: 8px; color: #9bafc1; font-size: 12px; }
+.light-color input { width: 35px; height: 28px; padding: 2px; border: 1px solid #34495d; border-radius: 5px; background: #142333; cursor: pointer; }
+.light-switch input { accent-color: #6cd7dd; }
+.light-color-code { margin-left: auto; color: #7f96a9; font: 400 11px 'DM Mono', monospace; }
+.light-brightness { display: flex; align-items: center; gap: 9px; color: #8ca2b6; font-size: 12px; }
+.light-editor .light-brightness { margin-top: 13px; }
+.light-brightness input { min-width: 0; flex: 1; accent-color: #6cd7dd; cursor: pointer; }
+.light-brightness output { min-width: 35px; text-align: right; font: 400 12px 'DM Mono', monospace; }
+.light-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 11px; }
+.light-actions .button, .light-actions .text-button, .indicator-editor .button, .light-toggle, .power-control .button { min-height: 30px; height: auto; padding: 6px 9px; font-size: 12px; }
+.indicator-editor { display: flex; align-items: center; gap: 9px; margin: 0 0 11px; }
+.indicator-editor .light-brightness { flex: 1; min-width: 0; }
+.indicator-editor .button { flex-shrink: 0; }
+.power-control { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-top: 10px; border-top: 1px solid rgba(132, 155, 181, .1); color: #9bafc1; font-size: 12px; }
+.power-note { align-items: flex-start; line-height: 1.6; }
+.power-line { flex: 0 0 12px; margin-top: 9px; }
+.light-note { margin: 9px 0 0; color: #8297ab; font-size: 12px; line-height: 1.6; }
+.light-editor:disabled, .indicator-editor:disabled { opacity: .55; }
+.pixel-select:focus-visible, .light-editor input:focus-visible, .indicator-editor input:focus-visible { outline: 2px solid #6cd7dd; outline-offset: 3px; }
+@media (max-width: 430px) {
+  .peripheral-card .led-row { flex-wrap: wrap; gap: 8px; padding: 9px 0; }
+  .peripheral-card .pixel-list { gap: 3px; }
+  .light-color-code { font-size: 10px; }
+}
 
 .audio-card { padding-bottom: 14px; }
 .audio-state { display: inline-flex; align-items: center; gap: 7px; margin-top: 2px; color: #8495aa; font-size: 13.5px; }

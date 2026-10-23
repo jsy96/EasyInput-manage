@@ -5,6 +5,26 @@ export const BLE_RX_UUID = 'e1000003-6e24-4f51-a3bc-2d8db0000001'
 
 export type ConnectionState = 'unknown' | 'disabled' | 'disconnected' | 'connecting' | 'connected' | 'advertising'
 
+export interface PixelSetting {
+  color: string
+  brightness: number
+  on: boolean
+}
+
+export interface LightControl {
+  ready: boolean
+  pixels: PixelSetting[]
+  status_led_brightness: number
+  error?: string
+}
+
+export type LightCommand =
+  | ({ action: 'lights.pixel.set'; index: number } & PixelSetting)
+  | ({ action: 'lights.all.set' } & PixelSetting)
+  | { action: 'lights.off' }
+  | { action: 'lights.status.set'; brightness: number }
+  | { action: 'peripherals.power.set'; on: boolean }
+
 export interface BoardStatus {
   type: 'status'
   protocol: number
@@ -25,7 +45,7 @@ export interface BoardStatus {
   }
   ble: { state: ConnectionState; name?: string; peers?: number }
   peripherals: { shared_rail: 'off' | 'on' | 'unknown' }
-  lights: { status_led: 'off' | 'on' | 'unknown'; pixels: Array<'off' | 'on' | 'unknown'> }
+  lights: { status_led: 'off' | 'on' | 'unknown'; pixels: Array<'off' | 'on' | 'unknown'>; control?: LightControl }
   speaker: { state: 'unavailable' | 'idle' | 'playing' | 'unknown'; volume?: number }
   microphone: { state: 'unavailable' | 'idle' | 'active' | 'unknown'; rms?: number; vad?: boolean }
   cpu: { frequency_mhz: number; usage_percent: number[]; temperature_c?: number }
@@ -69,6 +89,7 @@ export interface BoardResult {
   action: string
   ok: boolean
   message?: string
+  request_id?: string
 }
 
 export type BoardMessage = BoardHello | BoardStatus | InputEvent | BoardResult
@@ -125,6 +146,7 @@ export function parseBoardMessage(line: string): BoardMessage | null {
       !isRecord(nvsStorage) || !['total_bytes', 'used_entries', 'free_entries', 'total_entries'].every((key) => isFiniteNumber(nvsStorage[key])) ||
       !isRecord(power)
     ) return null
+    if (lights.control !== undefined && !isLightControl(lights.control)) return null
     return record as unknown as BoardStatus
   }
 
@@ -138,6 +160,8 @@ export function parseBoardMessage(line: string): BoardMessage | null {
 
   if (record.type === 'result') {
     if (typeof record.action !== 'string' || typeof record.ok !== 'boolean') return null
+    if (record.request_id !== undefined && (typeof record.request_id !== 'string' || !record.request_id || record.request_id.length > 64)) return null
+    if (record.message !== undefined && typeof record.message !== 'string') return null
     return record as unknown as BoardResult
   }
 
@@ -150,6 +174,26 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value)
+}
+
+function isBrightness(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 100
+}
+
+function isLightControl(value: unknown): value is LightControl {
+  return isRecord(value) && typeof value.ready === 'boolean' && isBrightness(value.status_led_brightness) &&
+    (value.error === undefined || typeof value.error === 'string') &&
+    Array.isArray(value.pixels) && value.pixels.length === 5 && value.pixels.every((pixel) =>
+      isRecord(pixel) && typeof pixel.color === 'string' && /^#[\da-f]{6}$/i.test(pixel.color) &&
+      isBrightness(pixel.brightness) && typeof pixel.on === 'boolean')
+}
+
+export function lightResultMatches(result: BoardResult, pending: { action: string; requestId: string } | null): boolean {
+  return pending !== null && result.action === pending.action && result.request_id === pending.requestId
+}
+
+export function pixelIsLit(pixel: PixelSetting): boolean {
+  return pixel.on && [1, 3, 5].some((offset) => Math.round(parseInt(pixel.color.slice(offset, offset + 2), 16) * pixel.brightness / 100) > 0)
 }
 
 export function describeInputEvent(event: InputEvent): string {
