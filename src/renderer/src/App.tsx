@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { version as appVersion } from '../../../package.json'
 import { registerSW } from 'virtual:pwa-register'
 import {
-  Activity, ArrowDownToLine, Bluetooth, Check, ChevronDown, CircleHelp, Cpu, Download,
-  FileUp, HardDrive, Headphones, Lightbulb, Link2, LoaderCircle, Mic, Monitor,
-  RotateCw, Usb, Wifi, X, Zap,
+  Activity, ArrowLeft, ArrowRight, Bluetooth, Check, ChevronDown, Cpu, Download,
+  FileUp, HardDrive, Headphones, Lightbulb, LoaderCircle, Mic, Monitor,
+  RotateCw, SlidersHorizontal, Usb, Wifi, X, Zap,
 } from 'lucide-react'
 import { ESPLoader, Transport } from 'esptool-js'
 import { BluetoothConnection } from './services/bluetooth'
@@ -15,6 +15,22 @@ import type { BoardHello, BoardMessage, BoardResult, BoardStatus, InputEvent, Li
 import { describeInputEvent, commandResultMatches, pixelIsLit, PROTOCOL_VERSION } from '@shared/protocol'
 
 const FLASH_BYTES = 16 * 1024 * 1024
+const pages = [
+  { id: 'overview', label: '总览', title: '设备总览', caption: '一眼了解你的设备', icon: Monitor },
+  { id: 'control', label: '控制', title: '随心控制', caption: '灯光与声音，触手可及', icon: SlidersHorizontal },
+  { id: 'network', label: '网络', title: '保持连接', caption: '管理网络与无线监控', icon: Wifi },
+  { id: 'system', label: '系统', title: '运行状态', caption: '设备资源，清晰可见', icon: Cpu },
+  { id: 'firmware', label: '固件', title: '固件管理', caption: '让设备保持更新', icon: Download },
+] as const
+type Page = typeof pages[number]['id']
+
+function Pagination({ page, count, onChange }: { page: number; count: number; onChange: (page: number) => void }): React.JSX.Element {
+  return <nav className="pagination" aria-label="列表分页">
+    <button className="page-button" disabled={page === 0} onClick={() => onChange(page - 1)} aria-label="上一页"><ArrowLeft size={16} /></button>
+    <span>第 <strong>{page + 1}</strong> / {count} 页</span>
+    <button className="page-button" disabled={page >= count - 1} onClick={() => onChange(page + 1)} aria-label="下一页"><ArrowRight size={16} /></button>
+  </nav>
+}
 
 type FirmwareImageSpec = { file: string; address: number; bytes: number; sha256: string }
 type FirmwareManifest = {
@@ -70,15 +86,6 @@ function wifiDisconnectReason(code?: number): string {
   }
   if (code === undefined) return '等待板端诊断'
   return code === 0 ? '无最近断线原因' : `${reasons[code] ?? '其他断线原因'}（代码 ${code}）`
-}
-
-function wifiSignalLevel(rssi?: number): number {
-  if (rssi === undefined) return 0
-  if (rssi >= -55) return 4
-  if (rssi >= -67) return 3
-  if (rssi >= -78) return 2
-  if (rssi >= -90) return 1
-  return 0
 }
 
 function stateLabel(state?: string): string {
@@ -155,6 +162,16 @@ function validateManifest(value: unknown): FirmwareManifest {
 }
 
 export default function App(): React.JSX.Element {
+  const [activePage, setActivePage] = useState<Page>('overview')
+  const [overviewTab, setOverviewTab] = useState('device')
+  const [controlTab, setControlTab] = useState('pixels')
+  const [systemTab, setSystemTab] = useState('performance')
+  const [eventPage, setEventPage] = useState(0)
+  const [partitionPage, setPartitionPage] = useState(0)
+  const [eventRows, setEventRows] = useState(3)
+  const [partitionRows, setPartitionRows] = useState(4)
+  const eventListRef = useRef<HTMLDivElement | null>(null)
+  const partitionListRef = useRef<HTMLDivElement | null>(null)
   const [serialOpen, setSerialOpen] = useState(false)
   const [serialConnecting, setSerialConnecting] = useState(false)
   const [serialError, setSerialError] = useState('')
@@ -245,7 +262,24 @@ export default function App(): React.JSX.Element {
   const audioEditable = Boolean(currentStatus.audio?.ready && (demoMode || wifiConfigOnline) && !deviceBusy && !wifiBusy && !outputBusy)
   const selectedSetting = lightControl?.pixels[selectedPixel]
 
-  const latestEvents = useMemo(() => events.slice(0, 28), [events])
+  const eventPageCount = Math.max(1, Math.ceil(events.length / eventRows))
+  const currentEventPage = Math.min(eventPage, eventPageCount - 1)
+  const visibleEvents = events.slice(currentEventPage * eventRows, (currentEventPage + 1) * eventRows)
+  const partitionPageCount = Math.max(1, Math.ceil(currentStatus.storage.partitions.length / partitionRows))
+  const currentPartitionPage = Math.min(partitionPage, partitionPageCount - 1)
+  const visiblePartitions = currentStatus.storage.partitions.slice(currentPartitionPage * partitionRows, (currentPartitionPage + 1) * partitionRows)
+
+  useEffect(() => {
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.target === eventListRef.current) setEventRows(Math.max(1, Math.floor(entry.contentRect.height / 58)))
+        if (entry.target === partitionListRef.current) setPartitionRows(Math.max(1, Math.floor(entry.contentRect.height / 48)))
+      }
+    })
+    if (eventListRef.current) observer.observe(eventListRef.current)
+    if (partitionListRef.current) observer.observe(partitionListRef.current)
+    return () => observer.disconnect()
+  }, [activePage, overviewTab, systemTab])
 
   useEffect(() => {
     if (!pixelDirty && selectedSetting) setPixelDraft({ ...selectedSetting })
@@ -698,17 +732,12 @@ export default function App(): React.JSX.Element {
   }
 
   function focusWifiConfiguration(): void {
+    setActivePage('network')
     setWifiEditing(true)
     setWifiResult(null)
     setWifiPassword('')
     if (currentStatus.wifi.ssid) setWifiSsid(currentStatus.wifi.ssid)
-    document.getElementById('wifi-config')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-    window.setTimeout(() => wifiSsidRef.current?.focus(), 350)
-  }
-
-  function connectWifi(): void {
-    if (currentStatus.wifi.configured) void sendWifiCommand('wifi.connect_saved')
-    else focusWifiConfiguration()
+    window.setTimeout(() => wifiSsidRef.current?.focus({ preventScroll: true }), 0)
   }
 
   async function importFirmware(event: React.ChangeEvent<HTMLInputElement>): Promise<void> {
@@ -832,332 +861,173 @@ export default function App(): React.JSX.Element {
   const wifiMonitorActive = wifiMonitorConnected || wifiMonitorConnecting || wifiMonitorRetrying
   const transportLabel = activeConnection?.transport === 'usb' ? 'USB' : activeConnection?.transport === 'wifi' ? 'Wi-Fi' : '蓝牙'
 
+  const page = pages.find((item) => item.id === activePage)!
+  const sectionTabs = {
+    overview: { value: overviewTab, select: setOverviewTab, items: [['device', '设备状态'], ['events', '输入事件']] },
+    control: { value: controlTab, select: setControlTab, items: [['pixels', '彩色灯带'], ['power', '指示灯与电源'], ['audio', '音频设备']] },
+    network: { value: 'all', select: () => undefined, items: [] },
+    system: { value: systemTab, select: setSystemTab, items: [['performance', '性能与内存'], ['storage', '存储状态'], ['partitions', '分区列表']] },
+    firmware: { value: 'all', select: () => undefined, items: [] },
+  }[activePage]
+  const lightNote = demoMode ? '演示模式：操作仅更新预览。' : !lightControl ? hello ? '需要 0.1.5 或更新固件，请先升级开发板。' : '连接 USB 或蓝牙后可控制灯光。' : !lightControl.ready ? `灯光驱动不可用：${lightControl.error ?? '请重启开发板后重试'}。` : !wifiConfigOnline ? '控制灯光请连接 USB 或蓝牙。' : '点击应用后生效，状态以设备回报为准。'
+
   return (
     <main className="app-shell">
-      <aside className="side-rail">
-        <div className="brand-mark"><span className="brand-key">E</span><span className="brand-dot" /></div>
-        <div className="rail-rule" />
-        <button className="rail-button active" aria-label="设备总览"><Monitor size={18} /></button>
-        <button className="rail-button" aria-label="固件管理" onClick={() => document.getElementById('firmware-panel')?.scrollIntoView({ behavior: 'smooth' })}><Download size={18} /></button>
-        <button className="rail-button" aria-label="输入事件" onClick={() => document.getElementById('events-panel')?.scrollIntoView({ behavior: 'smooth' })}><Activity size={18} /></button>
-        <div className="rail-bottom"><CircleHelp size={17} /></div>
-      </aside>
-
-      <section className="workspace">
+      <div className="workspace">
         <header className="topbar">
-          <div className="topbar-title">
-            <div className="eyebrow">DEVICE CONTROL CENTER <span className="eyebrow-line" /></div>
+          <div className="topbar-brand">
+            <div className="brand-mark">E<span /></div>
             <h1>EasyInput <span>Studio</span></h1>
           </div>
           <div className="topbar-actions">
-            <button className="text-button demo-toggle" disabled={bleConnecting || serialConnecting || deviceBusy} onClick={() => void toggleDemoMode()}>
-              {demoMode ? <Check size={15} /> : <Activity size={15} />}
-              {demoMode ? '退出演示' : '预览界面'}
+            <button className={`text-button demo-toggle ${demoMode ? 'demo-active' : ''}`} disabled={bleConnecting || serialConnecting || deviceBusy} onClick={() => void toggleDemoMode()}>
+              {demoMode ? <Check size={15} /> : <Activity size={15} />}{demoMode ? '退出演示' : '演示'}
             </button>
             <button className={`button ${serialOpen ? 'button-subtle' : 'button-primary'}`} disabled={serialConnecting || deviceBusy} onClick={() => serialOpen ? void closeSerial() : void connectBoard()}>
-              {serialConnecting ? <LoaderCircle size={16} className="spin" /> : <Usb size={16} />} {serialConnecting ? '连接中' : serialOpen ? '断开 USB' : '连接 USB'}
+              {serialConnecting ? <LoaderCircle size={16} className="spin" /> : <Usb size={16} />}{serialConnecting ? '连接中' : serialOpen ? '断开 USB' : '连接 USB'}
             </button>
-            <button className="button button-subtle" disabled={deviceBusy} onClick={() => {
+            <button className="button button-subtle desktop-action" disabled={deviceBusy} onClick={() => {
               if (wifiMonitorActive) wifiConnectionRef.current?.disconnect()
               else if (wifiAddress.trim()) connectWifiMonitor()
-              else document.getElementById('wifi-monitor')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+              else setActivePage('network')
             }}>
               {wifiMonitorConnecting || wifiMonitorRetrying ? <LoaderCircle size={16} className="spin" /> : <Wifi size={16} />}
-              {wifiMonitorConnecting || wifiMonitorRetrying ? '取消 Wi-Fi 重连' : wifiMonitorConnected ? '断开 Wi-Fi' : '连接 Wi-Fi'}
+              {wifiMonitorConnecting || wifiMonitorRetrying ? '取消重连' : wifiMonitorConnected ? '断开 Wi-Fi' : '连接 Wi-Fi'}
             </button>
           </div>
         </header>
 
-        {serialError && <div className="notice notice-error"><X size={16} /><span>{serialError}</span><button onClick={() => setSerialError('')} aria-label="关闭"><X size={14} /></button></div>}
-        {updateWaiting && updateBlocked && <div className="notice notice-update"><RotateCw size={15} /><span>新版本已就绪，设备操作结束后会自动更新。</span></div>}
+        <nav className="main-nav" aria-label="主要页面">{pages.map(({ id, label, icon: Icon }) => <button key={id} aria-current={activePage === id ? 'page' : undefined} className={activePage === id ? 'active' : ''} onClick={() => setActivePage(id)}><span className="nav-icon"><Icon size={18} strokeWidth={activePage === id ? 2 : 1.7} />{id === 'firmware' && (flashing || flashPreparing) && <i />}</span><span>{label}</span></button>)}</nav>
 
-        <div className="page-content">
-          <div className="section-heading">
-            <div>
-              <div className="section-kicker">硬件监控 / 实时遥测</div>
-              <h2>设备总览</h2>
-            </div>
-            <div className="live-clock"><span className={`pulse-dot ${protocolOnline ? 'pulse-on' : ''}`} />{demoMode ? '演示数据' : lastSeen ? `最近数据 ${lastSeen} · ${transportLabel}` : '等待设备数据'}</div>
-          </div>
-
-          <div className="device-strip panel">
-            <div className="device-avatar"><Cpu size={25} strokeWidth={1.7} /></div>
-            <div className="device-identity">
-              <div className="device-name">{hello?.board === 'easyinput-v2' ? 'EasyInput V2.0' : 'EasyInput V2.0'} <span className="version-pill">V2</span></div>
-              <div className="device-meta"><span>{hello?.chip ?? 'ESP32-S3R8'}</span><i /> <span>AI Keyboard V2.1</span> <i /> <span>固件 {hello?.firmware ?? '未读取'}</span></div>
-            </div>
-            <div className="device-runtime"><span>运行时长</span><strong>{status ? formatDuration(status.uptime_ms) : '—'}</strong></div>
-            <div className="device-divider" />
-            <div className="usb-summary">
-              <div className="usb-icon"><Usb size={17} /></div>
-              <div><span>USB-C / 原生串口</span><strong className={usbStateClass}>{usbLabel}</strong></div>
-            </div>
-            {!serialOpen && <button className="icon-button connect-small" disabled={serialConnecting || deviceBusy} onClick={() => void connectBoard()} aria-label="连接 USB 串口"><Link2 size={17} /></button>}
-          </div>
-
-          <article className="firmware-card panel" id="firmware-panel">
-            <div className="panel-heading">
-              <div><div className="section-kicker">FIRMWARE MANAGER</div><h3>固件管理</h3></div>
-              <div className="firmware-hex"><ArrowDownToLine size={17} /></div>
-            </div>
-            <div className="firmware-current">
-              <div className="firmware-ring"><Cpu size={19} /></div>
-              <div><small>板载固件</small><strong>{hello?.firmware ?? '未读取'}</strong></div>
-              <span className={`firmware-tag ${hello ? 'tag-ready' : ''}`}>{hello ? '运行中' : '待连接'}</span>
-            </div>
-            <div className="firmware-layout">
-              <div className="firmware-package">
-                <div className="package-title"><span>本地固件包</span>{manifest && <span className="package-ready"><Check size={12} />已校验</span>}</div>
-                <div className={`package-drop ${manifest ? 'package-loaded' : ''}`} onClick={() => flashFolderRef.current?.click()} role="button" tabIndex={0} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') flashFolderRef.current?.click() }}>
-                  <input ref={flashFolderRef} type="file" multiple hidden {...{ webkitdirectory: '', directory: '' }} onChange={(event) => void importFirmware(event)} />
-                  <span className="upload-icon">{manifest ? <Check size={17} /> : <FileUp size={17} />}</span>
-                  <span className="drop-copy"><strong>{manifest ? `版本 ${manifest.version}` : '导入固件包目录'}</strong><small>{manifest ? `${images.length} 个镜像 · SHA-256 已验证` : '选择包含 firmware.json 与镜像文件的目录'}</small></span>
-                  <ChevronDown size={15} className="drop-chevron" />
-                </div>
-                {packageError && <div className="inline-error">{packageError}</div>}
-                {manifest && <div className="image-list">{images.map((image) => <div className="image-row" key={image.file}><span>{image.file}</span><code>{formatAddress(image.address)}</code><small>{(image.bytes / 1024).toFixed(0)} KB</small></div>)}</div>}
-              </div>
-              <div className="firmware-flash">
-                {flashProgress > 0 && <div className="flash-progress-wrap"><div className="flash-progress-label"><span>{flashing ? '正在烧录' : '烧录进度'}</span><strong>{flashProgress}%</strong></div><div className="flash-progress"><i style={{ width: `${flashProgress}%` }} /></div></div>}
-                {flashLog && <div className="flash-log"><span className={flashError ? 'log-error' : ''}>{flashLog}</span></div>}
-                {flashError && <div className="inline-error">{flashError}</div>}
-                {flashCandidate ? (
-                  <div className="flash-confirm">
-                    <div className="target-heading"><span className="target-check"><Check size={15} /></span><div><small>已验证烧录目标</small><strong>{flashCandidate.chip}</strong></div></div>
-                    <div className="target-details"><span>设备 MAC</span><code>{flashCandidate.mac}</code></div>
-                    <div className="target-details"><span>目标固件</span><code>{manifest?.version}</code></div>
-                    <label className="confirm-check"><input type="checkbox" checked={confirmedTarget} onChange={(event) => setConfirmedTarget(event.target.checked)} /><span>确认将以上固件写入这台设备</span></label>
-                    <div className="flash-confirm-actions"><button className="text-button" onClick={cancelFlashCandidate}>取消</button><button className="button button-primary flash-button" disabled={!confirmedTarget || flashing} onClick={() => void flashFirmware()}>{flashing ? <LoaderCircle size={15} className="spin" /> : <Download size={15} />}确认烧录</button></div>
-                  </div>
-                ) : (
-                  <button className="button button-primary flash-button full-button" disabled={!manifest || flashPreparing || flashing || serialConnecting || bleConnecting || wifiBusy} onClick={() => void prepareFlash()}>
-                    {flashPreparing ? <LoaderCircle size={15} className="spin" /> : <Download size={15} />}
-                    {flashPreparing ? '正在识别芯片…' : '连接并识别设备'}
-                  </button>
-                )}
-                <div className="flash-footnote"><span className="footnote-icon">i</span><span>仅写入清单列出的镜像，不擦除整片 Flash。烧录后按板上电源开关关机再开机。</span></div>
-              </div>
-            </div>
-          </article>
-
-          <div className="dashboard-grid">
-            <div className="status-column">
-              <div className="status-grid">
-                <article className="status-card panel">
-                  <div className="card-topline"><div className="card-icon wifi-icon"><Wifi size={18} /></div><button className="card-connect-button" disabled={!wifiConfigOnline || deviceBusy || wifiBusy || currentStatus.wifi.state === 'connecting'} onClick={currentStatus.wifi.state === 'connected' ? focusWifiConfiguration : connectWifi}>{currentStatus.wifi.state === 'connected' ? '更换网络' : currentStatus.wifi.state === 'connecting' ? '自动连接中' : currentStatus.wifi.configured ? '重连' : '设置'}</button></div>
-                  <div className="card-label">Wi-Fi</div>
-                  <div className="status-value-row"><strong className={stateClass(currentStatus.wifi.state)}>{wifiStatusLabel}</strong><span className="status-dash" /></div>
-                  <div className="card-foot"><span>{wifiExtra}{currentStatus.wifi.state === 'connected' && currentStatus.wifi.channel ? ` · 信道 ${currentStatus.wifi.channel}` : ''}</span>{currentStatus.wifi.state === 'connected' && typeof currentStatus.wifi.rssi === 'number' && <span className="signal-bars" aria-label={`信号强度 ${currentStatus.wifi.rssi} dBm`}>{[1, 2, 3, 4].map((level) => <i key={level} className={wifiSignalLevel(currentStatus.wifi.rssi) >= level ? '' : 'signal-muted'} />)}</span>}</div>
-                </article>
-                <article className="status-card panel">
-                  <div className="card-topline"><div className="card-icon bluetooth-icon"><Bluetooth size={17} /></div><button className="card-connect-button" disabled={deviceBusy} onClick={() => { if (bleConnected || bleConnecting || bleRetrying) disconnectBle(); else void connectBle() }}>{bleConnecting || bleRetrying ? '取消重连' : bleConnected ? '断开' : '连接'}</button></div>
-                  <div className="card-label">Bluetooth LE</div>
-                  <div className="status-value-row"><strong className={bleStateClass}>{bleLabel}</strong><span className="status-dash" /></div>
-                  <div className="card-foot"><span>{currentStatus.ble.name ?? (currentStatus.ble.peers !== undefined ? `${currentStatus.ble.peers} 个连接` : '由板端固件上报')}</span><span className="bluetooth-wave"><i /><i /><i /></span></div>
-                  {bleError && <p className="ble-notice">{bleError}</p>}
-                  {!bleConnected && !bleConnecting && <button className="text-button ble-select-button" disabled={deviceBusy} onClick={() => void connectBle(true)}>重新选择设备</button>}
-                </article>
-              </div>
-
-              <article className="peripheral-card panel">
-                <div className="panel-heading">
-                  <div><div className="section-kicker">OUTPUTS</div><h3>灯光与电源</h3></div>
-                  <span className={`status-chip ${stateClass(currentStatus.peripherals.shared_rail)}`}>{currentStatus.peripherals.shared_rail === 'on' ? '外设电源已开' : currentStatus.peripherals.shared_rail === 'off' ? '共享电源关闭' : '等待数据'}</span>
-                </div>
-                <div className="led-row">
-                  <div className="led-title"><span className="led-symbol"><Lightbulb size={16} /></span><div><strong>WS2812 灯带</strong><small>5 颗串联 · GPIO12</small></div></div>
-                  <div className="pixel-list" role="group" aria-label="选择灯珠">
-                    {Array.from({ length: 5 }, (_, index) => {
-                      const pixelState = currentStatus.lights.pixels[index] ?? 'unknown'
-                      const setting = lightControl?.pixels[index]
-                      return <button key={index} className={`pixel-select ${selectedPixel === index ? 'selected' : ''}`} aria-label={`第 ${index + 1} 颗灯，${stateLabel(pixelState)}`} aria-pressed={selectedPixel === index} disabled={outputBusy || deviceBusy} onClick={() => { setSelectedPixel(index); setPixelDirty(false) }}>
-                        <span className={`pixel ${pixelState === 'on' ? 'pixel-on' : ''} ${pixelState === 'unknown' ? 'pixel-unknown' : ''}`} style={pixelState === 'on' && setting ? { background: setting.color, borderColor: setting.color, boxShadow: `0 0 10px ${setting.color}`, opacity: Math.max(0.25, setting.brightness / 100) } : undefined} />
-                        <small>{index + 1}</small>
-                      </button>
-                    })}
-                  </div>
-                </div>
-                <fieldset className="light-editor" disabled={!lightsEditable}>
-                  <legend>第 {selectedPixel + 1} 颗灯</legend>
-                  <div className="light-setting-row">
-                    <label className="light-color">颜色<input type="color" aria-label="灯珠颜色" value={pixelDraft.color.toLowerCase()} onChange={(event) => { setPixelDraft({ ...pixelDraft, color: event.target.value }); setPixelDirty(true) }} /></label>
-                    <label className="light-switch"><input type="checkbox" checked={pixelDraft.on} onChange={(event) => { setPixelDraft({ ...pixelDraft, on: event.target.checked }); setPixelDirty(true) }} />开启</label>
-                    <span className="light-color-code">{pixelDraft.color.toUpperCase()}</span>
-                  </div>
-                  <label className="light-brightness">亮度<input type="range" min="0" max="100" value={pixelDraft.brightness} onChange={(event) => { setPixelDraft({ ...pixelDraft, brightness: Number(event.target.value) }); setPixelDirty(true) }} /><output>{pixelDraft.brightness}%</output></label>
-                  <div className="light-actions">
-                    <button className="button button-primary" onClick={() => void sendOutputCommand({ action: 'lights.pixel.set', index: selectedPixel, ...pixelDraft })}>应用此灯</button>
-                    <button className="button button-subtle" onClick={() => void sendOutputCommand({ action: 'lights.all.set', ...pixelDraft })}>应用到全部</button>
-                    <button className="text-button" onClick={() => void sendOutputCommand({ action: 'lights.off' })}>全部熄灭</button>
-                  </div>
-                </fieldset>
-                <div className="led-row led-row-last">
-                  <div className="led-title"><span className="green-indicator"><i /></span><div><strong>状态指示灯</strong><small>GPIO42 · PWM</small></div></div>
-                  <button className="button button-subtle light-toggle" disabled={!lightsEditable} onClick={() => void sendOutputCommand({ action: 'lights.status.set', brightness: currentStatus.lights.status_led === 'on' ? 0 : indicatorDraft || 20 })}><span className={`tiny-dot ${currentStatus.lights.status_led === 'on' ? 'tiny-dot-on' : ''}`} />{stateLabel(currentStatus.lights.status_led)}</button>
-                </div>
-                <fieldset className="indicator-editor" disabled={!lightsEditable}>
-                  <label className="light-brightness">亮度<input aria-label="状态指示灯亮度" type="range" min="0" max="100" value={indicatorDraft} onChange={(event) => { setIndicatorDraft(Number(event.target.value)); setIndicatorDirty(true) }} /><output>{indicatorDraft}%</output></label>
-                  <button className="button button-subtle" onClick={() => void sendOutputCommand({ action: 'lights.status.set', brightness: indicatorDraft })}>应用亮度</button>
-                </fieldset>
-                <div className="power-control"><span>共享外设电源</span><button className="button button-subtle" disabled={!lightsEditable} onClick={() => void sendOutputCommand({ action: 'peripherals.power.set', on: currentStatus.peripherals.shared_rail !== 'on' })}>{currentStatus.peripherals.shared_rail === 'on' ? '关闭共享电源' : '开启共享电源'}</button></div>
-                <div className="power-note"><span className="power-line" />点亮灯带时自动供电；全部熄灭保留供电。GPIO8 同时影响麦克风与扬声器。</div>
-                <p className="light-note">{demoMode ? '演示模式：操作仅更新预览。' : !lightControl ? hello ? '灯光控制需要 0.1.5 或更新固件，请先升级开发板。' : '连接 USB 或蓝牙后可控制灯光。' : !lightControl.ready ? `灯光驱动不可用：${lightControl.error ?? '请重启开发板后重试'}。` : !wifiConfigOnline ? '当前仅查看状态，控制灯光请连接 USB 或蓝牙。' : '颜色与亮度在点击应用后生效；状态来自固件回报。'}</p>
-                {outputBusy && !pendingOutputRef.current?.action.startsWith('audio.') && <p className="light-note" role="status">正在应用设置…</p>}
-                {lightResult && <p className={`wifi-result ${lightResult.ok ? '' : 'error'}`} role="status">{lightResult.message}</p>}
-              </article>
-
-              <article className="audio-card panel">
-                <div className="panel-heading">
-                  <div><div className="section-kicker">AUDIO I/O</div><h3>音频设备</h3></div>
-                  <span className="audio-state"><span className={`pulse-dot ${currentStatus.microphone.state === 'active' ? 'pulse-on' : ''}`} />{stateLabel(currentStatus.microphone.state)}</span>
-                </div>
-                <div className="audio-devices">
-                  <div className="audio-device">
-                    <div className="audio-device-name"><span className="audio-icon"><Mic size={16} /></span><div><strong>麦克风</strong><small>输入 · I²S</small></div></div>
-                    <div className="meter-wrap"><div className="meter"><i style={{ width: `${micLevel}%` }} /></div><span>{micLevel}%</span></div>
-                  </div>
-                  <div className="audio-device speaker-device">
-                    <div className="audio-device-name"><span className="audio-icon speaker-icon"><Headphones size={16} /></span><div><strong>扬声器</strong><small>输出 · MAX98357A</small></div></div>
-                    <span className={`speaker-status ${stateClass(currentStatus.speaker.state)}`}>{stateLabel(currentStatus.speaker.state)}</span>
-                  </div>
-                </div>
-                <div className="audio-foot"><span><span className={`tiny-dot ${micVad ? 'tiny-dot-on' : ''}`} />语音活动 {micVad ? '检测中' : '未检测'}</span><span>{typeof currentStatus.speaker.volume === 'number' ? `音量 ${currentStatus.speaker.volume}%` : '音频状态由固件上报'}</span></div>
-                <div className="audio-actions">
-                  <button className="button button-subtle" disabled={!audioEditable} onClick={() => void sendOutputCommand({ action: 'audio.microphone.set', on: currentStatus.microphone.state !== 'active' })}>{currentStatus.microphone.state === 'active' ? '停止采集' : '开始采集'}</button>
-                  <button className="button button-subtle" disabled={!audioEditable} onClick={() => void sendOutputCommand(currentStatus.speaker.state === 'playing' ? { action: 'audio.speaker.stop' } : { action: 'audio.speaker.test', volume: 10 })}>{currentStatus.speaker.state === 'playing' ? '停止播放' : '播放测试音（10%）'}</button>
-                </div>
-                <p className="light-note">{demoMode ? '演示模式：预览音频状态，测试音约 1 秒后结束。' : !currentStatus.audio ? hello ? '音频控制需要 0.1.6 或更新固件，请先升级开发板。' : '连接开发板后可查看音频状态。' : !currentStatus.audio.ready ? '音频或共享电源驱动未就绪，请查看灯光状态并重启开发板。' : !wifiConfigOnline ? '当前仅查看状态，控制音频请连接 USB 或蓝牙。' : '采集或播放时自动供电；测试音约 1 秒。关闭共享电源会停止音频。'}</p>
-                {(currentStatus.microphone.error || currentStatus.speaker.error) && <p className="audio-protection-note">{currentStatus.microphone.error ? `麦克风：${currentStatus.microphone.error}。` : ''}{currentStatus.speaker.error ? `扬声器：${currentStatus.speaker.error}。` : ''}可重新启动对应功能重试。</p>}
-                {outputBusy && pendingOutputRef.current?.action.startsWith('audio.') && <p className="light-note" role="status">正在应用音频设置…</p>}
-                {audioResult && <p className={`wifi-result ${audioResult.ok ? '' : 'error'}`} role="status">{audioResult.message}</p>}
-              </article>
-            </div>
-
-            <div className="right-column">
-              <article className="events-card panel" id="events-panel">
-                <div className="panel-heading events-heading">
-                  <div><div className="section-kicker">INPUT STREAM</div><h3>实时输入事件 <span className="count-pill">{events.length}</span></h3></div>
-                  <div className="event-live"><span className={`pulse-dot ${protocolOnline || demoMode ? 'pulse-on' : ''}`} />{protocolOnline || demoMode ? 'LIVE' : '等待输入'}</div>
-                </div>
-                <div className="event-filter-row"><span>来源</span><span className="filter-chip"><span className="filter-dot key-dot" />按键</span><span className="filter-chip"><span className="filter-dot encoder-dot" />旋钮</span><span className="filter-chip"><span className="filter-dot mic-dot" />麦克风</span><button className="clear-events" onClick={() => setEvents([])}>清空</button></div>
-                <div className="event-list">
-                  {latestEvents.length === 0 ? (
-                    <div className="empty-events"><div className="empty-wave"><Activity size={21} /></div><strong>等待开发板输入</strong><span>按键、旋钮与麦克风事件会实时出现在这里</span><div className="key-hint"><kbd>S1</kbd><kbd>S2</kbd><kbd>S3</kbd><span>…</span><kbd>S8</kbd><span className="hint-sep" /> <RotateCw size={13} /> 旋钮</div></div>
-                  ) : latestEvents.map((event) => (
-                    <div className="event-row" key={event.rowId}>
-                      <div className={`event-source-icon ${event.source}`}>
-                        {event.source === 'key' ? <span>{event.key?.replace('S', '') ?? 'K'}</span> : event.source === 'encoder' ? <RotateCw size={15} /> : <Mic size={15} />}
-                      </div>
-                      <div className="event-copy"><strong>{describeInputEvent(event)}</strong><span>{event.source === 'key' ? '物理按键' : event.source === 'encoder' ? '旋转编码器' : 'I²S 麦克风'}</span></div>
-                      <time>{event.receivedAt}</time>
-                      <span className="event-arrow">↗</span>
-                    </div>
-                  ))}
-                </div>
-                <div className="events-footer"><span><span className="footer-led" />协议版本 {hello?.protocol ?? PROTOCOL_VERSION}</span><span>接收 {events.length} 条</span></div>
-              </article>
-
-              <div className="usb-tip"><span className="tip-icon"><Usb size={15} /></span><span>当前板只有一个原生 USB-C。需要烧录时，开机状态短按并松开 BOOT 进入下载模式。</span></div>
-            </div>
-          </div>
-
-          <section className="diagnostics-grid" aria-label="设备资源和网络诊断">
-            <article className="diagnostic-card panel">
-              <div className="panel-heading">
-                <div><div className="section-kicker">SYSTEM TELEMETRY</div><h3>性能、内存与存储</h3></div>
-                <span className="diagnostic-chip">{currentStatus.cpu.frequency_mhz || '—'} MHz</span>
-              </div>
-              <div className="metric-section">
-                <div className="metric-section-heading"><Cpu size={14} /><strong>CPU</strong><span>{currentStatus.cpu.temperature_c !== undefined ? `${currentStatus.cpu.temperature_c.toFixed(1)}°C 芯片温度` : '芯片温度不可用'}</span></div>
-                <div className="cpu-core-list">
-                  {currentStatus.cpu.usage_percent.map((usage, index) => <div className="cpu-core" key={index}><span>核心 {index}</span><div className="metric-bar"><i style={{ width: `${Math.min(100, Math.max(0, usage))}%` }} /></div><strong>{usage.toFixed(0)}%</strong></div>)}
-                  {currentStatus.cpu.usage_percent.length === 0 && <span className="metric-empty">等待 CPU 采样</span>}
-                </div>
-              </div>
-              <div className="metric-section">
-                <div className="metric-section-heading"><Zap size={14} /><strong>RAM / PSRAM</strong><span>空闲 / 总量 · 最大连续块</span></div>
-                <div className="resource-list">
-                  <div><span>内部 RAM</span><strong>{formatBytes(currentStatus.memory.internal.free_bytes)} / {formatBytes(currentStatus.memory.internal.total_bytes)}</strong><small>最低空闲 {formatBytes(currentStatus.memory.internal.minimum_free_bytes)} · 最大块 {formatBytes(currentStatus.memory.internal.largest_block_bytes)}</small></div>
-                  <div><span>外置 PSRAM</span><strong>{formatBytes(currentStatus.memory.psram.free_bytes)} / {formatBytes(currentStatus.memory.psram.total_bytes)}</strong><small>最大连续块 {formatBytes(currentStatus.memory.psram.largest_block_bytes)}</small></div>
-                </div>
-              </div>
-              <div className="metric-section">
-                <div className="metric-section-heading"><HardDrive size={14} /><strong>Flash 存储</strong><span>{formatBytes(currentStatus.storage.flash.total_bytes)} 总容量</span></div>
-                <div className="storage-summary"><span>Flash 状态<strong>{currentStatus.storage.flash.state === 'ready' ? '正常' : '等待数据'} · 末尾空闲 {formatBytes(currentStatus.storage.flash.unallocated_bytes)}</strong></span><span>运行分区<strong>{currentStatus.storage.app.state === 'running' ? '运行中' : '等待数据'} · 可用 {formatBytes(currentStatus.storage.app.free_bytes)} / {formatBytes(currentStatus.storage.app.partition_bytes)}</strong></span><span>NVS {formatBytes(currentStatus.storage.nvs.total_bytes)} · {currentStatus.storage.nvs.state === 'ready' ? '正常' : '不可用'}<strong>剩余 {currentStatus.storage.nvs.free_entries} / {currentStatus.storage.nvs.total_entries} 项</strong></span></div>
-                <div className="flash-rates"><span>读 {formatRate(currentStatus.storage.flash.read_bytes_per_second)}</span><span>写 {formatRate(currentStatus.storage.flash.write_bytes_per_second)}</span><span>擦除 {formatRate(currentStatus.storage.flash.erase_bytes_per_second)}</span></div>
-                <div className="partition-list">
-                  {currentStatus.storage.partitions.map((partition) => <div className="partition-row" key={`${partition.label}-${partition.address}`}><span>{partition.label}</span><code>0x{partition.address.toString(16).toUpperCase()}</code><strong>{formatBytes(partition.size_bytes)}</strong></div>)}
-                  {currentStatus.storage.partitions.length === 0 && <span className="metric-empty">等待分区信息</span>}
-                </div>
-                <p className="metric-footnote">Flash 速率统计 ESP-IDF Flash API 调用；CPU 使用率按各核心空闲时间估算。</p>
-              </div>
-            </article>
-
-            <div className="network-column">
-              <article className="diagnostic-card panel">
-                <div className="panel-heading">
-                  <div><div className="section-kicker">WI-FI DIAGNOSTICS</div><h3>Wi-Fi 连接诊断</h3></div>
-                  <span className={`diagnostic-chip ${stateClass(currentStatus.wifi.state)}`}>{wifiStatusLabel}</span>
-                </div>
-                <div className="network-details">
-                  <div><span>SSID</span><strong>{currentStatus.wifi.ssid ?? (currentStatus.wifi.configured ? '正在获取…' : '尚未配置')}</strong></div>
-                  <div><span>IP 地址</span><strong>{currentStatus.wifi.ip ?? '—'}</strong></div>
-                  <div><span>子网掩码</span><strong>{currentStatus.wifi.netmask ?? '—'}</strong></div>
-                  <div><span>网关 / DNS</span><strong>{[currentStatus.wifi.gateway, currentStatus.wifi.dns].filter(Boolean).join(' / ') || '—'}</strong></div>
-                  <div><span>信号 / 信道</span><strong>{currentStatus.wifi.state === 'connected' && currentStatus.wifi.rssi !== undefined ? `${currentStatus.wifi.rssi} dBm` : '—'}{currentStatus.wifi.state === 'connected' && currentStatus.wifi.channel ? ` / ${currentStatus.wifi.channel}` : ''}</strong></div>
-                  <div><span>重连 / 断线次数</span><strong>{currentStatus.wifi.retries ?? '—'} / {currentStatus.wifi.disconnects ?? '—'}</strong></div>
-                  <div className="network-reason"><span>最近断线原因</span><strong>{wifiDisconnectReason(currentStatus.wifi.disconnect_code)}</strong></div>
-                </div>
-                {wifiRetrying && <p className="wifi-retry-note" role="status">暂未连接，开发板仍在自动重试。最近原因：{wifiDisconnectReason(currentStatus.wifi.disconnect_code)}</p>}
-                <div className="wifi-config wifi-monitor" id="wifi-monitor">
-                  <div className="wifi-monitor-heading">
-                    <div className="metric-section-heading"><Wifi size={14} /><strong>网页监控 · Wi-Fi</strong></div>
-                    <span className={wifiProtocolOnline ? 'is-live' : wifiMonitorActive ? 'is-warn' : 'is-muted'} role="status">{wifiMonitorLabel}</span>
-                  </div>
-                  <form onSubmit={(event) => { event.preventDefault(); connectWifiMonitor() }}>
-                    <label>开发板 IP 地址<input aria-label="开发板 IP 地址" disabled={deviceBusy || wifiMonitorActive} autoComplete="off" maxLength={15} value={wifiAddress} onChange={(event) => setWifiAddress(event.target.value)} placeholder="例如 192.168.1.82" /></label>
-                    <div className="wifi-actions">
-                      {wifiMonitorActive
-                        ? <button className="button button-subtle" type="button" disabled={deviceBusy} onClick={() => wifiConnectionRef.current?.disconnect()}>{wifiMonitorConnected ? '断开 Wi-Fi 监控' : '取消重连'}</button>
-                        : <button className="button button-primary" type="submit" disabled={deviceBusy || !wifiAddress.trim()}><Wifi size={14} />连接 Wi-Fi 监控</button>}
-                    </div>
-                  </form>
-                  <p className="metric-footnote">电脑与开发板需在同一局域网。通过 USB 或蓝牙读取 IP 后会自动填入；Wi-Fi 通信正常后，可拔掉 USB 并断开蓝牙，使用锂电池继续监控。</p>
-                  {wifiMonitorError && <p className="wifi-retry-note" role="status">{wifiMonitorError}</p>}
-                </div>
-                <div className="wifi-config" id="wifi-config">
-                  {currentStatus.wifi.configured && <>
-                    <div className="metric-section-heading"><Wifi size={14} /><strong>已保存网络 · 自动连接</strong></div>
-                    <p className="metric-footnote">{currentStatus.wifi.ssid ?? '网络配置'}已保存在开发板中。开机和断线后自动连接，无需再次输入密码。</p>
-                    <div className="wifi-actions">
-                      {currentStatus.wifi.state !== 'connected' && <button className="button button-primary" type="button" disabled={!wifiConfigOnline || deviceBusy || wifiBusy || currentStatus.wifi.state === 'connecting'} onClick={() => void sendWifiCommand('wifi.connect_saved')}>{wifiBusy || currentStatus.wifi.state === 'connecting' ? <LoaderCircle size={14} className="spin" /> : <RotateCw size={14} />}{currentStatus.wifi.state === 'connecting' ? '自动连接中' : '使用已保存配置连接'}</button>}
-                      {!wifiEditing && <button className="text-button" type="button" disabled={!wifiConfigOnline || deviceBusy || wifiBusy} onClick={focusWifiConfiguration}>更换网络</button>}
-                      <button className="text-button" type="button" disabled={!wifiConfigOnline || deviceBusy || wifiBusy} onClick={() => void sendWifiCommand('wifi.clear')}>清除配置</button>
-                    </div>
-                  </>}
-                  {(wifiEditing || (wifiConfigOnline && currentStatus.wifi.configured === false)) && <form onSubmit={(event) => { event.preventDefault(); void sendWifiCommand('wifi.configure') }}>
-                    <div className="metric-section-heading wifi-form-heading"><Wifi size={14} /><strong>{currentStatus.wifi.configured ? '更换 Wi-Fi 网络' : '首次设置 Wi-Fi'}</strong></div>
-                    <label>网络名称 (SSID)<input ref={wifiSsidRef} disabled={!wifiConfigOnline || deviceBusy || wifiBusy} autoComplete="off" maxLength={32} value={wifiSsid} onChange={(event) => setWifiSsid(event.target.value)} placeholder="输入 2.4 GHz Wi-Fi 名称" /></label>
-                    <label>密码<input disabled={!wifiConfigOnline || deviceBusy || wifiBusy} autoComplete="new-password" maxLength={63} type="password" value={wifiPassword} onChange={(event) => setWifiPassword(event.target.value)} placeholder="只需填写一次；开放网络留空" /></label>
-                    <div className="wifi-actions"><button className="button button-primary" type="submit" disabled={!wifiConfigOnline || deviceBusy || wifiBusy}>{wifiBusy ? <LoaderCircle size={14} className="spin" /> : <Wifi size={14} />}保存并自动连接</button>{currentStatus.wifi.configured && <button className="text-button" type="button" disabled={wifiBusy} onClick={() => { setWifiEditing(false); setWifiPassword('') }}>取消</button>}</div>
-                  </form>}
-                  {!protocolOnline && !currentStatus.wifi.configured && <p className="metric-footnote">连接 USB、蓝牙或 Wi-Fi 监控后读取开发板保存的网络配置。</p>}
-                  {wifiResult && <p className={wifiResult.ok ? 'wifi-result' : 'wifi-result error'}>{wifiResult.message ?? (wifiResult.ok ? '操作完成。' : '操作失败。')}</p>}
-                  <p className="metric-footnote">网络配置通过 USB 或蓝牙修改。Wi-Fi 监控连接仅用于读取状态和输入事件。</p>
-                </div>
-              </article>
-
-              <article className="diagnostic-card panel power-diagnostic-card">
-                <div className="panel-heading"><div><div className="section-kicker">POWER</div><h3>供电状态</h3></div><Zap size={16} className="host-network-icon" /></div>
-                <div className="power-details"><span>电池电压<strong>{currentStatus.power.battery_mv !== undefined ? `${(currentStatus.power.battery_mv / 1000).toFixed(3)} V` : '不可用'}</strong></span><span>外部供电<strong>{currentStatus.power.external_power === undefined ? '等待数据' : currentStatus.power.external_power ? '已连接' : '未连接'}</strong></span><span>充电状态<strong>{currentStatus.power.charging === undefined ? '未知' : currentStatus.power.charging ? '正在充电' : '未充电'}</strong></span></div>
-                <p className="metric-footnote">当前按硬件电源检测脚与 ADC 电压上报；板上没有电量计，故不估算剩余百分比。</p>
-              </article>
-            </div>
-          </section>
-
-          <footer className="app-footer"><span>EasyInput V2.0 <span className="footer-separator">/</span> PCB AI Keyboard V2.1</span><span>浏览器 PWA · v{appVersion}</span></footer>
+        <div className="connection-line">
+          <span className="connection-summary"><span className={`pulse-dot ${protocolOnline || demoMode ? 'pulse-on' : ''}`} />{demoMode ? '演示模式' : protocolOnline ? `${transportLabel} · 实时连接` : dataTransportOpen ? '已连接 · 等待数据' : '等待连接设备'}</span>
+          <span className="connection-transports"><span className={usbStateClass} title={usbLabel}>USB</span><span className={bleStateClass}>BLE</span><span className={wifiProtocolOnline ? 'is-live' : 'is-muted'}>Wi-Fi</span><span className="app-version">v{appVersion}</span></span>
         </div>
-      </section>
+
+        <div className="notice-stack" aria-live="polite">
+          {serialError && <div className="notice notice-error"><X size={16} /><span>{serialError}</span><button onClick={() => setSerialError('')} aria-label="关闭提示"><X size={16} /></button></div>}
+          {updateWaiting && updateBlocked && <div className="notice notice-update"><RotateCw size={15} /><span>新版本已就绪，设备操作结束后会自动更新。</span></div>}
+        </div>
+
+        <section className="page-content" aria-labelledby="page-title">
+          <div className="section-heading"><div><p>{page.caption}</p><h2 id="page-title">{page.title}</h2></div><span className="page-number">0{pages.indexOf(page) + 1}<span> / 05</span></span></div>
+          {sectionTabs.items.length > 0 && <nav className="subnav" aria-label={`${page.label}分页`}>
+            {sectionTabs.items.map(([id, label]) => <button key={id} aria-pressed={sectionTabs.value === id} className={sectionTabs.value === id ? 'selected' : ''} onClick={() => sectionTabs.select(id)}>{label}{id === 'events' && events.length > 0 && <span className="tab-count">{events.length}</span>}</button>)}
+          </nav>}
+
+          <div className="page-body" key={`${activePage}-${sectionTabs.value}`}>
+            {activePage === 'overview' && overviewTab === 'device' && <div className="overview-layout">
+              <article className="device-hero">
+                <div className="hero-top"><span className="hero-badge"><Cpu size={13} /> YOUR DEVICE</span><span className="version-pill">V2.0</span></div>
+                <div className="hero-title"><div><h3>EasyInput</h3><p>{hello?.chip ?? 'ESP32-S3R8'}<span>·</span>AI Keyboard V2.1</p></div><div className="device-avatar"><Cpu size={34} strokeWidth={1.35} /></div></div>
+                <div className="hero-footer"><span>固件 <strong>{hello?.firmware ?? '未读取'}</strong></span><span>运行 <strong>{status ? formatDuration(status.uptime_ms) : '—'}</strong></span></div>
+              </article>
+              <div className="status-grid">
+                <article className="status-card panel"><div className="card-topline"><span className="card-icon wifi-icon"><Wifi size={17} /></span><button className="card-connect-button" onClick={() => setActivePage('network')}>详情 <ArrowRight size={12} /></button></div><span className="card-label">Wi-Fi</span><strong className={`status-value ${stateClass(currentStatus.wifi.state)}`}>{wifiStatusLabel}</strong><p className="card-foot">{wifiExtra}</p></article>
+                <article className="status-card panel"><div className="card-topline"><span className="card-icon bluetooth-icon"><Bluetooth size={17} /></span><button className="card-connect-button" disabled={deviceBusy} onClick={() => { if (bleConnected || bleConnecting || bleRetrying) disconnectBle(); else void connectBle() }}>{bleConnecting || bleRetrying ? '取消' : bleConnected ? '断开' : '连接'}</button></div><span className="card-label">Bluetooth LE</span><strong className={`status-value ${bleStateClass}`}>{bleLabel}</strong><p className="card-foot">{currentStatus.ble.name ?? 'EasyInput'}{bleError ? ' · 请查看网络页' : ''}</p></article>
+              </div>
+              <article className="power-summary panel"><div className="summary-heading"><Zap size={15} /><strong>供电状态</strong><span>{currentStatus.power.charging === undefined ? '等待数据' : currentStatus.power.charging ? '正在充电' : '未充电'}</span></div><div className="power-details"><div><span>电池电压</span><strong>{currentStatus.power.battery_mv !== undefined ? `${(currentStatus.power.battery_mv / 1000).toFixed(3)} V` : '不可用'}</strong></div><div><span>外部供电</span><strong>{currentStatus.power.external_power === undefined ? '等待数据' : currentStatus.power.external_power ? '已连接' : '未连接'}</strong></div><div><span>外设电源</span><strong>{stateLabel(currentStatus.peripherals.shared_rail)}</strong></div></div></article>
+              <div className="overview-foot"><span className="pulse-dot" />{demoMode ? '当前显示演示数据' : lastSeen ? `最近数据 ${lastSeen}` : '点击右上角 USB 或蓝牙连接设备'}<button onClick={() => { setOverviewTab('events'); setEventPage(0) }}>查看输入 <ArrowRight size={13} /></button></div>
+            </div>}
+
+            {activePage === 'overview' && overviewTab === 'events' && <article className="panel list-panel events-card">
+              <div className="panel-heading"><div><span className="section-kicker">INPUT STREAM</span><h3>实时输入事件 <span className="count-pill">{events.length}</span></h3></div><button className="text-button" onClick={() => { setEvents([]); setEventPage(0) }}>清空</button></div>
+              <div className="event-filter-row"><span><i className="filter-dot key-dot" />按键</span><span><i className="filter-dot encoder-dot" />旋钮</span><span><i className="filter-dot mic-dot" />麦克风</span><span className="event-live"><span className={`pulse-dot ${protocolOnline || demoMode ? 'pulse-on' : ''}`} />{protocolOnline || demoMode ? 'LIVE' : '等待输入'}</span></div>
+              <div className="paginated-list event-list" ref={eventListRef}>
+                {visibleEvents.length === 0 ? <div className="empty-state"><Activity size={30} strokeWidth={1.3} /><strong>等待你的第一次输入</strong><p>按下按键或转动旋钮<br />设备事件将在这里实时显示</p><span className="key-hint"><kbd>S1</kbd><kbd>S2</kbd><kbd>S3</kbd><span>…</span><kbd>S8</kbd></span></div> : visibleEvents.map((event) => <div className="event-row" key={event.rowId}><div className={`event-source-icon ${event.source}`}>{event.source === 'key' ? <span>{event.key?.replace('S', '') ?? 'K'}</span> : event.source === 'encoder' ? <RotateCw size={16} /> : <Mic size={16} />}</div><div className="event-copy"><strong>{describeInputEvent(event)}</strong><span>{event.source === 'key' ? '物理按键' : event.source === 'encoder' ? '旋转编码器' : 'I²S 麦克风'}</span></div><time>{event.receivedAt}</time></div>)}
+              </div>
+              <Pagination page={currentEventPage} count={eventPageCount} onChange={setEventPage} />
+            </article>}
+
+            {activePage === 'control' && controlTab === 'pixels' && <article className="panel control-card">
+              <div className="panel-heading"><div><span className="section-kicker">MAKE IT GLOW</span><h3>给灯光一点颜色</h3></div><span className="card-icon light-icon"><Lightbulb size={19} /></span></div>
+              <div className="led-row"><div><strong>WS2812 灯带</strong><small>选择一颗灯珠进行调整</small></div><div className="pixel-list" role="group" aria-label="选择灯珠">{Array.from({ length: 5 }, (_, index) => {
+                const pixelState = currentStatus.lights.pixels[index] ?? 'unknown'
+                const setting = lightControl?.pixels[index]
+                return <button key={index} className={`pixel-select ${selectedPixel === index ? 'selected' : ''}`} aria-label={`第 ${index + 1} 颗灯，${stateLabel(pixelState)}`} aria-pressed={selectedPixel === index} disabled={outputBusy || deviceBusy} onClick={() => { setSelectedPixel(index); setPixelDirty(false) }}><span className={`pixel ${pixelState === 'unknown' ? 'pixel-unknown' : ''}`} style={pixelState === 'on' && setting ? { background: setting.color, borderColor: setting.color, boxShadow: `0 0 10px ${setting.color}`, opacity: Math.max(0.25, setting.brightness / 100) } : undefined} /><small>{index + 1}</small></button>
+              })}</div></div>
+              <fieldset className="light-editor" disabled={!lightsEditable}><legend>第 {selectedPixel + 1} 颗灯</legend><div className="light-setting-row"><label className="light-color">颜色<input type="color" aria-label="灯珠颜色" value={pixelDraft.color.toLowerCase()} onChange={(event) => { setPixelDraft({ ...pixelDraft, color: event.target.value }); setPixelDirty(true) }} /></label><span className="light-color-code">{pixelDraft.color.toUpperCase()}</span><label className="light-switch"><input type="checkbox" checked={pixelDraft.on} onChange={(event) => { setPixelDraft({ ...pixelDraft, on: event.target.checked }); setPixelDirty(true) }} />开启</label></div><label className="light-brightness">亮度<input aria-label="灯珠亮度" type="range" min="0" max="100" value={pixelDraft.brightness} onChange={(event) => { setPixelDraft({ ...pixelDraft, brightness: Number(event.target.value) }); setPixelDirty(true) }} /><output>{pixelDraft.brightness}%</output></label><div className="light-actions"><button className="button button-primary" onClick={() => void sendOutputCommand({ action: 'lights.pixel.set', index: selectedPixel, ...pixelDraft })}>应用此灯</button><button className="button button-subtle" onClick={() => void sendOutputCommand({ action: 'lights.all.set', ...pixelDraft })}>应用到全部</button><button className="text-button" onClick={() => void sendOutputCommand({ action: 'lights.off' })}>全灭</button></div></fieldset>
+              <p className="light-note">{lightNote}</p>{outputBusy && !pendingOutputRef.current?.action.startsWith('audio.') && <p className="result-note" role="status">正在应用设置…</p>}{lightResult && <p className={`result-note ${lightResult.ok ? '' : 'error'}`} role="status">{lightResult.message}</p>}
+              <div className="panel-bottom-note"><Zap size={13} />点亮时自动供电，全部熄灭后保留供电。</div>
+            </article>}
+
+            {activePage === 'control' && controlTab === 'power' && <article className="panel control-card">
+              <div className="panel-heading"><div><span className="section-kicker">LIGHT & POWER</span><h3>指示灯与共享电源</h3></div><span className="card-icon wifi-icon"><Zap size={18} /></span></div>
+              <div className="led-row"><div><strong>状态指示灯</strong><small>调整开关与亮度</small></div><button className="button button-subtle" disabled={!lightsEditable} onClick={() => void sendOutputCommand({ action: 'lights.status.set', brightness: currentStatus.lights.status_led === 'on' ? 0 : indicatorDraft || 20 })}><span className={`tiny-dot ${currentStatus.lights.status_led === 'on' ? 'tiny-dot-on' : ''}`} />{stateLabel(currentStatus.lights.status_led)}</button></div>
+              <fieldset className="indicator-editor" disabled={!lightsEditable}><label className="light-brightness">亮度<input aria-label="状态指示灯亮度" type="range" min="0" max="100" value={indicatorDraft} onChange={(event) => { setIndicatorDraft(Number(event.target.value)); setIndicatorDirty(true) }} /><output>{indicatorDraft}%</output></label><button className="button button-subtle" onClick={() => void sendOutputCommand({ action: 'lights.status.set', brightness: indicatorDraft })}>应用亮度</button></fieldset>
+              <div className="power-control"><div><strong>共享外设电源</strong><small>{stateLabel(currentStatus.peripherals.shared_rail)}</small></div><button className="button button-primary" disabled={!lightsEditable} onClick={() => void sendOutputCommand({ action: 'peripherals.power.set', on: currentStatus.peripherals.shared_rail !== 'on' })}>{currentStatus.peripherals.shared_rail === 'on' ? '关闭电源' : '开启电源'}</button></div>
+              <p className="light-note">{lightNote}</p>{outputBusy && !pendingOutputRef.current?.action.startsWith('audio.') && <p className="result-note" role="status">正在应用设置…</p>}{lightResult && <p className={`result-note ${lightResult.ok ? '' : 'error'}`} role="status">{lightResult.message}</p>}
+              <div className="panel-bottom-note"><Zap size={14} />共享电源同时供给灯带、麦克风与扬声器；关闭会停止音频。</div>
+            </article>}
+
+            {activePage === 'control' && controlTab === 'audio' && <article className="panel audio-card">
+              <div className="panel-heading"><div><span className="section-kicker">SOUND CHECK</span><h3>听见设备的声音</h3></div><span className="status-chip">{stateLabel(currentStatus.microphone.state)}</span></div>
+              <div className="audio-devices"><div className="audio-device"><div className="audio-device-name"><span className="card-icon mic-icon"><Mic size={19} /></span><div><strong>麦克风</strong><small>音频输入</small></div><span className="device-state">{stateLabel(currentStatus.microphone.state)}</span></div><div className="meter-wrap"><div className="metric-bar"><i style={{ width: `${micLevel}%` }} /></div><span>{micLevel}%</span></div><button className="button button-subtle" disabled={!audioEditable} onClick={() => void sendOutputCommand({ action: 'audio.microphone.set', on: currentStatus.microphone.state !== 'active' })}>{currentStatus.microphone.state === 'active' ? '停止采集' : '开始采集'}</button></div>
+              <div className="audio-device"><div className="audio-device-name"><span className="card-icon bluetooth-icon"><Headphones size={19} /></span><div><strong>扬声器</strong><small>测试音量 10%</small></div><span className={`device-state ${stateClass(currentStatus.speaker.state)}`}>{stateLabel(currentStatus.speaker.state)}</span></div><button className="button button-subtle" disabled={!audioEditable} onClick={() => void sendOutputCommand(currentStatus.speaker.state === 'playing' ? { action: 'audio.speaker.stop' } : { action: 'audio.speaker.test', volume: 10 })}>{currentStatus.speaker.state === 'playing' ? '停止播放' : '播放测试音'}</button></div></div>
+              <p className="audio-foot"><span className={`tiny-dot ${micVad ? 'tiny-dot-on' : ''}`} />语音活动：{micVad ? '检测中' : '未检测'}<span>{typeof currentStatus.speaker.volume === 'number' ? `音量 ${currentStatus.speaker.volume}%` : ''}</span></p>
+              <p className="light-note">{demoMode ? '演示模式：测试音约 1 秒后结束。' : !currentStatus.audio ? hello ? '需要 0.1.6 或更新固件，请先升级。' : '连接开发板后可查看音频状态。' : !currentStatus.audio.ready ? '音频驱动未就绪，请检查电源后重试。' : !wifiConfigOnline ? '控制音频请连接 USB 或蓝牙。' : '采集与播放时自动供电；测试音约 1 秒。'}</p>
+              {(currentStatus.microphone.error || currentStatus.speaker.error) && <p className="result-note error">{currentStatus.microphone.error ? `麦克风：${currentStatus.microphone.error}。` : ''}{currentStatus.speaker.error ? `扬声器：${currentStatus.speaker.error}。` : ''}</p>}{outputBusy && pendingOutputRef.current?.action.startsWith('audio.') && <p className="result-note" role="status">正在应用音频设置…</p>}{audioResult && <p className={`result-note ${audioResult.ok ? '' : 'error'}`} role="status">{audioResult.message}</p>}
+            </article>}
+
+            {activePage === 'network' && <article className="panel network-card">
+              <div className="panel-heading"><div><span className="section-kicker">NETWORK CONTROL</span><h3>网络与连接</h3></div><span className={`status-chip ${stateClass(currentStatus.wifi.state)}`}>{wifiStatusLabel}</span></div>
+              <div className="network-action-grid">
+                <section className="network-action-block"><div className="network-action-heading"><Wifi size={16} /><strong>{wifiEditing ? '更换 Wi-Fi 网络' : 'Wi-Fi 设置'}</strong></div>
+                  {currentStatus.wifi.configured && !wifiEditing && <div className="saved-network"><span className="card-icon wifi-icon"><Check size={20} /></span><strong>{currentStatus.wifi.ssid ?? '已保存网络'}</strong><p>开机与断线后会自动连接<br />无需重复输入密码</p><div className="wifi-actions">{currentStatus.wifi.state !== 'connected' && <button className="button button-primary" type="button" disabled={!wifiConfigOnline || deviceBusy || wifiBusy || currentStatus.wifi.state === 'connecting'} onClick={() => void sendWifiCommand('wifi.connect_saved')}>{wifiBusy || currentStatus.wifi.state === 'connecting' ? <LoaderCircle size={14} className="spin" /> : <RotateCw size={14} />}{currentStatus.wifi.state === 'connecting' ? '自动连接中' : '使用已保存网络'}</button>}<button className="button button-subtle" disabled={!wifiConfigOnline || deviceBusy || wifiBusy} onClick={focusWifiConfiguration}>更换网络</button><button className="text-button" disabled={!wifiConfigOnline || deviceBusy || wifiBusy} onClick={() => void sendWifiCommand('wifi.clear')}>清除配置</button></div></div>}
+                  {(wifiEditing || currentStatus.wifi.configured !== true) && <form className="wifi-form" onSubmit={(event) => { event.preventDefault(); void sendWifiCommand('wifi.configure') }}><label>网络名称 (SSID)<input ref={wifiSsidRef} disabled={!wifiConfigOnline || deviceBusy || wifiBusy} autoComplete="off" maxLength={32} value={wifiSsid} onChange={(event) => setWifiSsid(event.target.value)} placeholder="输入 2.4 GHz Wi-Fi 名称" /></label><label>密码<input disabled={!wifiConfigOnline || deviceBusy || wifiBusy} autoComplete="new-password" maxLength={63} type="password" value={wifiPassword} onChange={(event) => setWifiPassword(event.target.value)} placeholder="开放网络可留空" /></label><div className="wifi-actions"><button className="button button-primary" type="submit" disabled={!wifiConfigOnline || deviceBusy || wifiBusy || !wifiSsid.trim()}>{wifiBusy ? <LoaderCircle size={14} className="spin" /> : <Wifi size={14} />}保存并自动连接</button>{currentStatus.wifi.configured && <button className="text-button" type="button" disabled={wifiBusy} onClick={() => { setWifiEditing(false); setWifiPassword('') }}>取消</button>}</div></form>}
+                  {wifiResult && <p className={`result-note ${wifiResult.ok ? '' : 'error'}`} role="status">{wifiResult.message ?? (wifiResult.ok ? '操作完成。' : '操作失败。')}</p>}
+                </section>
+                <section className="network-action-block"><div className="network-action-heading"><Monitor size={16} /><strong>无线监控</strong><span className={`status-chip ${wifiProtocolOnline ? 'is-live' : wifiMonitorActive ? 'is-warn' : 'is-muted'}`} role="status">{wifiMonitorLabel}</span></div>
+                  <form className="wifi-form" onSubmit={(event) => { event.preventDefault(); connectWifiMonitor() }}><label>开发板 IP 地址<input aria-label="开发板 IP 地址" disabled={deviceBusy || wifiMonitorActive} autoComplete="off" inputMode="decimal" maxLength={15} value={wifiAddress} onChange={(event) => setWifiAddress(event.target.value)} placeholder="例如 192.168.1.82" /></label><div className="wifi-actions">{wifiMonitorActive ? <button className="button button-subtle" type="button" disabled={deviceBusy} onClick={() => wifiConnectionRef.current?.disconnect()}>{wifiMonitorConnected ? '断开 Wi-Fi 监控' : '取消重连'}</button> : <button className="button button-primary" type="submit" disabled={deviceBusy || !wifiAddress.trim()}><Wifi size={15} />连接 Wi-Fi 监控</button>}</div></form>
+                  <p className="light-note">手机或电脑与开发板需在同一局域网。通过 USB 或蓝牙读取 IP 后自动填入。</p>{wifiMonitorError && <p className="result-note warn" role="status">{wifiMonitorError}</p>}
+                  <div className="bluetooth-section"><div className="summary-heading"><Bluetooth size={16} /><strong>蓝牙连接</strong><span className={bleStateClass}>{bleLabel}</span></div><div className="wifi-actions"><button className="button button-subtle" disabled={deviceBusy} onClick={() => { if (bleConnected || bleConnecting || bleRetrying) disconnectBle(); else void connectBle() }}>{bleConnected ? '断开蓝牙' : bleConnecting || bleRetrying ? '取消重连' : '连接蓝牙'}</button>{!bleConnected && !bleConnecting && <button className="text-button" disabled={deviceBusy} onClick={() => void connectBle(true)}>重新选择设备</button>}</div>{bleError && <p className="result-note warn">{bleError}</p>}</div>
+                </section>
+              </div>
+              <div className="network-status-section"><div className="network-status-heading"><span>当前 Wi-Fi 状态</span>{wifiRetrying && <span className="is-warn">开发板正在自动重试连接</span>}</div><div className="network-details"><div><span>网络名称</span><strong>{currentStatus.wifi.ssid ?? (currentStatus.wifi.configured ? '正在获取…' : '尚未配置')}</strong></div><div><span>IP 地址</span><strong>{currentStatus.wifi.ip ?? '—'}</strong></div><div><span>子网掩码</span><strong>{currentStatus.wifi.netmask ?? '—'}</strong></div><div><span>网关</span><strong>{currentStatus.wifi.gateway ?? '—'}</strong></div><div><span>DNS</span><strong>{currentStatus.wifi.dns ?? '—'}</strong></div><div><span>信号 / 信道</span><strong>{currentStatus.wifi.state === 'connected' && currentStatus.wifi.rssi !== undefined ? `${currentStatus.wifi.rssi} dBm` : '—'}{currentStatus.wifi.state === 'connected' && currentStatus.wifi.channel ? ` / ${currentStatus.wifi.channel}` : ''}</strong></div><div><span>重连 / 断线次数</span><strong>{currentStatus.wifi.retries ?? '—'} / {currentStatus.wifi.disconnects ?? '—'}</strong></div><div><span>最近断线原因</span><strong>{wifiDisconnectReason(currentStatus.wifi.disconnect_code)}</strong></div></div></div>
+              <div className="panel-bottom-note"><Usb size={14} />网络设置通过 USB 或蓝牙修改，Wi-Fi 连接仅用于监控。</div>
+            </article>}
+
+            {activePage === 'system' && systemTab === 'performance' && <article className="panel system-card">
+              <div className="panel-heading"><div><span className="section-kicker">SYSTEM TELEMETRY</span><h3>性能与内存</h3></div><span className="status-chip">{currentStatus.cpu.frequency_mhz || '—'} MHz</span></div>
+              <div className="metric-section"><div className="metric-section-heading"><Cpu size={15} /><strong>CPU</strong><span>{currentStatus.cpu.temperature_c !== undefined ? `${currentStatus.cpu.temperature_c.toFixed(1)} °C` : '温度不可用'}</span></div><div className="cpu-core-list">{currentStatus.cpu.usage_percent.map((usage, index) => <div className="cpu-core" key={index}><span>核心 {index}</span><div className="metric-bar"><i style={{ width: `${Math.min(100, Math.max(0, usage))}%` }} /></div><strong>{usage.toFixed(0)}%</strong></div>)}{currentStatus.cpu.usage_percent.length === 0 && <span className="metric-empty">等待 CPU 采样</span>}</div></div>
+              <div className="metric-section"><div className="metric-section-heading"><Zap size={15} /><strong>内存</strong><span>空闲 / 总量</span></div><div className="resource-list"><div><span>内部 RAM</span><strong>{formatBytes(currentStatus.memory.internal.free_bytes)} <small>/ {formatBytes(currentStatus.memory.internal.total_bytes)}</small></strong><p>最低空闲 {formatBytes(currentStatus.memory.internal.minimum_free_bytes)}<br />最大连续块 {formatBytes(currentStatus.memory.internal.largest_block_bytes)}</p></div><div><span>外置 PSRAM</span><strong>{formatBytes(currentStatus.memory.psram.free_bytes)} <small>/ {formatBytes(currentStatus.memory.psram.total_bytes)}</small></strong><p>最大连续块<br />{formatBytes(currentStatus.memory.psram.largest_block_bytes)}</p></div></div></div>
+              <div className="panel-bottom-note"><Activity size={14} />CPU 使用率根据各核心空闲时间估算。</div>
+            </article>}
+
+            {activePage === 'system' && systemTab === 'storage' && <article className="panel system-card">
+              <div className="panel-heading"><div><span className="section-kicker">STORAGE HEALTH</span><h3>存储状态</h3></div><HardDrive size={20} className="heading-icon" /></div>
+              <div className="storage-list"><div><span>Flash 总容量<small>{currentStatus.storage.flash.state === 'ready' ? '运行正常' : '等待数据'}</small></span><strong>{formatBytes(currentStatus.storage.flash.total_bytes)}<small>末尾空闲 {formatBytes(currentStatus.storage.flash.unallocated_bytes)}</small></strong></div><div><span>运行分区<small>{currentStatus.storage.app.state === 'running' ? '运行中' : '等待数据'}</small></span><strong>{formatBytes(currentStatus.storage.app.free_bytes)}<small>可用 / 共 {formatBytes(currentStatus.storage.app.partition_bytes)}</small></strong></div><div><span>NVS 配置存储<small>{formatBytes(currentStatus.storage.nvs.total_bytes)} · {currentStatus.storage.nvs.state === 'ready' ? '正常' : '不可用'}</small></span><strong>{currentStatus.storage.nvs.free_entries} / {currentStatus.storage.nvs.total_entries}<small>剩余条目 / 总条目</small></strong></div></div>
+              <div className="flash-rates"><div><span>读取</span><strong>{formatRate(currentStatus.storage.flash.read_bytes_per_second)}</strong></div><div><span>写入</span><strong>{formatRate(currentStatus.storage.flash.write_bytes_per_second)}</strong></div><div><span>擦除</span><strong>{formatRate(currentStatus.storage.flash.erase_bytes_per_second)}</strong></div></div><div className="panel-bottom-note"><HardDrive size={14} />速率统计设备 Flash API 的调用。</div>
+            </article>}
+
+            {activePage === 'system' && systemTab === 'partitions' && <article className="panel list-panel">
+              <div className="panel-heading"><div><span className="section-kicker">PARTITION MAP</span><h3>Flash 分区 <span className="count-pill">{currentStatus.storage.partitions.length}</span></h3></div><HardDrive size={20} className="heading-icon" /></div>
+              <div className="partition-table-heading"><span>分区名称</span><span>地址</span><span>大小</span></div><div className="paginated-list partition-list" ref={partitionListRef}>{visiblePartitions.length === 0 ? <div className="empty-state"><HardDrive size={30} strokeWidth={1.3} /><strong>等待分区信息</strong><p>连接设备后自动读取</p></div> : visiblePartitions.map((partition) => <div className="partition-row" key={`${partition.label}-${partition.address}`}><span>{partition.label}</span><code>0x{partition.address.toString(16).toUpperCase()}</code><strong>{formatBytes(partition.size_bytes)}</strong></div>)}</div><Pagination page={currentPartitionPage} count={partitionPageCount} onChange={setPartitionPage} />
+            </article>}
+
+            {activePage === 'firmware' && <article className="panel firmware-card">
+              <div className="panel-heading"><div><span className="section-kicker">FIRMWARE UPDATE</span><h3>固件包与设备烧录</h3></div><span className="status-chip">{manifest ? `v${manifest.version}` : '未导入固件'}</span></div>
+              <div className="firmware-current"><Cpu size={24} /><div><span>板载固件</span><strong>{hello?.firmware ?? '未读取'}</strong></div><span className={`status-chip ${hello ? 'is-live' : 'is-muted'}`}>{hello ? '运行中' : '待连接'}</span></div>
+              <div className="firmware-action-grid">
+                <section className="firmware-action-block"><div className="network-action-heading"><FileUp size={16} /><strong>选择固件包</strong></div>
+                  <input ref={flashFolderRef} type="file" multiple hidden disabled={deviceBusy} {...{ webkitdirectory: '', directory: '' }} onChange={(event) => void importFirmware(event)} />
+                  <button className={`package-drop ${manifest ? 'package-loaded' : ''}`} disabled={deviceBusy} onClick={() => flashFolderRef.current?.click()}><span className="upload-icon">{manifest ? <Check size={24} /> : <FileUp size={24} />}</span><strong>{manifest ? `版本 ${manifest.version}` : '选择本地固件包'}</strong><small>{manifest ? `${images.length} 个镜像 · SHA-256 已校验` : '选择包含 firmware.json 与镜像的目录'}</small><span className="package-link">{manifest ? '重新选择' : '导入目录'} <ChevronDown size={14} /></span></button>
+                  {packageError && <p className="result-note error" role="alert">{packageError}</p>}
+                </section>
+                <section className="firmware-action-block"><div className="network-action-heading"><Download size={16} /><strong>设备烧录</strong><span className={`status-chip ${flashing ? 'is-warn' : flashProgress === 100 ? 'is-live' : 'is-muted'}`}>{flashing ? '正在烧录' : flashProgress === 100 ? '已完成' : manifest ? '待连接设备' : '等待固件包'}</span></div>
+                  {!manifest && <div className="flash-empty"><FileUp size={30} strokeWidth={1.3} /><strong>先准备好固件包</strong><p>导入并校验成功后即可连接设备</p></div>}
+                  {flashProgress > 0 && <div className="flash-progress-wrap"><div className="flash-progress-label"><span>{flashing ? '正在烧录' : '烧录进度'}</span><strong>{flashProgress}%</strong></div><div className="metric-bar"><i style={{ width: `${flashProgress}%` }} /></div></div>}
+                  {flashCandidate ? <div className="flash-confirm"><div className="target-heading"><span className="card-icon wifi-icon"><Check size={18} /></span><div><span>已验证烧录目标</span><strong>{flashCandidate.chip}</strong></div></div><div className="target-details"><span>设备 MAC</span><code>{flashCandidate.mac}</code></div><div className="target-details"><span>目标固件</span><code>{manifest?.version}</code></div><label className="confirm-check"><input type="checkbox" checked={confirmedTarget} disabled={flashing} onChange={(event) => setConfirmedTarget(event.target.checked)} /><span>确认将以上固件写入这台设备</span></label><div className="flash-confirm-actions"><button className="text-button" disabled={flashing} onClick={cancelFlashCandidate}>取消</button><button className="button button-primary" disabled={!confirmedTarget || flashing} onClick={() => void flashFirmware()}>{flashing ? <LoaderCircle size={15} className="spin" /> : <Download size={15} />}确认烧录</button></div></div> : manifest && <div className="flash-ready"><span className="card-icon wifi-icon"><Usb size={24} /></span><strong>连接你的 EasyInput</strong><p>保持开发板开机，短按并松开 BOOT<br />选择 ESP32 下载端口</p><button className="button button-primary full-button" disabled={flashPreparing || flashing || serialConnecting || bleConnecting || wifiBusy} onClick={() => void prepareFlash()}>{flashPreparing ? <LoaderCircle size={15} className="spin" /> : <Usb size={15} />}{flashPreparing ? '正在识别芯片…' : '连接并识别设备'}</button></div>}
+                  {flashLog && <p className={`flash-log ${flashError ? 'error' : ''}`} role="status">{flashLog}</p>}{flashError && <p className="result-note error" role="alert">{flashError}</p>}
+                </section>
+              </div>
+              <section className="firmware-images"><div className="network-action-heading"><Check size={16} /><strong>已校验镜像清单</strong><span className="status-chip">{images.length} 个镜像</span></div>{manifest ? <><p className="light-note">版本 {manifest.version} · 所有镜像已通过 SHA-256 校验</p><div className="image-list">{images.map((image) => <div className="image-detail" key={image.file}><span className="card-icon wifi-icon"><Check size={18} /></span><div><strong>{image.file}</strong><small>写入地址 {formatAddress(image.address)}</small></div><span>{formatBytes(image.bytes)}</span></div>)}</div></> : <p className="light-note">导入固件包后显示镜像文件、写入地址和大小。</p>}</section>
+              <div className="panel-bottom-note"><Usb size={14} />仅写入固件包内镜像，保留其他分区。烧录后关机再开机。</div>
+            </article>}
+          </div>
+        </section>
+
+      </div>
     </main>
   )
 }
