@@ -1,4 +1,5 @@
 #include "lights.h"
+#include "audio.h"
 
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -31,8 +32,7 @@ bool lights_pixel_is_lit(const light_pixel_t *pixel)
     return scale_channel(pixel->rgb, 16, pixel) || scale_channel(pixel->rgb, 8, pixel) || scale_channel(pixel->rgb, 0, pixel);
 }
 
-// There are no active I2S consumers in this firmware. Future audio drivers MUST
-// share this lock/ownership gate and stop before the rail can be switched off.
+// Audio startup also takes lights_mutex via lights_with_shared_power.
 static esp_err_t safe_downstream(void)
 {
     const gpio_num_t outputs[] = {GPIO_NUM_9, GPIO_NUM_10, GPIO_NUM_12, GPIO_NUM_13, GPIO_NUM_14, GPIO_NUM_15};
@@ -107,6 +107,9 @@ static esp_err_t start_rail(void)
 
 static esp_err_t stop_rail(void)
 {
+    // Wait for in-flight I/O, then disable and detach both audio controllers.
+    const esp_err_t audio_result = audio_prepare_power_off();
+    if (audio_result != ESP_OK) return audio_result;
     // Must stop/detach RMT before restoring GPIO12 to a low GPIO output.
     if (channel_enabled) {
         const esp_err_t result = rmt_disable(pixel_channel);
@@ -201,6 +204,23 @@ static esp_err_t set_pixels(int index, const light_pixel_t *pixel)
         for (int i = 0; i < LIGHT_PIXEL_COUNT; i++) state.pixels[i] = next[i];
     }
     return finish_operation(result);
+}
+
+esp_err_t lights_with_shared_power(esp_err_t (*operation)(void *), void *context)
+{
+    if (!operation) return ESP_ERR_INVALID_ARG;
+    if (!lights_mutex) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(lights_mutex, portMAX_DELAY);
+    if (!state.ready) {
+        xSemaphoreGive(lights_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t power_result = start_rail();
+    if (power_result != ESP_OK) return finish_operation(power_result);
+    // Audio failures do not poison a healthy RMT/PWM driver.
+    const esp_err_t result = operation(context);
+    xSemaphoreGive(lights_mutex);
+    return result;
 }
 
 esp_err_t lights_set_pixel(int index, const light_pixel_t *pixel)

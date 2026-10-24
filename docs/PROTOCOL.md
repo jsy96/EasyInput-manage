@@ -15,7 +15,7 @@ All frames use `protocol: 2`. The desktop ignores older, unknown, or malformed v
 
 `wifi` includes the station connection state, configured SSID (never its password), RSSI, channel, last disconnect reason code, disconnect/retry counters and IPv4 address, netmask, gateway and DNS when available. `storage.partitions` enumerates the flash partition table. Flash I/O rates count ESP-IDF SPI flash API operations, not memory-mapped reads or total bus traffic. `flash.unallocated_bytes` is the unused area after the last partition. CPU usage is estimated from each core's FreeRTOS idle time; temperature is the ESP32-S3 internal sensor reading. Internal RAM and PSRAM report total/free/minimum/largest blocks as supported by the heap allocator. NVS free space is reported in entries as well as partition bytes.
 
-`source` is `key`, `encoder`, or `microphone`. Key and encoder-button actions are `down`/`up`; encoder movement uses `rotate` and a signed detent `delta`. Microphone events can use `vad_start`, `vad_end`, and `level` when the board's shared audio rail has been qualified and microphone capture is enabled.
+`source` is `key`, `encoder`, or `microphone`. Key and encoder-button actions are `down`/`up`; encoder movement uses `rotate` and a signed detent `delta`. Firmware 0.1.6 emits microphone `vad_start`, `vad_end`, and `level` events while capture is enabled; its rail timing and audio format are provisional bring-up settings pending assembled-board qualification.
 
 ## Desktop to board
 
@@ -98,16 +98,44 @@ Pixel set changes exactly one setting; all set copies one setting to five pixels
 
 The shared rail defaults off. A nonzero emitted pixel automatically enables it. At cold start, GPIO8 and downstream command outputs are latched low before output direction is enabled; GPIO11 stays disabled/floating without pulls. On every rail enable the firmware restores downstream safe levels, raises GPIO8, waits `SHARED_RAIL_SETTLE_MS=100` plus one scheduler tick, then creates/enables RMT and sends a black frame before colors. This is a **provisional project bring-up wait**, not a measurement or proof that all components/batches have stabilized. The board exposes no rail-ready feedback in this implementation. Qualify the settling waveform and voltage/DIN margins on the actual assembled board before accepting the result.
 
-RMT transmits GRB at 800 kbit/s (T0H/T0L 0.40/0.85 µs, T1H/T1L 0.80/0.45 µs) plus a 300 µs low latch. The entire five-pixel frame and end marker fit in RMT memory. Each channel is scaled with `(value * brightness + 50) / 100` when enabled. Shared shutdown sends black, stops/detaches RMT, restores GPIO9/10/12/13/14/15 low and GPIO11 disabled/floating, then lowers GPIO8. Pixel enable flags are cleared; powering back on alone does not restore previously lit pixels. The independent GPIO42 PWM is unaffected. One mutex serializes driver operations and status snapshots. Audio has no active I2S consumers; future audio drivers must coordinate with this same rail ownership/stop gate before using or releasing GPIO8.
+RMT transmits GRB at 800 kbit/s (T0H/T0L 0.40/0.85 µs, T1H/T1L 0.80/0.45 µs) plus a 300 µs low latch. The entire five-pixel frame and end marker fit in RMT memory. Each channel is scaled with `(value * brightness + 50) / 100` when enabled. Shared shutdown sends black, waits for audio I/O, stops/detaches both I²S controllers and RMT, restores GPIO9/10/12/13/14/15 low and GPIO11 disabled/floating, then lowers GPIO8. Pixel enable flags are cleared; powering back on alone does not restore previously lit pixels. The independent GPIO42 PWM is unaffected. The shared-rail mutex serializes light operations and audio startup. The audio worker uses a separate mutex, with strict lock order rail → audio → I²S. Shutdown takes the audio mutex to wait for bounded in-flight DMA calls; if an audio controller cannot be stopped/detached, GPIO8 stays on and an error is reported.
 
-Settings are volatile and reset on reboot. Disconnecting a monitoring transport does not switch the lights off. Microphone/speaker remain `unavailable` regardless of shared-power state until audio drivers are implemented and qualified.
+Settings are volatile and reset on reboot. Disconnecting a monitoring transport does not switch the lights off. Firmware before 0.1.6 reports microphone/speaker as `unavailable`. Firmware 0.1.6 starts both idle and enables them on demand through the shared-power gate.
+
+## Audio control (firmware 0.1.6+)
+
+Protocol remains 2. An optional top-level `audio` capability distinguishes the new firmware from older devices. Typical audio fields in a status frame are:
+
+```json
+{"audio":{"ready":true,"sample_rate_hz":16000},"microphone":{"state":"active","rms":512,"vad":true},"speaker":{"state":"idle","volume":10}}
+```
+
+`audio.ready` means the worker and shared-power gate are available, including while GPIO8 is off; it does not prove physical capture/playback. Microphone states are `idle`/`active`/`unavailable`; speaker states are `idle`/`playing`/`unavailable`. Each device can include an `error` string containing an ESP-IDF error name. Initialization failure disables audio capability until reboot. Channel failures stop/release the affected driver and permit retry through its start command. Speaker state describes firmware playback, without physical feedback. RMS and VAD reset when capture stops or power is disabled. Test volume defaults to 10 and records the last requested digital amplitude percentage.
+
+Commands use USB/encrypted BLE and share the light-command queue, request correlation, timeout and no-replay behavior. Emit a fresh status before acknowledging each command. Wi-Fi remains read-only.
+
+```json
+{"type":"command","protocol":2,"action":"audio.microphone.set","on":true,"request_id":"audio-1"}
+{"type":"command","protocol":2,"action":"audio.microphone.set","on":false,"request_id":"audio-2"}
+{"type":"command","protocol":2,"action":"audio.speaker.test","volume":10,"request_id":"audio-3"}
+{"type":"command","protocol":2,"action":"audio.speaker.stop","request_id":"audio-4"}
+{"type":"event","protocol":2,"source":"microphone","action":"level","rms":512,"vad":true,"uptime_ms":4567}
+```
+
+`on` must be boolean. Test `volume` is an integer 1–20 (omission defaults to 10); invalid arguments do not power the rail or alter audio. Starting audio automatically enables shared power and waits for the same provisional settling gate used by pixels. Stopping capture/playback releases its I²S channel and restores its safe pins while keeping shared power on. Explicit power-off stops both audio functions before restoring downstream pins and lowering GPIO8. Power-on alone never resumes capture or playback. Settings are volatile; disconnecting any monitoring session leaves capture running. No PCM data is persisted or sent to Studio.
+
+Project format: independent I²S0 RX on GPIO9/10/11 and I²S1 TX on GPIO14/13/15, both 16 kHz Philips stereo. RX uses 32-bit slots with signed, high-aligned 24-bit samples converted to 16-bit units, removes each slot's DC mean and takes the higher slot RMS (0–32768); the board schematic ties microphone SELECT high. Both slots are captured so an empty slot does not halve the reported level. RX ignores the first 100 ms and reports a channel timeout after 500 ms without received samples. A successfully clocked stream of zeros cannot prove that a physical microphone works.
+
+The basic energy VAD starts at RMS 300 and releases below RMS 180 after a 300 ms hold. The status task samples activity about every 100 ms, emits `level` events no faster than every 250 ms plus start/stop, and broadcasts `vad_start`/`vad_end` on observed transitions. These are sound-activity heuristics, not a speech classifier; ambient sound and speaker playback can trigger them. Status frames continue about once per second. Studio uses newer microphone events between status frames for its meter/activity display.
+
+TX sends identical 16-bit samples to both slots: 440 Hz for 16,000 frames, with 20 ms amplitude fades, then drains up to six 256-frame DMA blocks plus 20 ms and releases the controller. DMA automatically clears completed TX buffers to silence; repeated playback replaces the current test. Capture and playback can run concurrently. Actual slot format, sensitivity, thresholds, DMA behavior under radio load, rail settling and audible output require assembled-board verification.
 
 ## Hardware truth and limits
 
 - The board has one native USB-C port. The app filters for Espressif USB Serial/JTAG (`VID 303A`, `PID 1001`) and asks the user to select a port; it does not infer identity from a path such as `/dev/cu.usbmodem…`.
 - Wi-Fi uses the ESP32-S3 2.4 GHz station radio. Disconnect reason codes come from ESP-IDF; the app names common authentication, access point, beacon, and handshake failures and retains the numeric code for other reasons.
 - BLE advertises as `EasyInput`, reports link state, and exposes the Studio GATT service documented above. BLE command writes require an encrypted link.
-- GPIO8 defaults low, and 0.1.5+ implements explicit/automatic light power control with the provisional project timing described above. Rail settling and 3.3 V LED-DIN margins have not been electrically qualified. GPIO12 drives five serial GRB pixels; GPIO42 is an independent green status LED. Audio drivers remain unavailable.
-- The speaker has no physical activity feedback pin. A future status can only report firmware playback state unless hardware feedback is added.
+- GPIO8 defaults low, and 0.1.5+ implements explicit/automatic light power control with the provisional project timing described above. Rail settling and 3.3 V LED-DIN margins have not been electrically qualified. GPIO12 drives five serial GRB pixels; GPIO42 is an independent green status LED. Firmware 0.1.6 adds on-demand microphone/speaker I²S drivers using the same shared-power gate; physical audio behavior remains unverified.
+- The speaker has no physical activity feedback pin. Status reports firmware playback state; actual sound requires an audible check.
 - Battery reporting is limited to calibrated voltage and board power/charge pins. There is no qualified battery chemistry or fuel gauge for a remaining-capacity percentage.
 - PSRAM initialization, ADC voltage accuracy and sampling window, GPIO power/charge polarity, Wi-Fi recovery behavior, and CPU/temperature measurements still need verification on the assembled board.

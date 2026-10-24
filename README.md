@@ -11,6 +11,7 @@ File locations and collaboration rules are defined in [AGENTS.md](AGENTS.md). Pr
 - Remembered Bluetooth authorization, automatic reconnection, and persistent board-side pairing.
 - Wi-Fi configuration, saved-credential reconnection, and connection diagnostics.
 - Individual RGB color, brightness and on/off control for five WS2812 pixels, independent status LED dimming, and explicit shared-power control (firmware 0.1.5+; USB/BLE commands).
+- Microphone capture, live RMS level and basic energy-based voice activity, plus a one-second low-volume speaker test (firmware 0.1.6+; USB/BLE commands).
 - Firmware package validation, ESP32-S3 identification, explicit write confirmation, progress, and per-image flashing without whole-flash erase.
 - A clearly marked interface preview mode that works without connecting to hardware.
 - Installable PWA shell with offline-cached static application assets. Device telemetry and credentials are not cached.
@@ -28,7 +29,7 @@ USB Serial and Web Bluetooth require a secure browser context and an explicit br
 
 USB and Bluetooth can connect to the same board simultaneously. Connecting or disconnecting one does not close the other. Each connection has its own handshake and protocol state; commands use healthy USB first and fall back to healthy Bluetooth. Each USB connection requests a fresh board handshake, allowing Wi-Fi configuration after a late connection or reconnect without restarting the board. This requires monitor firmware 0.1.2 or later with `hello.get` support.
 
-The service worker caches the versioned static app shell and build assets. While the app is visible, it checks for new deployments every 30 minutes. A detected update activates automatically and reloads once USB, BLE, Wi-Fi monitoring, Wi-Fi/light commands, and firmware operations are idle. It does not cache Wi-Fi passwords, board telemetry, or device commands. The browser owns USB/Bluetooth device selection and permission prompts.
+The service worker caches the versioned static app shell and build assets. While the app is visible, it checks for new deployments every 30 minutes. A detected update activates automatically and reloads once USB, BLE, Wi-Fi monitoring, Wi-Fi/light/audio commands, and firmware operations are idle. It does not cache Wi-Fi passwords, board telemetry, or device commands. The browser owns USB/Bluetooth device selection and permission prompts.
 
 ## Automatic Bluetooth connection
 
@@ -64,10 +65,10 @@ The board-side project targets ESP32-S3 and uses ESP-IDF 5.5.5 or later. Default
 cd firmware/easyinput-monitor
 idf.py set-target esp32s3
 idf.py build
-python3 ../../scripts/export-firmware.py --version 0.1.5
+python3 ../../scripts/export-firmware.py --version 0.1.6
 ```
 
-The export command writes `release/firmware/0.1.5-v2-monitor` containing `firmware.json` and the bootloader, partition table, and app images. The output is relative to the repository root, regardless of the shell's current directory. Firmware packages stay outside the website build output and are excluded from Git. The app checks the manifest, image sizes and SHA-256 hashes before flashing; the manifest is not a signed publisher identity. The WebSocket options in `sdkconfig.defaults` require ESP-IDF 5.5.5 or later. When reusing older generated configurations, regenerate them from these defaults before building so WebSocket support and both handshake callbacks are enabled.
+The export command writes `release/firmware/0.1.6-v2-monitor` containing `firmware.json` and the bootloader, partition table, and app images. The output is relative to the repository root, regardless of the shell's current directory. Firmware packages stay outside the website build output and are excluded from Git. The app checks the manifest, image sizes and SHA-256 hashes before flashing; the manifest is not a signed publisher identity. The WebSocket options in `sdkconfig.defaults` require ESP-IDF 5.5.5 or later. When reusing older generated configurations, regenerate them from these defaults before building so WebSocket support and both handshake callbacks are enabled.
 
 ## Automatic connection hardware check
 
@@ -96,9 +97,19 @@ Update the board using `release/firmware/0.1.5-v2-monitor/firmware.json` and all
 
 In **灯光与电源**, select pixel **1–5**, choose a color, enable **开启**, choose brightness, then click **应用此灯**. **应用到全部** copies that color, brightness and on/off setting to all five. **全部熄灭** preserves each pixel's color/brightness while switching all five off. Wire index 0 is displayed as pixel 1; the physical order needs checking on the board. Status LED GPIO42 has an independent toggle and brightness slider with **应用亮度**; it can work while shared power is off. Changes take effect only after applying. Preview mode simulates these operations without controlling hardware.
 
-Shared power starts off after reboot. A lit pixel automatically enables GPIO8; **全部熄灭** leaves power on. **关闭共享电源** sends a black frame, stops RMT, returns downstream outputs low and GPIO11 floating, then lowers GPIO8. It also clears pixel enable flags, so explicitly enabling power again does not restore old lights. Status LED GPIO42 is unaffected. Microphone and speaker drivers remain unavailable even when shared power is on. Settings live in RAM and reset on reboot; disconnecting the page leaves the last settings running.
+Shared power starts off after reboot. A lit pixel automatically enables GPIO8; **全部熄灭** leaves power on. **关闭共享电源** sends a black frame, stops and detaches microphone/speaker I²S and RMT, returns downstream outputs low and GPIO11 floating, then lowers GPIO8. It also clears pixel enable flags, so explicitly enabling power again does not restore old lights. Status LED GPIO42 is unaffected. Firmware 0.1.6 adds on-demand audio drivers; turning power on alone leaves audio idle. Settings live in RAM and reset on reboot; disconnecting the page leaves the last settings running.
 
 The project currently waits at least **100 ms** after GPIO8 rises, then creates/enables the RMT driver, sends a black frame, and applies colors. This is a provisional bring-up parameter, not a measured board guarantee. Before accepting the hardware behavior, verify rail settling, USB/battery voltage and 3.3 V DIN margin. RMT sends five GRB pixels at 800 kbit/s with a 300 µs low latch; GPIO42 PWM uses 5 kHz/13-bit resolution. Start board checks at 20% brightness: test red/green/blue and off on each pixel, copy to all, switch all off while power stays on, then power off/on and test status LED independently. Verify USB/BLE status follows changes and key events still arrive.
+
+## Audio control (firmware 0.1.6+)
+
+Import the complete `release/firmware/0.1.6-v2-monitor/` folder in Studio, confirm the identified board, flash it, then switch the board off and on. Refresh Studio and connect USB or encrypted Bluetooth. In **音频设备**, click **开始采集** and speak near the board; the level meter, voice-activity indicator and microphone events should respond. **停止采集** resets RMS/VAD and releases the microphone controller. The indicator uses simple energy thresholds, so other loud sounds and the test tone can also trigger it; it is not speech recognition.
+
+Click **播放测试音（10%）** to play a 440 Hz tone for about one second; it stops automatically, or click **停止播放**. The firmware permits test amplitudes of 1–20%, with 20 ms fades. These percentages describe digital amplitude, not calibrated acoustic loudness. Playback status confirms the firmware operation only; listen to verify the speaker physically works. Driver errors appear on the card and the affected start action can retry. Missing audio capability on older firmware displays an upgrade prompt.
+
+Audio starts idle and shared power stays off after reboot. Starting capture or a test powers GPIO8 automatically and uses the existing provisional 100 ms settling wait. Stopping either audio function keeps shared power and lights unchanged. **关闭共享电源** stops both audio controllers and the pixels before powering down; turning power back on leaves capture and playback idle. GPIO42 stays independent. Disconnecting Studio leaves capture running until stopped, powered down, or rebooted. No PCM recording is stored or transmitted; only levels, activity and playback state are reported. Wi-Fi can monitor these values, while audio commands require USB/BLE. Preview mode simulates state and plays no sound.
+
+Board check: start capture, speak, play the test with capture running, then stop each independently. Turn shared power off during capture/playback and check that both stop; turn it back on and verify they remain idle until explicitly restarted. Check that lit pixels and key/encoder events continue working during audio. The microphone slot/alignment, sensitivity/VAD thresholds, simultaneous I²S behavior, rail settling and audible output still need this assembled-board validation.
 
 ## Flashing behavior
 
@@ -106,4 +117,4 @@ The browser filters device access through the Web Serial permission prompt. Firm
 
 ## Hardware validation boundary
 
-Physical USB enumeration, simultaneous USB/BLE/Wi-Fi sessions, Wi-Fi provisioning/recovery and WebSocket monitoring on battery power, PSRAM initialization, ADC voltage accuracy and sampling, power/charge detection, CPU/temperature readings, key/encoder polarity, BLE radio behavior, and flash/resume behavior still need a board-side check. The encoder direction is a project choice and should be checked against the actual knob. Light control is implemented for board bring-up; the 100 ms shared-rail wait, electrical margins, pixel order and visible behavior still require assembled-board validation. Compilation and software tests do not qualify the circuit. Shared-rail audio drivers remain unimplemented.
+Physical USB enumeration, simultaneous USB/BLE/Wi-Fi sessions, Wi-Fi provisioning/recovery and WebSocket monitoring on battery power, PSRAM initialization, ADC voltage accuracy and sampling, power/charge detection, CPU/temperature readings, key/encoder polarity, BLE radio behavior, and flash/resume behavior still need a board-side check. The encoder direction is a project choice and should be checked against the actual knob. Light control is implemented for board bring-up; the 100 ms shared-rail wait, electrical margins, pixel order and visible behavior still require assembled-board validation. Compilation and software tests do not qualify the circuit. Audio drivers are implemented for bring-up; microphone sample alignment/levels, energy-based VAD thresholds, concurrent capture/playback and physical speaker output remain to be verified on the assembled board.

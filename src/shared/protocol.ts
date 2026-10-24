@@ -25,6 +25,11 @@ export type LightCommand =
   | { action: 'lights.status.set'; brightness: number }
   | { action: 'peripherals.power.set'; on: boolean }
 
+export type AudioCommand =
+  | { action: 'audio.microphone.set'; on: boolean }
+  | { action: 'audio.speaker.test'; volume: number }
+  | { action: 'audio.speaker.stop' }
+
 export interface BoardStatus {
   type: 'status'
   protocol: number
@@ -46,8 +51,9 @@ export interface BoardStatus {
   ble: { state: ConnectionState; name?: string; peers?: number }
   peripherals: { shared_rail: 'off' | 'on' | 'unknown' }
   lights: { status_led: 'off' | 'on' | 'unknown'; pixels: Array<'off' | 'on' | 'unknown'>; control?: LightControl }
-  speaker: { state: 'unavailable' | 'idle' | 'playing' | 'unknown'; volume?: number }
-  microphone: { state: 'unavailable' | 'idle' | 'active' | 'unknown'; rms?: number; vad?: boolean }
+  audio?: { ready: boolean; sample_rate_hz: number }
+  speaker: { state: 'unavailable' | 'idle' | 'playing' | 'unknown'; volume?: number; error?: string }
+  microphone: { state: 'unavailable' | 'idle' | 'active' | 'unknown'; rms?: number; vad?: boolean; error?: string }
   cpu: { frequency_mhz: number; usage_percent: number[]; temperature_c?: number }
   memory: {
     internal: { total_bytes: number; free_bytes: number; minimum_free_bytes: number; largest_block_bytes: number }
@@ -147,6 +153,13 @@ export function parseBoardMessage(line: string): BoardMessage | null {
       !isRecord(power)
     ) return null
     if (lights.control !== undefined && !isLightControl(lights.control)) return null
+    if (record.audio !== undefined && (!isRecord(record.audio) || typeof record.audio.ready !== 'boolean' ||
+      !isFiniteNumber(record.audio.sample_rate_hz) || !Number.isInteger(record.audio.sample_rate_hz) || record.audio.sample_rate_hz <= 0)) return null
+    if ((microphone.rms !== undefined && !isAudioLevel(microphone.rms)) ||
+      (microphone.vad !== undefined && typeof microphone.vad !== 'boolean') ||
+      (microphone.error !== undefined && typeof microphone.error !== 'string') ||
+      (speaker.volume !== undefined && !isBrightness(speaker.volume)) ||
+      (speaker.error !== undefined && typeof speaker.error !== 'string')) return null
     return record as unknown as BoardStatus
   }
 
@@ -155,6 +168,8 @@ export function parseBoardMessage(line: string): BoardMessage | null {
       !['key', 'encoder', 'microphone'].includes(String(record.source)) ||
       typeof record.action !== 'string' || typeof record.uptime_ms !== 'number'
     ) return null
+    if (record.source === 'microphone' && ((record.rms !== undefined && !isAudioLevel(record.rms)) ||
+      (record.vad !== undefined && typeof record.vad !== 'boolean'))) return null
     return record as unknown as InputEvent
   }
 
@@ -180,6 +195,10 @@ function isBrightness(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 100
 }
 
+function isAudioLevel(value: unknown): value is number {
+  return isFiniteNumber(value) && value >= 0 && value <= 32768
+}
+
 function isLightControl(value: unknown): value is LightControl {
   return isRecord(value) && typeof value.ready === 'boolean' && isBrightness(value.status_led_brightness) &&
     (value.error === undefined || typeof value.error === 'string') &&
@@ -188,7 +207,7 @@ function isLightControl(value: unknown): value is LightControl {
       isBrightness(pixel.brightness) && typeof pixel.on === 'boolean')
 }
 
-export function lightResultMatches(result: BoardResult, pending: { action: string; requestId: string } | null): boolean {
+export function commandResultMatches(result: BoardResult, pending: { action: string; requestId: string } | null): boolean {
   return pending !== null && result.action === pending.action && result.request_id === pending.requestId
 }
 

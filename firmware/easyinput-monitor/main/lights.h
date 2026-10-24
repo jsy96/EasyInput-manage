@@ -28,3 +28,5 @@ esp_err_t lights_set_all(const light_pixel_t *pixel);
 esp_err_t lights_off(void);
 esp_err_t lights_set_status(uint8_t brightness);
 esp_err_t lights_set_power(bool on);
+// Serializes audio startup with shutdown and waits for stable shared power.
+esp_err_t lights_with_shared_power(esp_err_t (*operation)(void *), void *context);

@@ -6,6 +6,7 @@
 
 #include "cJSON.h"
 #include "lights.h"
+#include "audio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/idf_additions.h"
@@ -669,12 +670,20 @@ static void emit_status(void)
         cJSON_AddBoolToObject(setting, "on", pixel->on);
         cJSON_AddItemToArray(settings, setting);
     }
+    audio_snapshot_t audio_state;
+    audio_get_snapshot(&audio_state);
+    cJSON *audio = cJSON_AddObjectToObject(root, "audio");
+    cJSON_AddBoolToObject(audio, "ready", audio_state.ready && light_state.ready);
+    cJSON_AddNumberToObject(audio, "sample_rate_hz", AUDIO_SAMPLE_RATE);
     cJSON *speaker = cJSON_AddObjectToObject(root, "speaker");
-    cJSON_AddStringToObject(speaker, "state", "unavailable");
+    cJSON_AddStringToObject(speaker, "state", !audio_state.ready || audio_state.speaker_error != ESP_OK ? "unavailable" : audio_state.speaker_playing ? "playing" : "idle");
+    cJSON_AddNumberToObject(speaker, "volume", audio_state.volume);
+    if (audio_state.speaker_error != ESP_OK) cJSON_AddStringToObject(speaker, "error", esp_err_to_name(audio_state.speaker_error));
     cJSON *microphone = cJSON_AddObjectToObject(root, "microphone");
-    cJSON_AddStringToObject(microphone, "state", "unavailable");
-    cJSON_AddNumberToObject(microphone, "rms", 0);
-    cJSON_AddBoolToObject(microphone, "vad", false);
+    cJSON_AddStringToObject(microphone, "state", !audio_state.ready || audio_state.microphone_error != ESP_OK ? "unavailable" : audio_state.microphone_active ? "active" : "idle");
+    cJSON_AddNumberToObject(microphone, "rms", audio_state.rms);
+    cJSON_AddBoolToObject(microphone, "vad", audio_state.vad);
+    if (audio_state.microphone_error != ESP_OK) cJSON_AddStringToObject(microphone, "error", esp_err_to_name(audio_state.microphone_error));
 
     cJSON *cpu = cJSON_AddObjectToObject(root, "cpu");
     cJSON_AddNumberToObject(cpu, "frequency_mhz", cpu_frequency_mhz);
@@ -1046,6 +1055,36 @@ static bool handle_light_command(const cJSON *command, const char *action)
     return true;
 }
 
+static bool handle_audio_command(const cJSON *command, const char *action)
+{
+    const bool microphone = strcmp(action, "audio.microphone.set") == 0;
+    const bool test = strcmp(action, "audio.speaker.test") == 0;
+    const bool stop = strcmp(action, "audio.speaker.stop") == 0;
+    if (!microphone && !test && !stop) return false;
+    const cJSON *id = cJSON_GetObjectItemCaseSensitive(command, "request_id");
+    if (id && (!cJSON_IsString(id) || strlen(id->valuestring) == 0 || strlen(id->valuestring) > 64)) {
+        send_result(action, false, "request_id 必须为 1～64 字节字符串。");
+        return true;
+    }
+    esp_err_t result = ESP_ERR_INVALID_ARG;
+    if (microphone) {
+        const cJSON *on = cJSON_GetObjectItemCaseSensitive(command, "on");
+        if (cJSON_IsBool(on)) result = audio_set_microphone(cJSON_IsTrue(on));
+    } else if (test) {
+        int volume = 10;
+        if (!cJSON_HasObjectItem(command, "volume") || command_integer(command, "volume", AUDIO_TEST_VOLUME_MAX, &volume)) {
+            result = audio_play_test(volume);
+        }
+    } else {
+        result = audio_stop_speaker();
+    }
+    emit_status();
+    const char *message = result == ESP_OK ? (test ? "测试音已开始，约 1 秒后自动停止。" : "音频设置已应用。")
+        : result == ESP_ERR_INVALID_ARG ? "参数无效：采集开关为布尔值，测试音量为 1～20 的整数。" : esp_err_to_name(result);
+    send_result_with_id(action, result == ESP_OK, message, id ? id->valuestring : NULL);
+    return true;
+}
+
 static void handle_command(const char *line)
 {
     cJSON *command = cJSON_Parse(line);
@@ -1065,6 +1104,8 @@ static void handle_command(const char *line)
         emit_status();
     } else if (handle_light_command(command, action->valuestring)) {
         // Light commands share the serialized USB/BLE command task.
+    } else if (handle_audio_command(command, action->valuestring)) {
+        // Audio commands use the same command task and shared-power gate.
     } else if (strcmp(action->valuestring, "wifi.configure") == 0) {
         const cJSON *ssid = cJSON_GetObjectItemCaseSensitive(command, "ssid");
         cJSON *password = cJSON_GetObjectItemCaseSensitive(command, "password");
@@ -1182,12 +1223,40 @@ static void usb_task(void *arg)
     }
 }
 
+static void send_microphone_event(const char *action, const audio_snapshot_t *audio)
+{
+    char line[224];
+    snprintf(line, sizeof(line),
+             "{\"type\":\"event\",\"protocol\":%d,\"source\":\"microphone\",\"action\":\"%s\",\"rms\":%u,\"vad\":%s,\"uptime_ms\":%lld}",
+             PROTOCOL_VERSION, action, audio->rms, audio->vad ? "true" : "false", (long long)(esp_timer_get_time() / 1000));
+    send_line(line);
+}
+
 static void status_task(void *arg)
 {
     (void)arg;
+    int64_t last_status_us = -STATUS_INTERVAL_MS * 1000LL;
+    int64_t last_level_us = 0;
+    bool previous_vad = false;
+    bool previous_active = false;
     while (true) {
-        emit_status();
-        vTaskDelay(pdMS_TO_TICKS(STATUS_INTERVAL_MS));
+        const int64_t now = esp_timer_get_time();
+        audio_snapshot_t audio;
+        audio_get_snapshot(&audio);
+        if (audio.vad != previous_vad) send_microphone_event(audio.vad ? "vad_start" : "vad_end", &audio);
+        if (audio.microphone_active && (!previous_active || now - last_level_us >= 250000)) {
+            send_microphone_event("level", &audio);
+            last_level_us = now;
+        } else if (!audio.microphone_active && previous_active) {
+            send_microphone_event("level", &audio);
+        }
+        previous_vad = audio.vad;
+        previous_active = audio.microphone_active;
+        if (now - last_status_us >= STATUS_INTERVAL_MS * 1000LL) {
+            emit_status();
+            last_status_us = now;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -1514,6 +1583,8 @@ void app_main(void)
     }
 
     configure_system_sensors();
+    const esp_err_t audio_result = audio_init();
+    if (audio_result != ESP_OK) ESP_LOGE(TAG, "Audio init failed: %s", esp_err_to_name(audio_result));
     init_wifi_monitor();
     init_wifi_websocket();
     init_ble_monitor();
@@ -1522,5 +1593,5 @@ void app_main(void)
     xTaskCreate(input_task, "input_scan", 4096, NULL, 8, NULL);
     xTaskCreate(usb_task, "usb_command", 6144, NULL, 6, NULL);
     xTaskCreate(status_task, "status_stream", 6144, NULL, 5, NULL);
-    ESP_LOGI(TAG, "EasyInput monitor firmware started; lights controllable, shared rail off until requested");
+    ESP_LOGI(TAG, "EasyInput monitor firmware started; lights/audio controllable, shared rail off until requested");
 }

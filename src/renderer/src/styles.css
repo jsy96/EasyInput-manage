@@ -178,6 +178,8 @@ button { color: inherit; }
 .speaker-status { align-self: flex-end; font-size: 12px; }
 .audio-foot { display: flex; justify-content: space-between; margin-top: 11px; padding-top: 8px; border-top: 1px solid rgba(134, 156, 182, .08); color: #718399; font-size: 12px; }
 .audio-foot > span:first-child { display: inline-flex; align-items: center; gap: 6px; }
+.audio-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.audio-actions .button { min-height: 34px; }
 .audio-protection-note { padding: 10px 11px; margin: 11px 0 0; border: 1px solid rgba(237, 194, 123, .16); border-radius: 7px; color: #c5aa7b; background: rgba(113, 82, 33, .1); font-size: 12px; line-height: 1.5; }
 
 .events-card { padding: 17px 0 0; overflow: hidden; }

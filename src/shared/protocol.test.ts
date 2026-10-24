@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { describeInputEvent, lightResultMatches, parseBoardMessage, pixelIsLit } from './protocol'
+import { describeInputEvent, commandResultMatches, parseBoardMessage, pixelIsLit } from './protocol'
 
 describe('board protocol', () => {
   it('accepts complete status frames for protocol v2 and rejects old or unknown versions', () => {
@@ -15,6 +15,23 @@ describe('board protocol', () => {
       power: {},
     }
     expect(parseBoardMessage(JSON.stringify(status))).toEqual(status)
+    const audioStatus = {
+      ...status, audio: { ready: true, sample_rate_hz: 16000 },
+      microphone: { state: 'active', rms: 512, vad: true },
+      speaker: { state: 'playing', volume: 10 },
+    }
+    expect(parseBoardMessage(JSON.stringify(audioStatus))).toEqual(audioStatus)
+    expect(parseBoardMessage(JSON.stringify({ ...audioStatus, audio: { ready: false, sample_rate_hz: 16000 }, microphone: { state: 'unavailable', error: 'ESP_ERR_TIMEOUT' } }))).not.toBeNull()
+    for (const audio of [null, { ready: 'yes', sample_rate_hz: 16000 }, { ready: true, sample_rate_hz: 0 }, { ready: true, sample_rate_hz: 1.5 }]) {
+      expect(parseBoardMessage(JSON.stringify({ ...audioStatus, audio }))).toBeNull()
+    }
+    for (const microphone of [
+      { state: 'active', rms: -1 }, { state: 'active', rms: 32769 },
+      { state: 'active', rms: '512' }, { state: 'active', vad: 1 }, { state: 'unavailable', error: 5 },
+    ]) expect(parseBoardMessage(JSON.stringify({ ...audioStatus, microphone }))).toBeNull()
+    for (const volume of [-1, 101, 1.5, '10']) {
+      expect(parseBoardMessage(JSON.stringify({ ...audioStatus, speaker: { state: 'playing', volume } }))).toBeNull()
+    }
     const control = {
       ready: true, status_led_brightness: 25,
       pixels: Array.from({ length: 5 }, () => ({ color: '#fF8000', brightness: 20, on: true })),
@@ -45,15 +62,34 @@ describe('board protocol', () => {
     expect(describeInputEvent({ type: 'event', protocol: 2, source: 'encoder', action: 'rotate', delta: -1, uptime_ms: 10 })).toBe('旋钮 -1')
   })
 
+  it('accepts microphone levels and VAD edges and rejects invalid telemetry', () => {
+    for (const action of ['level', 'vad_start', 'vad_end']) {
+      const event = { type: 'event', protocol: 2, source: 'microphone', action, rms: 512, vad: action !== 'vad_end', uptime_ms: 42 }
+      expect(parseBoardMessage(JSON.stringify(event))).toEqual(event)
+      expect(parseBoardMessage(JSON.stringify({ ...event, rms: -1 }))).toBeNull()
+      expect(parseBoardMessage(JSON.stringify({ ...event, rms: 32769 }))).toBeNull()
+      expect(parseBoardMessage(JSON.stringify({ ...event, vad: 'false' }))).toBeNull()
+    }
+    expect(describeInputEvent({ type: 'event', protocol: 2, source: 'microphone', action: 'vad_end', uptime_ms: 42 })).toBe('麦克风 语音结束')
+  })
+
+  it('does not match a late audio acknowledgement to another operation', () => {
+    const pending = { action: 'audio.microphone.set', requestId: 'capture-2' }
+    const result = { type: 'result' as const, protocol: 2, action: pending.action, request_id: pending.requestId, ok: true }
+    expect(commandResultMatches(result, pending)).toBe(true)
+    expect(commandResultMatches({ ...result, request_id: 'capture-1' }, pending)).toBe(false)
+    expect(commandResultMatches({ ...result, action: 'audio.speaker.test' }, pending)).toBe(false)
+  })
+
   it('matches only the action and request ID of the outstanding light operation', () => {
     const pending = { action: 'lights.pixel.set', requestId: 'operation-2' }
     const result = { type: 'result' as const, protocol: 2, action: pending.action, ok: true, request_id: pending.requestId }
     expect(parseBoardMessage(JSON.stringify(result))).toEqual(result)
-    expect(lightResultMatches(result, pending)).toBe(true)
-    expect(lightResultMatches({ ...result, request_id: 'operation-1' }, pending)).toBe(false)
-    expect(lightResultMatches({ ...result, action: 'lights.all.set' }, pending)).toBe(false)
-    expect(lightResultMatches({ ...result, request_id: undefined }, pending)).toBe(false)
-    expect(lightResultMatches(result, null)).toBe(false)
+    expect(commandResultMatches(result, pending)).toBe(true)
+    expect(commandResultMatches({ ...result, request_id: 'operation-1' }, pending)).toBe(false)
+    expect(commandResultMatches({ ...result, action: 'lights.all.set' }, pending)).toBe(false)
+    expect(commandResultMatches({ ...result, request_id: undefined }, pending)).toBe(false)
+    expect(commandResultMatches(result, null)).toBe(false)
     expect(parseBoardMessage(JSON.stringify({ ...result, request_id: 12 }))).toBeNull()
     expect(parseBoardMessage(JSON.stringify({ ...result, request_id: '' }))).toBeNull()
   })
