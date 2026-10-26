@@ -119,6 +119,8 @@ The browser filters device access through the Web Serial permission prompt. Firm
 
 The repository includes a Cloudflare Worker gateway in `cloudflare/`. The firmware opens an outbound WSS connection to Cloudflare, so the board does not need a public port or a computer Agent. The browser connects to the same device room using the Worker URL, device ID, and pairing token in **公网直连监控**. The older `agent/` bridge remains as a compatibility fallback.
 
+The Studio page can also be published as a static Workers Assets project with `cloudflare/studio.wrangler.jsonc`, allowing browsers on other computers to join the same authenticated device room.
+
 Deploy the Worker with Wrangler after setting `ALLOWED_ORIGINS` and a long `PAIRING_SECRET`. Build and flash the WSS-enabled firmware, configure Wi-Fi and the cloud gateway once over USB or encrypted Bluetooth, then the board reconnects automatically. The public relay forwards only `hello.get`, `status.get`, and board telemetry/input frames; Wi-Fi credentials, light commands, audio commands, and firmware flashing still require USB or encrypted Bluetooth from the browser.
 
 Treat the pairing token as a password. Use HTTPS for the Studio site and WSS for the gateway. This feature is an optional relay deployment and is not enabled by the local development server.

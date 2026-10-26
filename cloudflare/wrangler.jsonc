@@ -11,7 +11,7 @@
     { "tag": "v1", "new_sqlite_classes": ["DeviceRoom"] }
   ],
   "vars": {
-    "ALLOWED_ORIGINS": "http://127.0.0.1:5173"
+    "ALLOWED_ORIGINS": "http://127.0.0.1:5173,https://studio.leige.online"
   },
   "routes": [
     { "pattern": "easy.leige.online", "custom_domain": true }
