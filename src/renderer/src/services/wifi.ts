@@ -1,10 +1,12 @@
 import { parseBoardMessage, PROTOCOL_VERSION } from '@shared/protocol'
 
 const SAVED_CONNECTION_KEY = 'easyinput.wifi.v1'
+const SAVED_REMOTE_KEY = 'easyinput.remote.v1'
 const RETRY_DELAYS = [1000, 2000, 4000, 8000, 15000, 30000]
 const DATA_TIMEOUT_MS = 8000
 
 type SavedConnection = { address: string; autoConnect: boolean }
+export type SavedRemote = { gateway: string; device: string; token: string; autoConnect: boolean }
 type Callbacks = {
   connected(value: boolean): void
   connecting(value: boolean): void
@@ -38,9 +40,19 @@ function readSavedConnection(): SavedConnection | null {
   }
 }
 
+export function readSavedRemote(): SavedRemote | null {
+  try {
+    const saved = JSON.parse(localStorage.getItem(SAVED_REMOTE_KEY) ?? 'null') as Partial<SavedRemote> | null
+    return saved && typeof saved.gateway === 'string' && typeof saved.device === 'string' && typeof saved.token === 'string' && typeof saved.autoConnect === 'boolean'
+      ? { gateway: saved.gateway, device: saved.device, token: saved.token, autoConnect: saved.autoConnect } : null
+  } catch { return null }
+}
+
 /** A local-network monitoring connection; Wi-Fi credentials stay on USB/encrypted BLE. */
 export class WifiConnection {
   private saved = readSavedConnection()
+  private remote = readSavedRemote()
+  private remoteMode = false
   private socket: WebSocket | null = null
   private retryTimer: number | null = null
   private dataTimer: number | null = null
@@ -56,7 +68,12 @@ export class WifiConnection {
     document.addEventListener('visibilitychange', this.onVisible)
     window.addEventListener('online', this.wake)
     if (this.saved) this.callbacks.address(this.saved.address)
-    if (this.saved?.autoConnect) {
+    if (this.remote?.autoConnect) {
+      if (this.saved?.autoConnect) this.save(this.saved.address, false)
+      this.remoteMode = true
+      this.enabled = true
+      this.attempt()
+    } else if (this.saved?.autoConnect) {
       this.enabled = true
       this.attempt()
     }
@@ -80,6 +97,12 @@ export class WifiConnection {
     }
   }
 
+  private disableRemoteAutoConnect(): void {
+    if (!this.remote?.autoConnect) return
+    this.remote = { ...this.remote, autoConnect: false }
+    try { localStorage.setItem(SAVED_REMOTE_KEY, JSON.stringify(this.remote)) } catch { /* memory fallback */ }
+  }
+
   rememberAddress(value: string): void {
     if (this.disposed || this.hasSession) return
     let address: string
@@ -98,8 +121,27 @@ export class WifiConnection {
       return
     }
     this.pause()
+    this.disableRemoteAutoConnect()
+    this.remoteMode = false
     this.save(address, true)
     this.callbacks.address(address)
+    this.enabled = true
+    this.retries = 0
+    this.attempt(true)
+  }
+
+  connectRemote(gateway: string, device: string, token: string): void {
+    if (this.disposed) return
+    const base = gateway.trim().replace(/\/$/, '')
+    if (!/^wss:\/\//i.test(base) || !/^[A-Za-z0-9_-]{3,64}$/.test(device.trim()) || token.trim().length < 16) {
+      this.callbacks.notice('请输入有效的 WSS 网关地址、设备 ID 和至少 16 位配对令牌。')
+      return
+    }
+    this.pause()
+    if (this.saved?.autoConnect) this.save(this.saved.address, false)
+    this.remote = { gateway: base, device: device.trim(), token: token.trim(), autoConnect: true }
+    try { localStorage.setItem(SAVED_REMOTE_KEY, JSON.stringify(this.remote)) } catch { /* memory fallback */ }
+    this.remoteMode = true
     this.enabled = true
     this.retries = 0
     this.attempt(true)
@@ -139,6 +181,13 @@ export class WifiConnection {
     this.callbacks.notice('已暂停 Wi-Fi 自动连接，点击连接可恢复。')
   }
 
+  disconnectRemote(): void {
+    this.pause()
+    this.disableRemoteAutoConnect()
+    this.remoteMode = false
+    this.callbacks.notice('已暂停公网直连。')
+  }
+
   dispose(): void {
     this.disposed = true
     this.pause()
@@ -160,8 +209,8 @@ export class WifiConnection {
   }
 
   private attempt(manual = false): void {
-    if (!this.enabled || !this.saved || this.hasSession || this.disposed) return
-    if (window.location.protocol === 'https:') {
+    if (!this.enabled || ((!this.saved || !this.saved.address) && (!this.remoteMode || !this.remote)) || this.hasSession || this.disposed) return
+    if (!this.remoteMode && window.location.protocol === 'https:') {
       this.enabled = false
       this.callbacks.notice('Wi-Fi 直连请使用本机 http://127.0.0.1:5173 页面；HTTPS 网站需要安全代理支持。')
       return
@@ -176,7 +225,10 @@ export class WifiConnection {
     this.callbacks.reset()
     let socket: WebSocket
     try {
-      socket = new WebSocket(`ws://${this.saved.address}/ws`)
+      const url = this.remoteMode && this.remote
+        ? `${this.remote.gateway}/ws?device=${encodeURIComponent(this.remote.device)}&role=browser&token=${encodeURIComponent(this.remote.token)}`
+        : `ws://${this.saved?.address}/ws`
+      socket = new WebSocket(url)
     } catch (error) {
       this.enabled = false
       this.callbacks.connecting(false)

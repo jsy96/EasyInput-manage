@@ -8,7 +8,7 @@ import {
 } from 'lucide-react'
 import { ESPLoader, Transport } from 'esptool-js'
 import { BluetoothConnection } from './services/bluetooth'
-import { WifiConnection } from './services/wifi'
+import { readSavedRemote, WifiConnection } from './services/wifi'
 import { BoardConnections } from '@shared/connections'
 import type { BoardTransport } from '@shared/connections'
 import type { BoardHello, BoardMessage, BoardResult, BoardStatus, InputEvent, LightCommand, AudioCommand, PixelSetting } from '@shared/protocol'
@@ -203,6 +203,12 @@ export default function App(): React.JSX.Element {
   const [wifiMonitorRetrying, setWifiMonitorRetrying] = useState(false)
   const [wifiMonitorError, setWifiMonitorError] = useState('')
   const [wifiAddress, setWifiAddress] = useState('')
+  const [savedRemote] = useState(readSavedRemote)
+  const [remoteGateway, setRemoteGateway] = useState(() => savedRemote?.gateway ?? '')
+  const [remoteDevice, setRemoteDevice] = useState(() => savedRemote?.device ?? 'easyinput-v2')
+  const [remoteToken, setRemoteToken] = useState(() => savedRemote?.token ?? '')
+  const [cloudBusy, setCloudBusy] = useState(false)
+  const [cloudResult, setCloudResult] = useState<BoardResult | null>(null)
   const [events, setEvents] = useState<BoardEventRow[]>([])
   const [demoMode, setDemoMode] = useState(false)
   const [manifest, setManifest] = useState<FirmwareManifest | null>(null)
@@ -461,6 +467,11 @@ export default function App(): React.JSX.Element {
         setWifiEditing(false)
       }
     }
+    if (message.type === 'result' && (message.action === 'cloud.configure' || message.action === 'cloud.clear')) {
+      setCloudResult(message)
+      setCloudBusy(false)
+      if (message.ok && message.action === 'cloud.configure') setRemoteToken('')
+    }
     if (message.type === 'event') {
       const row: BoardEventRow = { ...message, receivedAt: new Date().toLocaleTimeString('zh-CN'), rowId: ++eventCounter.current }
       setEvents((previous) => [row, ...previous].slice(0, 80))
@@ -577,6 +588,15 @@ export default function App(): React.JSX.Element {
     wifiConnectionRef.current?.connect(wifiAddress)
   }
 
+  function connectRemoteMonitor(): void {
+    setDemoMode(false)
+    wifiConnectionRef.current?.connectRemote(remoteGateway, remoteDevice, remoteToken)
+  }
+
+  function disconnectRemoteMonitor(): void {
+    wifiConnectionRef.current?.disconnectRemote()
+  }
+
   async function toggleDemoMode(): Promise<void> {
     if (demoMode) {
       setDemoMode(false)
@@ -647,6 +667,36 @@ export default function App(): React.JSX.Element {
       finishWifiCommand()
       if (action === 'wifi.configure') setWifiPassword('')
       setWifiResult({ type: 'result', protocol: PROTOCOL_VERSION, action, ok: false, message: useBle ? '蓝牙命令发送失败，请确认连接仍有效。' : 'USB 命令发送失败，请确认串口仍连接。' })
+    }
+  }
+
+  async function sendCloudCommand(action: 'cloud.configure' | 'cloud.clear'): Promise<void> {
+    const port = portRef.current
+    const transport = connectionsRef.current.commandTransport(Date.now())
+    const useBle = transport === 'ble'
+    if (!transport || (!useBle && !port?.writable) || (useBle && !bleConnectionRef.current?.writable) || deviceBusy || cloudBusy) return
+    if (action === 'cloud.configure' && (!remoteGateway.trim() || !remoteDevice.trim() || remoteToken.trim().length < 16)) {
+      setCloudResult({ type: 'result', protocol: PROTOCOL_VERSION, action, ok: false, message: '请填写 WSS 网关、设备 ID 和至少 16 位令牌。' })
+      return
+    }
+    setCloudBusy(true)
+    setCloudResult(null)
+    const command: Record<string, unknown> = { type: 'command', protocol: PROTOCOL_VERSION, action }
+    if (action === 'cloud.configure') Object.assign(command, { gateway: remoteGateway.trim(), device: remoteDevice.trim(), token: remoteToken })
+    const frame = new TextEncoder().encode(`${JSON.stringify(command)}\n`)
+    try {
+      if (useBle) await bleConnectionRef.current!.write(frame)
+      else {
+        const writer = port!.writable!.getWriter()
+        try { await writer.write(frame) } finally { writer.releaseLock() }
+      }
+      if (action === 'cloud.configure') setRemoteToken('')
+    } catch {
+      setCloudResult({ type: 'result', protocol: PROTOCOL_VERSION, action, ok: false, message: '云端配置发送失败，请保持 USB 或加密蓝牙连接。' })
+    } finally {
+      frame.fill(0)
+      command.token = ''
+      setCloudBusy(false)
     }
   }
 
@@ -980,6 +1030,7 @@ export default function App(): React.JSX.Element {
                 <section className="network-action-block"><div className="network-action-heading"><Monitor size={16} /><strong>无线监控</strong><span className={`status-chip ${wifiProtocolOnline ? 'is-live' : wifiMonitorActive ? 'is-warn' : 'is-muted'}`} role="status">{wifiMonitorLabel}</span></div>
                   <form className="wifi-form" onSubmit={(event) => { event.preventDefault(); connectWifiMonitor() }}><label>开发板 IP 地址<input aria-label="开发板 IP 地址" disabled={deviceBusy || wifiMonitorActive} autoComplete="off" inputMode="decimal" maxLength={15} value={wifiAddress} onChange={(event) => setWifiAddress(event.target.value)} placeholder="例如 192.168.1.82" /></label><div className="wifi-actions">{wifiMonitorActive ? <button className="button button-subtle" type="button" disabled={deviceBusy} onClick={() => wifiConnectionRef.current?.disconnect()}>{wifiMonitorConnected ? '断开 Wi-Fi 监控' : '取消重连'}</button> : <button className="button button-primary" type="submit" disabled={deviceBusy || !wifiAddress.trim()}><Wifi size={15} />连接 Wi-Fi 监控</button>}</div></form>
                   <p className="light-note">手机或电脑与开发板需在同一局域网。通过 USB 或蓝牙读取 IP 后自动填入。</p>{wifiMonitorError && <p className="result-note warn" role="status">{wifiMonitorError}</p>}
+                  <div className="remote-agent-section"><div className="summary-heading"><Monitor size={16} /><strong>公网直连监控</strong><span className={wifiProtocolOnline ? 'is-live' : 'is-muted'}>{wifiProtocolOnline && remoteGateway ? '已连接' : '未连接'}</span></div><form className="wifi-form" onSubmit={(event) => { event.preventDefault(); connectRemoteMonitor() }}><label>Cloudflare WSS 网关<input value={remoteGateway} onChange={(event) => setRemoteGateway(event.target.value)} placeholder="wss://xxx.workers.dev" /></label><label>设备 ID<input value={remoteDevice} onChange={(event) => setRemoteDevice(event.target.value)} placeholder="easyinput-v2" /></label><label>配对令牌<input type="password" value={remoteToken} onChange={(event) => setRemoteToken(event.target.value)} placeholder="至少 16 位" /></label><div className="wifi-actions"><button className="button button-subtle" type="button" disabled={cloudBusy || !wifiConfigOnline} onClick={() => void sendCloudCommand('cloud.configure')}>保存到开发板</button>{wifiMonitorActive && remoteGateway ? <button className="button button-subtle" type="button" onClick={disconnectRemoteMonitor}>断开公网监控</button> : <button className="button button-primary" type="submit" disabled={deviceBusy || !remoteGateway.trim() || !remoteToken.trim()}>连接公网监控</button>}</div></form><p className="light-note">先通过 USB 或加密蓝牙保存配置，开发板随后会自行连接 Cloudflare；不再需要电脑 Agent。</p>{cloudResult && <p className={`result-note ${cloudResult.ok ? '' : 'error'}`}>{cloudResult.message}</p>}</div>
                   <div className="bluetooth-section"><div className="summary-heading"><Bluetooth size={16} /><strong>蓝牙连接</strong><span className={bleStateClass}>{bleLabel}</span></div><div className="wifi-actions"><button className="button button-subtle" disabled={deviceBusy} onClick={() => { if (bleConnected || bleConnecting || bleRetrying) disconnectBle(); else void connectBle() }}>{bleConnected ? '断开蓝牙' : bleConnecting || bleRetrying ? '取消重连' : '连接蓝牙'}</button>{!bleConnected && !bleConnecting && <button className="text-button" disabled={deviceBusy} onClick={() => void connectBle(true)}>重新选择设备</button>}</div>{bleError && <p className="result-note warn">{bleError}</p>}</div>
                 </section>
               </div>

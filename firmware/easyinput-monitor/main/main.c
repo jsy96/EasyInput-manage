@@ -7,6 +7,7 @@
 #include "cJSON.h"
 #include "lights.h"
 #include "audio.h"
+#include "cloud.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/idf_additions.h"
@@ -120,6 +121,7 @@ static uint64_t last_cpu_sample_us;
 static uint64_t last_idle_runtime[portNUM_PROCESSORS];
 static esp_flash_counters_t last_flash_counters;
 static uint64_t last_flash_sample_us;
+
 
 static void start_advertising(void);
 static void handle_command(const char *line);
@@ -352,11 +354,17 @@ static void send_line(const char *line)
     if (line == NULL) return;
     queue_ble_line(line);
     queue_wifi_line(line);
+    cloud_monitor_send(line);
     if (usb_serial_jtag_is_connected() && usb_tx_mutex != NULL && xSemaphoreTake(usb_tx_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         usb_serial_jtag_write_bytes(line, strlen(line), pdMS_TO_TICKS(80));
         usb_serial_jtag_write_bytes("\n", 1, pdMS_TO_TICKS(80));
         xSemaphoreGive(usb_tx_mutex);
     }
+}
+
+bool cloud_monitor_queue_command(const char *line)
+{
+    return line != NULL && board_command_queue != NULL && xQueueSend(board_command_queue, line, 0) == pdTRUE;
 }
 
 static bool ble_frame_is_current(const ble_tx_frame_t *frame)
@@ -442,6 +450,15 @@ static void clear_command_password(cJSON *command)
     if (cJSON_IsString(password) && password->valuestring != NULL) {
         volatile char *secret = password->valuestring;
         for (size_t index = 0; secret[index] != '\0'; index++) secret[index] = '\0';
+    }
+}
+
+static void clear_command_secret(cJSON *command, const char *name)
+{
+    cJSON *secret = cJSON_GetObjectItemCaseSensitive(command, name);
+    if (cJSON_IsString(secret) && secret->valuestring != NULL) {
+        volatile char *value = secret->valuestring;
+        for (size_t index = 0; value[index] != '\0'; index++) value[index] = '\0';
     }
 }
 
@@ -1135,6 +1152,17 @@ static void handle_command(const char *line)
         } else {
             run_wifi_command("wifi.connect_saved", NULL, "正在使用开发板已保存的配置连接 Wi-Fi。");
         }
+    } else if (strcmp(action->valuestring, "cloud.configure") == 0) {
+        const cJSON *gateway = cJSON_GetObjectItemCaseSensitive(command, "gateway");
+        const cJSON *device = cJSON_GetObjectItemCaseSensitive(command, "device");
+        const cJSON *token = cJSON_GetObjectItemCaseSensitive(command, "token");
+        const bool ok = cJSON_IsString(gateway) && cJSON_IsString(device) && cJSON_IsString(token) &&
+            cloud_monitor_configure(gateway->valuestring, device->valuestring, token->valuestring);
+        send_result("cloud.configure", ok, ok ? "云端 WSS 配置已保存，开发板将在 Wi-Fi 可用时连接。" : "云端 WSS 配置无效或保存失败。");
+        clear_command_secret(command, "token");
+    } else if (strcmp(action->valuestring, "cloud.clear") == 0) {
+        const bool ok = cloud_monitor_clear();
+        send_result("cloud.clear", ok, ok ? "云端 WSS 配置已清除。" : "云端 WSS 配置清除失败。");
     }
     clear_command_password(command);
     cJSON_Delete(command);
@@ -1334,6 +1362,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             esp_ip4addr_ntoa(&info.ip, ip, sizeof(ip));
             esp_ip4addr_ntoa(&info.netmask, netmask, sizeof(netmask));
             esp_ip4addr_ntoa(&info.gw, gateway, sizeof(gateway));
+            esp_netif_dns_info_t public_dns = {0};
+            public_dns.ip.type = ESP_IPADDR_TYPE_V4;
+            public_dns.ip.u_addr.ip4.addr = esp_ip4addr_aton("1.1.1.1");
+            (void)esp_netif_set_dns_info(wifi_netif, ESP_NETIF_DNS_MAIN, &public_dns);
+            public_dns.ip.u_addr.ip4.addr = esp_ip4addr_aton("8.8.8.8");
+            (void)esp_netif_set_dns_info(wifi_netif, ESP_NETIF_DNS_BACKUP, &public_dns);
             esp_netif_dns_info_t dns_info = {0};
             if (esp_netif_get_dns_info(wifi_netif, ESP_NETIF_DNS_MAIN, &dns_info) == ESP_OK) {
                 esp_ip4addr_ntoa((const esp_ip4_addr_t *)&dns_info.ip.u_addr.ip4, dns, sizeof(dns));
@@ -1587,6 +1621,7 @@ void app_main(void)
     if (audio_result != ESP_OK) ESP_LOGE(TAG, "Audio init failed: %s", esp_err_to_name(audio_result));
     init_wifi_monitor();
     init_wifi_websocket();
+    cloud_monitor_init();
     init_ble_monitor();
     xTaskCreate(ble_tx_task, "ble_tx", 4096, NULL, 6, NULL);
     emit_hello();

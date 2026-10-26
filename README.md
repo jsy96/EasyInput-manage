@@ -115,6 +115,14 @@ Board check: start capture, speak, play the test with capture running, then stop
 
 The browser filters device access through the Web Serial permission prompt. Firmware flashing uses the board's USB Serial/JTAG connection. The app first attempts automatic entry into download mode using the USB reset sequence. If that connection fails, keep the board powered on, short-press/release **BOOT**, then retry and select its download port. After writing, switch the board off and on to return to normal startup. Do not use the generic “hold BOOT while powering on” sequence. The app requires a separate confirmation after identifying the ESP32-S3 and reading its MAC address.
 
+## Public Wi-Fi monitoring through Cloudflare
+
+The repository includes a Cloudflare Worker gateway in `cloudflare/`. The firmware opens an outbound WSS connection to Cloudflare, so the board does not need a public port or a computer Agent. The browser connects to the same device room using the Worker URL, device ID, and pairing token in **公网直连监控**. The older `agent/` bridge remains as a compatibility fallback.
+
+Deploy the Worker with Wrangler after setting `ALLOWED_ORIGINS` and a long `PAIRING_SECRET`. Build and flash the WSS-enabled firmware, configure Wi-Fi and the cloud gateway once over USB or encrypted Bluetooth, then the board reconnects automatically. The public relay forwards only `hello.get`, `status.get`, and board telemetry/input frames; Wi-Fi credentials, light commands, audio commands, and firmware flashing still require USB or encrypted Bluetooth from the browser.
+
+Treat the pairing token as a password. Use HTTPS for the Studio site and WSS for the gateway. This feature is an optional relay deployment and is not enabled by the local development server.
+
 ## Hardware validation boundary
 
 Physical USB enumeration, simultaneous USB/BLE/Wi-Fi sessions, Wi-Fi provisioning/recovery and WebSocket monitoring on battery power, PSRAM initialization, ADC voltage accuracy and sampling, power/charge detection, CPU/temperature readings, key/encoder polarity, BLE radio behavior, and flash/resume behavior still need a board-side check. The encoder direction is a project choice and should be checked against the actual knob. Light control is implemented for board bring-up; the 100 ms shared-rail wait, electrical margins, pixel order and visible behavior still require assembled-board validation. Compilation and software tests do not qualify the circuit. Audio drivers are implemented for bring-up; microphone sample alignment/levels, energy-based VAD thresholds, concurrent capture/playback and physical speaker output remain to be verified on the assembled board.

@@ -1,0 +1,19 @@
+{
+  "name": "easyinput-gateway",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-26",
+  "durable_objects": {
+    "bindings": [
+      { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["DeviceRoom"] }
+  ],
+  "vars": {
+    "ALLOWED_ORIGINS": "http://127.0.0.1:5173"
+  },
+  "routes": [
+    { "pattern": "easy.leige.online", "custom_domain": true }
+  ]
+}

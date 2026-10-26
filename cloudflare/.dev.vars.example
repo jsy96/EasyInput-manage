@@ -1,0 +1,2 @@
+ALLOWED_ORIGINS=http://localhost:5173,https://your-studio.example
+PAIRING_SECRET=replace-with-a-long-random-secret
