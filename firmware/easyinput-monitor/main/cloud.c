@@ -9,11 +9,14 @@
 #include "esp_log.h"
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "nvs.h"
 
 #define CLOUD_LINE_MAX 4096
 #define CLOUD_COMMAND_MAX 512
+#define CLOUD_EVENT_QUEUE_DEPTH 16
 #define CLOUD_RECONNECT_MS 5000
 #define LEGACY_GATEWAY "wss://easyinput-gateway.jsy96.workers.dev"
 #define CURRENT_GATEWAY "wss://easy.leige.online"
@@ -22,6 +25,10 @@ static const char *TAG = "easyinput_cloud";
 static esp_websocket_client_handle_t client;
 static SemaphoreHandle_t state_lock;
 static SemaphoreHandle_t send_lock;
+static SemaphoreHandle_t outbound_lock;
+static QueueHandle_t event_queue;
+static TaskHandle_t sender_task;
+static char *pending_status;
 static bool online;
 static char gateway[192];
 static char device_id[65];
@@ -53,11 +60,14 @@ static bool send_text(const char *text, size_t length, TickType_t timeout)
 
 static void stop_client(void)
 {
+    if (send_lock != NULL) xSemaphoreTake(send_lock, portMAX_DELAY);
     esp_websocket_client_handle_t current = client;
     client = NULL;
-    if (current == NULL) return;
-    (void)esp_websocket_client_stop(current);
-    (void)esp_websocket_client_destroy(current);
+    if (current != NULL) {
+        (void)esp_websocket_client_stop(current);
+        (void)esp_websocket_client_destroy(current);
+    }
+    if (send_lock != NULL) xSemaphoreGive(send_lock);
 }
 
 static void load_config(void)
@@ -107,10 +117,11 @@ static void cloud_event_handler(void *arg, esp_event_base_t base, int32_t event_
     (void)arg; (void)base;
     esp_websocket_event_data_t *event = event_data;
     if (event_id == WEBSOCKET_EVENT_CONNECTED) {
-        xSemaphoreTake(state_lock, portMAX_DELAY); online = true; xSemaphoreGive(state_lock);
         ESP_LOGI(TAG, "cloud WSS connected");
         const char *hello = "{\"type\":\"command\",\"protocol\":2,\"action\":\"hello.get\"}\n";
         (void)send_text(hello, strlen(hello), pdMS_TO_TICKS(1000));
+        xSemaphoreTake(state_lock, portMAX_DELAY); online = true; xSemaphoreGive(state_lock);
+        if (sender_task != NULL) (void)xTaskNotifyGive(sender_task);
     } else if (event_id == WEBSOCKET_EVENT_DISCONNECTED) {
         xSemaphoreTake(state_lock, portMAX_DELAY); online = false; xSemaphoreGive(state_lock);
         ESP_LOGW(TAG, "cloud WSS disconnected");
@@ -147,12 +158,50 @@ static void cloud_task(void *arg)
     }
 }
 
+static void cloud_sender_task(void *arg)
+{
+    (void)arg;
+    bool prefer_status = false;
+    while (true) {
+        xSemaphoreTake(state_lock, portMAX_DELAY);
+        const bool ready = online;
+        xSemaphoreGive(state_lock);
+        if (!ready) {
+            (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        char *frame = NULL;
+        xSemaphoreTake(outbound_lock, portMAX_DELAY);
+        const bool have_event = uxQueueMessagesWaiting(event_queue) > 0;
+        if ((prefer_status && pending_status != NULL) || !have_event) {
+            frame = pending_status;
+            pending_status = NULL;
+            prefer_status = false;
+        } else {
+            (void)xQueueReceive(event_queue, &frame, 0);
+            prefer_status = true;
+        }
+        xSemaphoreGive(outbound_lock);
+
+        if (frame != NULL) {
+            (void)send_text(frame, strlen(frame), pdMS_TO_TICKS(1000));
+            free(frame);
+            continue;
+        }
+        (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    }
+}
+
 void cloud_monitor_init(void)
 {
     state_lock = xSemaphoreCreateMutex();
     send_lock = xSemaphoreCreateMutex();
+    outbound_lock = xSemaphoreCreateMutex();
+    event_queue = xQueueCreate(CLOUD_EVENT_QUEUE_DEPTH, sizeof(char *));
     load_config();
     xTaskCreate(cloud_task, "cloud_wss", 7168, NULL, 4, NULL);
+    xTaskCreate(cloud_sender_task, "cloud_send", 4096, NULL, 5, &sender_task);
 }
 
 bool cloud_monitor_configure(const char *gateway_url, const char *device, const char *pairing_token)
@@ -186,15 +235,36 @@ bool cloud_monitor_clear(void)
 
 void cloud_monitor_send(const char *line)
 {
-    if (client == NULL || !esp_websocket_client_is_connected(client)) return;
+    if (line == NULL || outbound_lock == NULL || event_queue == NULL || sender_task == NULL) return;
     const size_t length = strlen(line);
     if (length >= CLOUD_LINE_MAX) return;
-    char *frame = malloc(length + 2);
-    if (frame == NULL) return;
-    memcpy(frame, line, length);
-    frame[length] = '\n'; frame[length + 1] = '\0';
-    (void)send_text(frame, length + 1, pdMS_TO_TICKS(200));
-    free(frame);
+    char *copy = malloc(length + 2);
+    if (copy == NULL) return;
+    memcpy(copy, line, length);
+    copy[length] = '\n';
+    copy[length + 1] = '\0';
+
+    char *discarded = NULL;
+    bool queued = false;
+    if (xSemaphoreTake(outbound_lock, pdMS_TO_TICKS(50)) != pdTRUE) {
+        free(copy);
+        return;
+    }
+    static const char status_prefix[] = "{\"type\":\"status\"";
+    if (strncmp(line, status_prefix, sizeof(status_prefix) - 1) == 0) {
+        discarded = pending_status;
+        pending_status = copy;
+        queued = true;
+    } else if (xQueueSend(event_queue, &copy, 0) != pdTRUE) {
+        (void)xQueueReceive(event_queue, &discarded, 0);
+        queued = xQueueSend(event_queue, &copy, 0) == pdTRUE;
+        if (!queued) free(copy);
+    } else {
+        queued = true;
+    }
+    xSemaphoreGive(outbound_lock);
+    free(discarded);
+    if (queued) (void)xTaskNotifyGive(sender_task);
 }
 
 bool cloud_monitor_is_online(void)
