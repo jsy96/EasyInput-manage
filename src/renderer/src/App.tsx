@@ -7,6 +7,10 @@ import {
   RotateCw, SlidersHorizontal, Usb, Wifi, X, Zap,
 } from 'lucide-react'
 import { ESPLoader, Transport } from 'esptool-js'
+import { VoiceChat } from './VoiceChat'
+import { ChatConnection } from './services/chat'
+import { emptyRoom } from '@shared/chat'
+import type { RoomState } from '@shared/chat'
 import { BluetoothConnection } from './services/bluetooth'
 import { readSavedRemote, WifiConnection } from './services/wifi'
 import { BoardConnections } from '@shared/connections'
@@ -16,9 +20,10 @@ import { describeInputEvent, commandResultMatches, pixelIsLit, PROTOCOL_VERSION 
 
 const FLASH_BYTES = 16 * 1024 * 1024
 const pages = [
+  { id: 'chat', label: '群聊', title: '语音群聊', caption: '电脑和开发板，在同一个群里', icon: Mic },
   { id: 'overview', label: '总览', title: '设备总览', caption: '一眼了解你的设备', icon: Monitor },
   { id: 'control', label: '控制', title: '随心控制', caption: '灯光与声音，触手可及', icon: SlidersHorizontal },
-  { id: 'network', label: '网络', title: '保持连接', caption: '管理网络与无线监控', icon: Wifi },
+  { id: 'network', label: '网络', title: '保持连接', caption: '连接一次，之后自动联网', icon: Wifi },
   { id: 'system', label: '系统', title: '运行状态', caption: '设备资源，清晰可见', icon: Cpu },
   { id: 'firmware', label: '固件', title: '固件管理', caption: '让设备保持更新', icon: Download },
 ] as const
@@ -76,16 +81,6 @@ function formatBytes(bytes: number): string {
 
 function formatRate(bytesPerSecond: number): string {
   return `${formatBytes(bytesPerSecond)}/s`
-}
-
-function wifiDisconnectReason(code?: number): string {
-  const reasons: Record<number, string> = {
-    1: '未指定原因', 2: '认证超时', 15: '4 向握手超时', 200: '信标超时 / 信号不稳',
-    201: '未找到该 Wi-Fi', 202: '认证失败 / 密码可能错误', 203: '接入点拒绝关联',
-    204: '安全握手超时', 210: '没有兼容安全方式的网络', 211: '安全模式不符合设置', 212: '信号低于连接阈值',
-  }
-  if (code === undefined) return '等待板端诊断'
-  return code === 0 ? '无最近断线原因' : `${reasons[code] ?? '其他断线原因'}（代码 ${code}）`
 }
 
 function stateLabel(state?: string): string {
@@ -162,7 +157,12 @@ function validateManifest(value: unknown): FirmwareManifest {
 }
 
 export default function App(): React.JSX.Element {
-  const [activePage, setActivePage] = useState<Page>('overview')
+  const [activePage, setActivePage] = useState<Page>('chat')
+  const [room, setRoom] = useState<RoomState>({ ...emptyRoom })
+  const [chatBusy, setChatBusy] = useState(false)
+  const [chatNotice, setChatNotice] = useState('')
+  const chatRef = useRef<ChatConnection | null>(null)
+  const chatBufferRef = useRef('')
   const [overviewTab, setOverviewTab] = useState('device')
   const [controlTab, setControlTab] = useState('pixels')
   const [systemTab, setSystemTab] = useState('performance')
@@ -200,12 +200,12 @@ export default function App(): React.JSX.Element {
   const [bleError, setBleError] = useState('')
   const [wifiMonitorConnected, setWifiMonitorConnected] = useState(false)
   const [wifiMonitorConnecting, setWifiMonitorConnecting] = useState(false)
-  const [wifiMonitorRetrying, setWifiMonitorRetrying] = useState(false)
-  const [wifiMonitorError, setWifiMonitorError] = useState('')
-  const [wifiAddress, setWifiAddress] = useState('')
+  const [, setWifiMonitorRetrying] = useState(false)
+  const [, setWifiMonitorError] = useState('')
+  const [, setWifiAddress] = useState('')
   const [savedRemote] = useState(readSavedRemote)
-  const [remoteGateway, setRemoteGateway] = useState(() => savedRemote?.gateway ?? '')
-  const [remoteDevice, setRemoteDevice] = useState(() => savedRemote?.device ?? 'easyinput-v2')
+  const [remoteGateway] = useState(() => savedRemote?.gateway ?? 'wss://easy.leige.online')
+  const [remoteDevice] = useState(() => savedRemote?.device ?? 'easyinput-v2')
   const [remoteToken, setRemoteToken] = useState(() => savedRemote?.token ?? '')
   const [cloudBusy, setCloudBusy] = useState(false)
   const [cloudResult, setCloudResult] = useState<BoardResult | null>(null)
@@ -249,7 +249,7 @@ export default function App(): React.JSX.Element {
   const currentStatus = status ?? emptyStatus
   const dataTransportOpen = serialOpen || bleConnected || wifiMonitorConnected || wifiMonitorConnecting
   const deviceBusy = flashing || flashPreparing || flashCandidate !== null
-  const updateBlocked = dataTransportOpen || serialConnecting || bleConnecting || wifiBusy || outputBusy || flashing || flashPreparing || flashCandidate !== null
+  const updateBlocked = chatBusy || dataTransportOpen || serialConnecting || bleConnecting || wifiBusy || outputBusy || flashing || flashPreparing || flashCandidate !== null
   const usbProtocolOnline = serialOpen && connectionsRef.current.isOnline('usb', clock)
   const bleProtocolOnline = bleConnected && connectionsRef.current.isOnline('ble', clock)
   const wifiProtocolOnline = wifiMonitorConnected && connectionsRef.current.isOnline('wifi', clock)
@@ -274,6 +274,25 @@ export default function App(): React.JSX.Element {
   const partitionPageCount = Math.max(1, Math.ceil(currentStatus.storage.partitions.length / partitionRows))
   const currentPartitionPage = Math.min(partitionPage, partitionPageCount - 1)
   const visiblePartitions = currentStatus.storage.partitions.slice(currentPartitionPage * partitionRows, (currentPartitionPage + 1) * partitionRows)
+
+  useEffect(() => {
+    const chat = new ChatConnection({
+      state: (value) => {
+        setRoom(value)
+        setWifiMonitorConnected(value.online)
+        if (!value.online) { connectionsRef.current.reset('wifi'); refreshConnections(n => n + 1) }
+      },
+      telemetry: (text) => handleProtocolText('wifi', text),
+      notice: setChatNotice,
+      bridge: async (value) => {
+        if (!bleConnectionRef.current?.writable) return
+        await bleConnectionRef.current.write(new TextEncoder().encode(`${JSON.stringify(value)}\n`))
+      },
+    })
+    chatRef.current = chat
+    chat.start()
+    return () => { chat.dispose(); if (chatRef.current === chat) chatRef.current = null }
+  }, [])
 
   useEffect(() => {
     const observer = new ResizeObserver((entries) => {
@@ -306,7 +325,7 @@ export default function App(): React.JSX.Element {
       connecting: setBleConnecting,
       retrying: setBleRetrying,
       notice: setBleError,
-      reset: () => resetTransport('ble'),
+      reset: () => { chatRef.current?.gatewayOff(); chatBufferRef.current = ''; resetTransport('ble') },
       text: (text) => handleProtocolText('ble', text),
     })
     bleConnectionRef.current = connection
@@ -328,7 +347,6 @@ export default function App(): React.JSX.Element {
       text: (text) => handleProtocolText('wifi', text),
     })
     wifiConnectionRef.current = connection
-    connection.start()
     return () => {
       connection.dispose()
       if (wifiConnectionRef.current === connection) wifiConnectionRef.current = null
@@ -479,6 +497,16 @@ export default function App(): React.JSX.Element {
   }
 
   function handleProtocolText(transport: BoardTransport, text: string): void {
+    if (transport === 'ble' && !demoMode) {
+      const lines = (chatBufferRef.current + text).split(/\r?\n/)
+      chatBufferRef.current = (lines.pop() ?? '').slice(-32768)
+      for (const line of lines) {
+        try {
+          const value = JSON.parse(line) as Record<string, unknown>
+          if (['hello', 'status', 'event', 'result', 'chat'].includes(String(value.type))) chatRef.current?.bridge(value)
+        } catch { /* Partial frames wait for newline. */ }
+      }
+    }
     const now = Date.now()
     const messages = connectionsRef.current.receive(transport, text, now)
     for (const message of messages) handleBoardMessage(transport, message)
@@ -581,20 +609,6 @@ export default function App(): React.JSX.Element {
     setDemoMode(false)
     if (selectDevice) await bleConnectionRef.current?.selectDevice()
     else await bleConnectionRef.current?.connect()
-  }
-
-  function connectWifiMonitor(): void {
-    setDemoMode(false)
-    wifiConnectionRef.current?.connect(wifiAddress)
-  }
-
-  function connectRemoteMonitor(): void {
-    setDemoMode(false)
-    wifiConnectionRef.current?.connectRemote(remoteGateway, remoteDevice, remoteToken)
-  }
-
-  function disconnectRemoteMonitor(): void {
-    wifiConnectionRef.current?.disconnectRemote()
   }
 
   async function toggleDemoMode(): Promise<void> {
@@ -906,13 +920,9 @@ export default function App(): React.JSX.Element {
       : '由板端固件上报'
   const wifiRetrying = currentStatus.wifi.state === 'connecting' && (currentStatus.wifi.retries ?? 0) > 0
   const wifiStatusLabel = wifiRetrying ? `重试中 · ${currentStatus.wifi.retries} 次` : stateLabel(currentStatus.wifi.state)
-  const wifiMonitorLabel = wifiMonitorConnecting ? '连接中' : wifiMonitorRetrying ? '等待自动重连'
-    : wifiProtocolOnline ? '通信正常' : wifiMonitorConnected ? '等待数据' : '未连接'
-  const wifiMonitorActive = wifiMonitorConnected || wifiMonitorConnecting || wifiMonitorRetrying
-  const transportLabel = activeConnection?.transport === 'usb' ? 'USB' : activeConnection?.transport === 'wifi' ? 'Wi-Fi' : '蓝牙'
-
-  const page = pages.find((item) => item.id === activePage)!
+  const page = pages.find(item => item.id === activePage)!
   const sectionTabs = {
+    chat: { value: '', select: (_value: string) => {}, items: [] as string[][] },
     overview: { value: overviewTab, select: setOverviewTab, items: [['device', '设备状态'], ['events', '输入事件']] },
     control: { value: controlTab, select: setControlTab, items: [['pixels', '彩色灯带'], ['power', '指示灯与电源'], ['audio', '音频设备']] },
     network: { value: 'all', select: () => undefined, items: [] },
@@ -930,42 +940,37 @@ export default function App(): React.JSX.Element {
             <h1>EasyInput <span>Studio</span></h1>
           </div>
           <div className="topbar-actions">
-            <button className={`text-button demo-toggle ${demoMode ? 'demo-active' : ''}`} disabled={bleConnecting || serialConnecting || deviceBusy} onClick={() => void toggleDemoMode()}>
+            <button className={`text-button demo-toggle ${demoMode ? 'demo-active' : ''}`} disabled={chatBusy || bleConnecting || serialConnecting || deviceBusy} onClick={() => void toggleDemoMode()}>
               {demoMode ? <Check size={15} /> : <Activity size={15} />}{demoMode ? '退出演示' : '演示'}
             </button>
-            <button className={`button ${serialOpen ? 'button-subtle' : 'button-primary'}`} disabled={serialConnecting || deviceBusy} onClick={() => serialOpen ? void closeSerial() : void connectBoard()}>
+            <button className={`button ${serialOpen ? 'button-subtle' : 'button-primary'}`} disabled={chatBusy || serialConnecting || deviceBusy} onClick={() => serialOpen ? void closeSerial() : void connectBoard()}>
               {serialConnecting ? <LoaderCircle size={16} className="spin" /> : <Usb size={16} />}{serialConnecting ? '连接中' : serialOpen ? '断开 USB' : '连接 USB'}
             </button>
-            <button className="button button-subtle desktop-action" disabled={deviceBusy} onClick={() => {
-              if (wifiMonitorActive) wifiConnectionRef.current?.disconnect()
-              else if (wifiAddress.trim()) connectWifiMonitor()
-              else setActivePage('network')
-            }}>
-              {wifiMonitorConnecting || wifiMonitorRetrying ? <LoaderCircle size={16} className="spin" /> : <Wifi size={16} />}
-              {wifiMonitorConnecting || wifiMonitorRetrying ? '取消重连' : wifiMonitorConnected ? '断开 Wi-Fi' : '连接 Wi-Fi'}
-            </button>
+            <button className="button button-subtle desktop-action" disabled={chatBusy || deviceBusy} onClick={() => setActivePage('network')}><Wifi size={16} />{room.online ? '开发板在线' : '开发板离线'}</button>
           </div>
         </header>
 
-        <nav className="main-nav" aria-label="主要页面">{pages.map(({ id, label, icon: Icon }) => <button key={id} aria-current={activePage === id ? 'page' : undefined} className={activePage === id ? 'active' : ''} onClick={() => setActivePage(id)}><span className="nav-icon"><Icon size={18} strokeWidth={activePage === id ? 2 : 1.7} />{id === 'firmware' && (flashing || flashPreparing) && <i />}</span><span>{label}</span></button>)}</nav>
+        <nav className="main-nav" aria-label="主要页面">{pages.map(({ id, label, icon: Icon }) => <button key={id} disabled={chatBusy} aria-current={activePage === id ? 'page' : undefined} className={activePage === id ? 'active' : ''} onClick={() => setActivePage(id)}><span className="nav-icon"><Icon size={18} strokeWidth={activePage === id ? 2 : 1.7} />{id === 'firmware' && (flashing || flashPreparing) && <i />}</span><span>{label}</span></button>)}</nav>
 
         <div className="connection-line">
-          <span className="connection-summary"><span className={`pulse-dot ${protocolOnline || demoMode ? 'pulse-on' : ''}`} />{demoMode ? '演示模式' : protocolOnline ? `${transportLabel} · 实时连接` : dataTransportOpen ? '已连接 · 等待数据' : '等待连接设备'}</span>
+          <span className="connection-summary"><span className={`pulse-dot ${room.online || demoMode ? 'pulse-on' : ''}`} />{demoMode ? '演示模式' : `开发板状态：${room.online ? '在线' : '离线'}${room.online ? ` · ${room.via === 'wifi' ? 'Wi-Fi' : '蓝牙网关'}` : ''}`}</span>
           <span className="connection-transports"><span className={usbStateClass} title={usbLabel}>USB</span><span className={bleStateClass}>BLE</span><span className={wifiProtocolOnline ? 'is-live' : 'is-muted'}>Wi-Fi</span><span className="app-version">v{appVersion}</span></span>
         </div>
 
         <div className="notice-stack" aria-live="polite">
+          {chatNotice && <div className="notice notice-error"><span>{chatNotice}</span><button onClick={() => setChatNotice('')} aria-label="关闭提示"><X size={16} /></button></div>}
           {serialError && <div className="notice notice-error"><X size={16} /><span>{serialError}</span><button onClick={() => setSerialError('')} aria-label="关闭提示"><X size={16} /></button></div>}
           {updateWaiting && updateBlocked && <div className="notice notice-update"><RotateCw size={15} /><span>新版本已就绪，设备操作结束后会自动更新。</span></div>}
         </div>
 
         <section className="page-content" aria-labelledby="page-title">
-          <div className="section-heading"><div><p>{page.caption}</p><h2 id="page-title">{page.title}</h2></div><span className="page-number">0{pages.indexOf(page) + 1}<span> / 05</span></span></div>
+          <div className="section-heading"><div><p>{page.caption}</p><h2 id="page-title">{page.title}</h2></div><span className="page-number">0{pages.indexOf(page) + 1}<span> / 06</span></span></div>
           {sectionTabs.items.length > 0 && <nav className="subnav" aria-label={`${page.label}分页`}>
             {sectionTabs.items.map(([id, label]) => <button key={id} aria-pressed={sectionTabs.value === id} className={sectionTabs.value === id ? 'selected' : ''} onClick={() => sectionTabs.select(id)}>{label}{id === 'events' && events.length > 0 && <span className="tab-count">{events.length}</span>}</button>)}
           </nav>}
 
           <div className="page-body" key={`${activePage}-${sectionTabs.value}`}>
+            {activePage === 'chat' && <VoiceChat room={room} board={room.online ? currentStatus : null} connection={chatRef.current} busyChanged={setChatBusy} disabled={deviceBusy || demoMode} />}
             {activePage === 'overview' && overviewTab === 'device' && <div className="overview-layout">
               <article className="device-hero">
                 <div className="hero-top"><span className="hero-badge"><Cpu size={13} /> YOUR DEVICE</span><span className="version-pill">V2.0</span></div>
@@ -982,7 +987,7 @@ export default function App(): React.JSX.Element {
 
             {activePage === 'overview' && overviewTab === 'events' && <article className="panel list-panel events-card">
               <div className="panel-heading"><div><span className="section-kicker">INPUT STREAM</span><h3>实时输入事件 <span className="count-pill">{events.length}</span></h3></div><button className="text-button" onClick={() => { setEvents([]); setEventPage(0) }}>清空</button></div>
-              <div className="event-filter-row"><span><i className="filter-dot key-dot" />按键</span><span><i className="filter-dot encoder-dot" />旋钮</span><span><i className="filter-dot mic-dot" />麦克风</span><span className="event-live"><span className={`pulse-dot ${protocolOnline || demoMode ? 'pulse-on' : ''}`} />{protocolOnline || demoMode ? 'LIVE' : '等待输入'}</span></div>
+              <div className="event-filter-row"><span><i className="filter-dot key-dot" />按键</span><span><i className="filter-dot encoder-dot" />旋钮</span><span><i className="filter-dot mic-dot" />麦克风</span><span className="event-live"><span className={`pulse-dot ${room.online || demoMode ? 'pulse-on' : ''}`} />{protocolOnline || demoMode ? 'LIVE' : '等待输入'}</span></div>
               <div className="paginated-list event-list" ref={eventListRef}>
                 {visibleEvents.length === 0 ? <div className="empty-state"><Activity size={30} strokeWidth={1.3} /><strong>等待你的第一次输入</strong><p>按下按键或转动旋钮<br />设备事件将在这里实时显示</p><span className="key-hint"><kbd>S1</kbd><kbd>S2</kbd><kbd>S3</kbd><span>…</span><kbd>S8</kbd></span></div> : visibleEvents.map((event) => <div className="event-row" key={event.rowId}><div className={`event-source-icon ${event.source}`}>{event.source === 'key' ? <span>{event.key?.replace('S', '') ?? 'K'}</span> : event.source === 'encoder' ? <RotateCw size={16} /> : <Mic size={16} />}</div><div className="event-copy"><strong>{describeInputEvent(event)}</strong><span>{event.source === 'key' ? '物理按键' : event.source === 'encoder' ? '旋转编码器' : 'I²S 麦克风'}</span></div><time>{event.receivedAt}</time></div>)}
               </div>
@@ -1019,23 +1024,19 @@ export default function App(): React.JSX.Element {
               {(currentStatus.microphone.error || currentStatus.speaker.error) && <p className="result-note error">{currentStatus.microphone.error ? `麦克风：${currentStatus.microphone.error}。` : ''}{currentStatus.speaker.error ? `扬声器：${currentStatus.speaker.error}。` : ''}</p>}{outputBusy && pendingOutputRef.current?.action.startsWith('audio.') && <p className="result-note" role="status">正在应用音频设置…</p>}{audioResult && <p className={`result-note ${audioResult.ok ? '' : 'error'}`} role="status">{audioResult.message}</p>}
             </article>}
 
-            {activePage === 'network' && <article className="panel network-card">
-              <div className="panel-heading"><div><span className="section-kicker">NETWORK CONTROL</span><h3>网络与连接</h3></div><span className={`status-chip ${stateClass(currentStatus.wifi.state)}`}>{wifiStatusLabel}</span></div>
-              <div className="network-action-grid">
-                <section className="network-action-block"><div className="network-action-heading"><Wifi size={16} /><strong>{wifiEditing ? '更换 Wi-Fi 网络' : 'Wi-Fi 设置'}</strong></div>
-                  {currentStatus.wifi.configured && !wifiEditing && <div className="saved-network"><span className="card-icon wifi-icon"><Check size={20} /></span><strong>{currentStatus.wifi.ssid ?? '已保存网络'}</strong><p>开机与断线后会自动连接<br />无需重复输入密码</p><div className="wifi-actions">{currentStatus.wifi.state !== 'connected' && <button className="button button-primary" type="button" disabled={!wifiConfigOnline || deviceBusy || wifiBusy || currentStatus.wifi.state === 'connecting'} onClick={() => void sendWifiCommand('wifi.connect_saved')}>{wifiBusy || currentStatus.wifi.state === 'connecting' ? <LoaderCircle size={14} className="spin" /> : <RotateCw size={14} />}{currentStatus.wifi.state === 'connecting' ? '自动连接中' : '使用已保存网络'}</button>}<button className="button button-subtle" disabled={!wifiConfigOnline || deviceBusy || wifiBusy} onClick={focusWifiConfiguration}>更换网络</button><button className="text-button" disabled={!wifiConfigOnline || deviceBusy || wifiBusy} onClick={() => void sendWifiCommand('wifi.clear')}>清除配置</button></div></div>}
-                  {(wifiEditing || currentStatus.wifi.configured !== true) && <form className="wifi-form" onSubmit={(event) => { event.preventDefault(); void sendWifiCommand('wifi.configure') }}><label>网络名称 (SSID)<input ref={wifiSsidRef} disabled={!wifiConfigOnline || deviceBusy || wifiBusy} autoComplete="off" maxLength={32} value={wifiSsid} onChange={(event) => setWifiSsid(event.target.value)} placeholder="输入 2.4 GHz Wi-Fi 名称" /></label><label>密码<input disabled={!wifiConfigOnline || deviceBusy || wifiBusy} autoComplete="new-password" maxLength={63} type="password" value={wifiPassword} onChange={(event) => setWifiPassword(event.target.value)} placeholder="开放网络可留空" /></label><div className="wifi-actions"><button className="button button-primary" type="submit" disabled={!wifiConfigOnline || deviceBusy || wifiBusy || !wifiSsid.trim()}>{wifiBusy ? <LoaderCircle size={14} className="spin" /> : <Wifi size={14} />}保存并自动连接</button>{currentStatus.wifi.configured && <button className="text-button" type="button" disabled={wifiBusy} onClick={() => { setWifiEditing(false); setWifiPassword('') }}>取消</button>}</div></form>}
-                  {wifiResult && <p className={`result-note ${wifiResult.ok ? '' : 'error'}`} role="status">{wifiResult.message ?? (wifiResult.ok ? '操作完成。' : '操作失败。')}</p>}
-                </section>
-                <section className="network-action-block"><div className="network-action-heading"><Monitor size={16} /><strong>无线监控</strong><span className={`status-chip ${wifiProtocolOnline ? 'is-live' : wifiMonitorActive ? 'is-warn' : 'is-muted'}`} role="status">{wifiMonitorLabel}</span></div>
-                  <form className="wifi-form" onSubmit={(event) => { event.preventDefault(); connectWifiMonitor() }}><label>开发板 IP 地址<input aria-label="开发板 IP 地址" disabled={deviceBusy || wifiMonitorActive} autoComplete="off" inputMode="decimal" maxLength={15} value={wifiAddress} onChange={(event) => setWifiAddress(event.target.value)} placeholder="例如 192.168.1.82" /></label><div className="wifi-actions">{wifiMonitorActive ? <button className="button button-subtle" type="button" disabled={deviceBusy} onClick={() => wifiConnectionRef.current?.disconnect()}>{wifiMonitorConnected ? '断开 Wi-Fi 监控' : '取消重连'}</button> : <button className="button button-primary" type="submit" disabled={deviceBusy || !wifiAddress.trim()}><Wifi size={15} />连接 Wi-Fi 监控</button>}</div></form>
-                  <p className="light-note">手机或电脑与开发板需在同一局域网。通过 USB 或蓝牙读取 IP 后自动填入。</p>{wifiMonitorError && <p className="result-note warn" role="status">{wifiMonitorError}</p>}
-                  <div className="remote-agent-section"><div className="summary-heading"><Monitor size={16} /><strong>公网直连监控</strong><span className={wifiProtocolOnline ? 'is-live' : 'is-muted'}>{wifiProtocolOnline && remoteGateway ? '已连接' : '未连接'}</span></div><form className="wifi-form" onSubmit={(event) => { event.preventDefault(); connectRemoteMonitor() }}><label>Cloudflare WSS 网关<input value={remoteGateway} onChange={(event) => setRemoteGateway(event.target.value)} placeholder="wss://xxx.workers.dev" /></label><label>设备 ID<input value={remoteDevice} onChange={(event) => setRemoteDevice(event.target.value)} placeholder="easyinput-v2" /></label><label>配对令牌<input type="password" value={remoteToken} onChange={(event) => setRemoteToken(event.target.value)} placeholder="至少 16 位" /></label><div className="wifi-actions"><button className="button button-subtle" type="button" disabled={cloudBusy || !wifiConfigOnline} onClick={() => void sendCloudCommand('cloud.configure')}>保存到开发板</button>{wifiMonitorActive && remoteGateway ? <button className="button button-subtle" type="button" onClick={disconnectRemoteMonitor}>断开公网监控</button> : <button className="button button-primary" type="submit" disabled={deviceBusy || !remoteGateway.trim() || !remoteToken.trim()}>连接公网监控</button>}</div></form><p className="light-note">先通过 USB 或加密蓝牙保存配置，开发板随后会自行连接 Cloudflare；不再需要电脑 Agent。</p>{cloudResult && <p className={`result-note ${cloudResult.ok ? '' : 'error'}`}>{cloudResult.message}</p>}</div>
-                  <div className="bluetooth-section"><div className="summary-heading"><Bluetooth size={16} /><strong>蓝牙连接</strong><span className={bleStateClass}>{bleLabel}</span></div><div className="wifi-actions"><button className="button button-subtle" disabled={deviceBusy} onClick={() => { if (bleConnected || bleConnecting || bleRetrying) disconnectBle(); else void connectBle() }}>{bleConnected ? '断开蓝牙' : bleConnecting || bleRetrying ? '取消重连' : '连接蓝牙'}</button>{!bleConnected && !bleConnecting && <button className="text-button" disabled={deviceBusy} onClick={() => void connectBle(true)}>重新选择设备</button>}</div>{bleError && <p className="result-note warn">{bleError}</p>}</div>
-                </section>
-              </div>
-              <div className="network-status-section"><div className="network-status-heading"><span>当前 Wi-Fi 状态</span>{wifiRetrying && <span className="is-warn">开发板正在自动重试连接</span>}</div><div className="network-details"><div><span>网络名称</span><strong>{currentStatus.wifi.ssid ?? (currentStatus.wifi.configured ? '正在获取…' : '尚未配置')}</strong></div><div><span>IP 地址</span><strong>{currentStatus.wifi.ip ?? '—'}</strong></div><div><span>子网掩码</span><strong>{currentStatus.wifi.netmask ?? '—'}</strong></div><div><span>网关</span><strong>{currentStatus.wifi.gateway ?? '—'}</strong></div><div><span>DNS</span><strong>{currentStatus.wifi.dns ?? '—'}</strong></div><div><span>信号 / 信道</span><strong>{currentStatus.wifi.state === 'connected' && currentStatus.wifi.rssi !== undefined ? `${currentStatus.wifi.rssi} dBm` : '—'}{currentStatus.wifi.state === 'connected' && currentStatus.wifi.channel ? ` / ${currentStatus.wifi.channel}` : ''}</strong></div><div><span>重连 / 断线次数</span><strong>{currentStatus.wifi.retries ?? '—'} / {currentStatus.wifi.disconnects ?? '—'}</strong></div><div><span>最近断线原因</span><strong>{wifiDisconnectReason(currentStatus.wifi.disconnect_code)}</strong></div></div></div>
-              <div className="panel-bottom-note"><Usb size={14} />网络设置通过 USB 或蓝牙修改，Wi-Fi 连接仅用于监控。</div>
+            {activePage === 'network' && <article className="panel network-card simple-network">
+              <div className="panel-heading"><h3>开发板状态</h3><span className={`status-chip ${room.online ? 'is-live' : 'is-muted'}`}>{room.online ? '在线' : '离线'}</span></div>
+              <div className="board-online-card"><span className={`pulse-dot ${room.online ? 'pulse-on' : ''}`} /><strong>开发板状态：{room.online ? '在线' : '离线'}</strong>{room.online && <p>联网方式：{room.via === 'wifi' ? 'Wi-Fi' : '蓝牙网关'}</p>}</div>
+              <p className="light-note">配置保存后，开发板开机自动联网。群里的电脑会同步显示状态。</p>
+              <details className="first-setup"><summary>首次连接 / 更换 Wi-Fi</summary>
+                <div className="phone-setup"><strong>手机配网 · 安卓 / iPhone</strong><ol><li>长按开发板旋钮 3 秒，进入配网模式。</li><li>手机连接 <b>EasyInput-Setup-XXXX</b> 热点，密码 <b>easyinput</b>。</li><li>在浏览器地址栏输入 <b>http://192.168.4.1</b>，填写 2.4 GHz Wi-Fi 并保存。</li><li>手机切回日常网络，再打开本网址查看状态。</li></ol><p className="light-note">配网窗口为 2 分钟，超时可再次长按旋钮。Wi-Fi 和已有配对信息会保存在开发板内；首次使用还需填写云端配对码。此功能需要 0.2.1 固件。</p></div>
+                <p className="light-note">通过 USB 或蓝牙连接开发板一次，再保存 Wi-Fi。蓝牙网关需要这台电脑保持联网、网页运行。</p>
+                <div className="wifi-actions"><button className="button button-subtle" disabled={deviceBusy} onClick={() => { if (bleConnected || bleConnecting || bleRetrying) disconnectBle(); else void connectBle() }}>{bleConnected ? '断开蓝牙' : bleConnecting || bleRetrying ? '取消重连' : '连接蓝牙'}</button><button className="text-button" disabled={deviceBusy} onClick={() => void connectBle(true)}>重新选择设备</button></div>{bleError && <p className="result-note warn">{bleError}</p>}
+                {currentStatus.wifi.configured && !wifiEditing ? <div className="saved-network"><strong>Wi-Fi 已保存</strong><p>开机后自动连接，无需再次输入密码。</p><button className="text-button" disabled={!wifiConfigOnline} onClick={focusWifiConfiguration}>更换 Wi-Fi</button></div> : <form className="wifi-form" onSubmit={e => { e.preventDefault(); void sendWifiCommand('wifi.configure') }}><label>Wi-Fi 名称<input ref={wifiSsidRef} value={wifiSsid} maxLength={32} onChange={e => setWifiSsid(e.target.value)} disabled={!wifiConfigOnline || wifiBusy} autoComplete="off" placeholder="2.4 GHz Wi-Fi" /></label><label>Wi-Fi 密码<input type="password" value={wifiPassword} maxLength={63} onChange={e => setWifiPassword(e.target.value)} disabled={!wifiConfigOnline || wifiBusy} autoComplete="new-password" /></label><button className="button button-primary" disabled={!wifiConfigOnline || wifiBusy || !wifiSsid.trim()}>保存并自动连接</button></form>}
+                {wifiResult && <p className={`result-note ${wifiResult.ok ? '' : 'error'}`}>{wifiResult.message}</p>}
+                {currentStatus.cloud?.configured ? <p className="result-note">云端连接已保存，无需重复配置。</p> : <div className="wifi-form"><label>开发板配对码<input type="password" autoComplete="off" value={remoteToken} onChange={e => setRemoteToken(e.target.value)} placeholder="首次配置一次" /></label><button className="button button-subtle" disabled={!wifiConfigOnline || cloudBusy || remoteToken.length < 16} onClick={() => void sendCloudCommand('cloud.configure')}>保存到开发板</button></div>}
+                {cloudResult && <p className={`result-note ${cloudResult.ok ? '' : 'error'}`}>{cloudResult.message}</p>}
+              </details>
             </article>}
 
             {activePage === 'system' && systemTab === 'performance' && <article className="panel system-card">

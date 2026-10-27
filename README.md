@@ -1,8 +1,16 @@
 # EasyInput Studio
 
-EasyInput Studio is a browser PWA for monitoring and managing the EasyInput V2.0 development board (firmware board alias `v2`, PCB marking `AI Keyboard V2.1`). It is a static web app with no desktop runtime or backend.
+EasyInput Studio is a browser PWA for monitoring and managing the EasyInput V2.0 development board (firmware board alias `v2`, PCB marking `AI Keyboard V2.1`). The PWA is published at https://studio.leige.online and uses a Cloudflare Worker / Durable Object for shared board presence and voice messages. There is no desktop runtime.
 
 File locations and collaboration rules are defined in [AGENTS.md](AGENTS.md). Protocol details are in [docs/PROTOCOL.md](docs/PROTOCOL.md). Web builds go in `dist/`; versioned firmware packages go in `release/firmware/` so rebuilding the website does not remove them.
+
+## 多电脑语音群（网页 0.2.1 / 固件 0.2.4）
+
+打开 [EasyInput Studio](https://studio.leige.online)，所有电脑自动加入同一开发板的语音群。日常网络页只显示开发板在线 / 离线，以及 Wi-Fi / 蓝牙网关。浏览器与群聊服务器连上，并不代表开发板在线；状态来自最近 8 秒内的板端数据。
+
+网页可以录制最长 60 秒的语音，或发送自动转成语音的中文文字；全群可以播放网页及开发板留言。前四个浏览器身份固定绑定 S1–S4，其余身份统一绑定 S8（第 5 灯）。红灯表示有未读，绿灯表示全部播放完毕；短按播放未读或重播最后一条，长按 1.2 秒清除该路已读留言，保留未读。S5 开始录音，S6 结束发送，60 秒自动结束。S7 语音播报网络；旋钮调音量、短按切换 S8 播放、长按 3 秒开启手机热点配网。第 5 灯录音时橙闪，S6 或满 60 秒结束后停止橙闪；发送中黄闪、失败待重试黄亮，确认成功后恢复留言灯态。板端 Flash 缓存最多 8 条录音，断电保留、恢复联网后每次失败等待 3 秒重试。
+
+Wi-Fi 与云端配置只需首次通过 USB / 加密蓝牙保存。蓝牙网关需要一台已连接开发板的联网电脑保持网页运行；Wi-Fi 直连则不需要电脑常驻。当前网站是同一共享房间，访问者无需额外登录即可查看状态、收发留言。硬件验收和详细约定见 [docs/VOICE_CHAT.md](docs/VOICE_CHAT.md)。
 
 ## Features
 
@@ -65,10 +73,10 @@ The board-side project targets ESP32-S3 and uses ESP-IDF 5.5.5 or later. Default
 cd firmware/easyinput-monitor
 idf.py set-target esp32s3
 idf.py build
-python3 ../../scripts/export-firmware.py --version 0.1.6
+python3 ../../scripts/export-firmware.py --version 0.2.4
 ```
 
-The export command writes `release/firmware/0.1.6-v2-monitor` containing `firmware.json` and the bootloader, partition table, and app images. The output is relative to the repository root, regardless of the shell's current directory. Firmware packages stay outside the website build output and are excluded from Git. The app checks the manifest, image sizes and SHA-256 hashes before flashing; the manifest is not a signed publisher identity. The WebSocket options in `sdkconfig.defaults` require ESP-IDF 5.5.5 or later. When reusing older generated configurations, regenerate them from these defaults before building so WebSocket support and both handshake callbacks are enabled.
+The export command writes `release/firmware/0.2.4-v2-monitor` containing `firmware.json` and the bootloader, partition table, and app images. The output is relative to the repository root, regardless of the shell's current directory. Firmware packages stay outside the website build output and are excluded from Git. The app checks the manifest, image sizes and SHA-256 hashes before flashing; the manifest is not a signed publisher identity. The WebSocket options in `sdkconfig.defaults` require ESP-IDF 5.5.5 or later. When reusing older generated configurations, regenerate them from these defaults before building so WebSocket support and both handshake callbacks are enabled. Firmware 0.2.4 synchronizes system time before opening TLS and keeps non-real-time worker stacks in PSRAM so the internal heap is available to the TLS handshake.
 
 ## Automatic connection hardware check
 
@@ -115,15 +123,11 @@ Board check: start capture, speak, play the test with capture running, then stop
 
 The browser filters device access through the Web Serial permission prompt. Firmware flashing uses the board's USB Serial/JTAG connection. The app first attempts automatic entry into download mode using the USB reset sequence. If that connection fails, keep the board powered on, short-press/release **BOOT**, then retry and select its download port. After writing, switch the board off and on to return to normal startup. Do not use the generic “hold BOOT while powering on” sequence. The app requires a separate confirmation after identifying the ESP32-S3 and reading its MAC address.
 
-## Public Wi-Fi monitoring through Cloudflare
+## Public monitoring and voice through Cloudflare
 
-The repository includes a Cloudflare Worker gateway in `cloudflare/`. The firmware opens an outbound WSS connection to Cloudflare, so the board does not need a public port or a computer Agent. The browser connects to the same device room using the Worker URL, device ID, and pairing token in **公网直连监控**. The older `agent/` bridge remains as a compatibility fallback.
+`cloudflare/` contains the gateway, durable voice room, Edge read-aloud adapter, and static website deployment configuration. The board opens outbound WSS on Wi-Fi; a browser with encrypted BLE can act as a gateway when direct Wi-Fi is unavailable. Browsers automatically join the public default device room, with no gateway/IP/token form. Board authentication still requires the existing `PAIRING_SECRET`, saved once by `cloud.configure`. Custom private room identifiers can continue using token authentication.
 
-The Studio page can also be published as a static Workers Assets project with `cloudflare/studio.wrangler.jsonc`, allowing browsers on other computers to join the same authenticated device room.
-
-Deploy the Worker with Wrangler after setting `ALLOWED_ORIGINS` and a long `PAIRING_SECRET`. Build and flash the WSS-enabled firmware, configure Wi-Fi and the cloud gateway once over USB or encrypted Bluetooth, then the board reconnects automatically. The public relay forwards only `hello.get`, `status.get`, and board telemetry/input frames; Wi-Fi credentials, light commands, audio commands, and firmware flashing still require USB or encrypted Bluetooth from the browser.
-
-Treat the pairing token as a password. Use HTTPS for the Studio site and WSS for the gateway. This feature is an optional relay deployment and is not enabled by the local development server.
+The server stores at most 100 committed messages, recovers them after page reloads, and never evicts pending unread computer messages to make room. See [cloudflare/README.md](cloudflare/README.md) for deployment and [docs/VOICE_CHAT.md](docs/VOICE_CHAT.md) for usage, protocol, and verification limits.
 
 ## Hardware validation boundary
 

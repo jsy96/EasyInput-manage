@@ -21,6 +21,28 @@
 // Six DMA blocks can still be in flight after the last write returns.
 #define TONE_DRAIN_US (6LL * AUDIO_BLOCK_FRAMES * 1000000 / AUDIO_SAMPLE_RATE + 20000)
 
+static uint8_t *record_buffer;
+static size_t record_capacity;
+static const uint8_t *voice_buffer;
+static size_t voice_length;
+static uint32_t voice_frame;
+static int64_t record_deadline_us;
+static uint8_t mulaw_encode(int sample)
+{
+    const int sign = sample < 0 ? 0x80 : 0;
+    if (sample < 0) sample = -sample;
+    if (sample > 32635) sample = 32635;
+    sample += 132;
+    int exponent = 7;
+    for (int mask = 0x4000; exponent > 0 && !(sample & mask); mask >>= 1) exponent--;
+    return ~(sign | (exponent << 4) | ((sample >> (exponent + 3)) & 15));
+}
+static int16_t mulaw_decode(uint8_t value)
+{
+    const unsigned u = (uint8_t)~value;
+    const int pcm = (((u & 15) << 3) + 132) << ((u >> 4) & 7);
+    return (u & 128) ? 132 - pcm : pcm - 132;
+}
 static SemaphoreHandle_t audio_mutex;
 static audio_snapshot_t state;
 static i2s_chan_handle_t microphone_channel;
@@ -33,6 +55,7 @@ static int64_t microphone_started_us;
 static int64_t microphone_last_data_us;
 static int64_t voice_until_us;
 static uint32_t tone_frame;
+static uint8_t tone_volume;
 static int64_t tone_drain_until_us;
 
 static esp_err_t safe_audio_pins(bool microphone)
@@ -64,6 +87,7 @@ static esp_err_t stop_channel(bool microphone)
     bool *enabled = microphone ? &microphone_enabled : &speaker_enabled;
     if (microphone) {
         state.microphone_active = false;
+        state.recording = false;
         state.rms = 0;
         state.vad = false;
         voice_until_us = 0;
@@ -149,6 +173,7 @@ static void audio_task(void *arg)
     while (true) {
         bool did_io = false;
         xSemaphoreTake(audio_mutex, portMAX_DELAY);
+        if (state.recording && esp_timer_get_time() >= record_deadline_us) (void)stop_channel(true);
         if (state.microphone_active) {
             did_io = true;
             size_t bytes = 0;
@@ -156,7 +181,19 @@ static void audio_task(void *arg)
             const int64_t now = esp_timer_get_time();
             if ((result == ESP_OK || result == ESP_ERR_TIMEOUT) && bytes >= 2 * sizeof(int32_t)) {
                 microphone_last_data_us = now;
-                if (now - microphone_started_us >= MIC_WARMUP_US) update_microphone(bytes / (2 * sizeof(int32_t)), now);
+                if (now - microphone_started_us >= MIC_WARMUP_US) {
+                    const size_t frames = bytes / (2 * sizeof(int32_t));
+                    update_microphone(frames, now);
+                    if (state.recording && record_buffer != NULL) {
+                        // SELECT is high on the board: use the right I2S slot.
+                        for (size_t i = 0; i + 1 < frames && state.recorded_bytes < record_capacity; i += 2) {
+                            const int a = microphone_samples[i * 2 + 1] >> 16;
+                            const int b = microphone_samples[(i + 1) * 2 + 1] >> 16;
+                            record_buffer[state.recorded_bytes++] = mulaw_encode((a + b) / 2);
+                        }
+                        if (state.recorded_bytes >= record_capacity) (void)stop_channel(true);
+                    }
+                }
                 result = ESP_OK;
             } else if (result == ESP_OK || result == ESP_ERR_TIMEOUT) {
                 result = now - microphone_last_data_us < MIC_STALL_US ? ESP_OK : ESP_ERR_TIMEOUT;
@@ -166,7 +203,24 @@ static void audio_task(void *arg)
                 (void)stop_channel(true);
             }
         }
-        if (state.speaker_playing && tone_frame < TONE_FRAMES) {
+        if (state.speaker_playing && voice_buffer != NULL && voice_frame < voice_length * 2) {
+            did_io = true;
+            size_t frames = voice_length * 2 - voice_frame;
+            if (frames > AUDIO_BLOCK_FRAMES) frames = AUDIO_BLOCK_FRAMES;
+            for (size_t i = 0; i < frames; i++) {
+                const int16_t sample = mulaw_decode(voice_buffer[(voice_frame + i) / 2]) * state.volume / 100;
+                speaker_samples[i * 2] = speaker_samples[i * 2 + 1] = sample;
+            }
+            size_t written = 0;
+            esp_err_t result = i2s_channel_write(speaker_channel, speaker_samples, frames * 4, &written, AUDIO_IO_TIMEOUT_MS);
+            if (result != ESP_OK || written != frames * 4) {
+                state.speaker_error = result != ESP_OK ? result : ESP_ERR_TIMEOUT;
+                (void)stop_channel(false);
+            } else {
+                voice_frame += frames;
+                if (voice_frame == voice_length * 2) tone_drain_until_us = esp_timer_get_time() + TONE_DRAIN_US;
+            }
+        } else if (state.speaker_playing && voice_buffer == NULL && tone_frame < TONE_FRAMES) {
             did_io = true;
             unsigned frames = TONE_FRAMES - tone_frame;
             if (frames > AUDIO_BLOCK_FRAMES) frames = AUDIO_BLOCK_FRAMES;
@@ -174,7 +228,7 @@ static void audio_task(void *arg)
                 const uint32_t frame = tone_frame + i;
                 const uint32_t remaining = TONE_FRAMES - 1 - frame;
                 const float fade = fminf(1.0f, (float)(frame < remaining ? frame : remaining) / TONE_FADE_FRAMES);
-                const int16_t sample = (int16_t)(32767.0f * state.volume / 100.0f * fade * sinf(2.0f * 3.14159265358979323846f * 440.0f * frame / AUDIO_SAMPLE_RATE));
+                const int16_t sample = (int16_t)(32767.0f * tone_volume / 100.0f * fade * sinf(2.0f * 3.14159265358979323846f * 440.0f * frame / AUDIO_SAMPLE_RATE));
                 speaker_samples[i * 2] = sample;
                 speaker_samples[i * 2 + 1] = sample;
             }
@@ -190,6 +244,7 @@ static void audio_task(void *arg)
         } else if (state.speaker_playing && esp_timer_get_time() >= tone_drain_until_us) {
             const esp_err_t result = stop_channel(false);
             if (result != ESP_OK) state.speaker_error = result;
+            else if (voice_buffer != NULL && voice_frame == voice_length * 2) state.voice_completed = true;
         }
         xSemaphoreGive(audio_mutex);
         // DMA blocks active I/O. An extra tick would starve 16 ms audio blocks.
@@ -199,7 +254,7 @@ static void audio_task(void *arg)
 
 esp_err_t audio_init(void)
 {
-    state.volume = 10;
+    state.volume = 20;
     audio_mutex = xSemaphoreCreateMutex();
     if (!audio_mutex) return ESP_ERR_NO_MEM;
     state.ready = true;
@@ -250,7 +305,9 @@ static esp_err_t start_test(void *arg)
     const esp_err_t result = start_channel(false);
     state.speaker_error = result;
     if (result == ESP_OK) {
-        state.volume = volume;
+        voice_buffer = NULL;
+        state.voice_completed = false;
+        tone_volume = volume;
         state.speaker_playing = true;
         tone_frame = 0;
         tone_drain_until_us = 0;
@@ -287,3 +344,59 @@ esp_err_t audio_prepare_power_off(void)
     xSemaphoreGive(audio_mutex);
     return mic_result != ESP_OK ? mic_result : spk_result;
 }
+
+typedef struct { const uint8_t *buffer; size_t length; } voice_context_t;
+static esp_err_t start_voice(void *arg)
+{
+    const voice_context_t *context = arg;
+    xSemaphoreTake(audio_mutex, portMAX_DELAY);
+    if (state.recording || state.speaker_playing) { xSemaphoreGive(audio_mutex); return ESP_ERR_INVALID_STATE; }
+    esp_err_t result = start_channel(false);
+    state.speaker_error = result;
+    if (result == ESP_OK) {
+        voice_buffer = context->buffer; voice_length = context->length;
+        state.voice_completed = false;
+        state.speaker_playing = true;
+        voice_frame = 0;
+        tone_drain_until_us = 0;
+    }
+    xSemaphoreGive(audio_mutex);
+    return result;
+}
+esp_err_t audio_play_voice(const uint8_t *buffer, size_t length)
+{
+    if (buffer == NULL || length == 0 || length > 480000) return ESP_ERR_INVALID_ARG;
+    const voice_context_t context = {.buffer = buffer, .length = length};
+    return lights_with_shared_power(start_voice, (void *)&context);
+}
+esp_err_t audio_set_volume(uint8_t volume)
+{
+    if (!audio_mutex || volume > 100) return ESP_ERR_INVALID_ARG;
+    xSemaphoreTake(audio_mutex, portMAX_DELAY);
+    state.volume = volume;
+    xSemaphoreGive(audio_mutex);
+    return ESP_OK;
+}
+static esp_err_t start_record(void *arg)
+{
+    const voice_context_t *context = arg;
+    xSemaphoreTake(audio_mutex, portMAX_DELAY);
+    esp_err_t result = stop_channel(false);
+    if (result == ESP_OK) result = start_channel(true);
+    state.microphone_error = result;
+    if (result == ESP_OK) {
+        microphone_started_us = microphone_last_data_us = esp_timer_get_time();
+        record_buffer = (uint8_t *)context->buffer; record_capacity = context->length;
+        state.recorded_bytes = 0; state.recording = true; state.microphone_active = true;
+        record_deadline_us = esp_timer_get_time() + 60000000;
+    }
+    xSemaphoreGive(audio_mutex);
+    return result;
+}
+esp_err_t audio_record_start(uint8_t *buffer, size_t capacity)
+{
+    if (buffer == NULL || capacity == 0 || capacity > 480000) return ESP_ERR_INVALID_ARG;
+    const voice_context_t context = {.buffer = buffer, .length = capacity};
+    return lights_with_shared_power(start_record, (void *)&context);
+}
+esp_err_t audio_record_stop(void) { return audio_set_microphone(false); }

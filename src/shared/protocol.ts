@@ -51,6 +51,8 @@ export interface BoardStatus {
   ble: { state: ConnectionState; name?: string; peers?: number }
   peripherals: { shared_rail: 'off' | 'on' | 'unknown' }
   lights: { status_led: 'off' | 'on' | 'unknown'; pixels: Array<'off' | 'on' | 'unknown'>; control?: LightControl }
+  cloud?: { configured: boolean; online: boolean }
+  voice?: { pending: number; sending: boolean; storage_error: boolean; s8_enabled: boolean; setup_active: boolean }
   audio?: { ready: boolean; sample_rate_hz: number }
   speaker: { state: 'unavailable' | 'idle' | 'playing' | 'unknown'; volume?: number; error?: string }
   microphone: { state: 'unavailable' | 'idle' | 'active' | 'unknown'; rms?: number; vad?: boolean; error?: string }
@@ -153,6 +155,9 @@ export function parseBoardMessage(line: string): BoardMessage | null {
       !isRecord(power)
     ) return null
     if (lights.control !== undefined && !isLightControl(lights.control)) return null
+    if (record.voice !== undefined && (!isRecord(record.voice) || !isFiniteNumber(record.voice.pending) ||
+      !Number.isInteger(record.voice.pending) || record.voice.pending < 0 || record.voice.pending > 9 ||
+      !['sending', 'storage_error', 's8_enabled', 'setup_active'].every(key => typeof (record.voice as Record<string, unknown>)[key] === 'boolean'))) return null
     if (record.audio !== undefined && (!isRecord(record.audio) || typeof record.audio.ready !== 'boolean' ||
       !isFiniteNumber(record.audio.sample_rate_hz) || !Number.isInteger(record.audio.sample_rate_hz) || record.audio.sample_rate_hz <= 0)) return null
     if ((microphone.rms !== undefined && !isAudioLevel(microphone.rms)) ||

@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EasyInput 配网</title>
+<style>body{font:16px system-ui,sans-serif;background:#f5f8f2;color:#203c33;margin:0;padding:24px}main{max-width:420px;margin:20px auto;background:white;padding:24px;border-radius:20px}h1{font-size:26px}p{line-height:1.6;color:#52685e}label{display:block;margin:20px 0 6px}input,button{box-sizing:border-box;font:inherit;width:100%;padding:13px;border:1px solid #b7c8ba;border-radius:10px}button{background:#24614e;color:white;margin-top:24px}button:disabled{opacity:.5}#result{white-space:pre-wrap}small{display:block;margin-top:8px;line-height:1.5}</style>
+<main><h1>让开发板连上 Wi-Fi</h1><p>保存一次，之后开机自动连接。只支持 2.4 GHz Wi-Fi。</p>
+<form id="form"><label for="ssid">Wi-Fi 名称</label><input id="ssid" required autocomplete="off" maxlength="32"><label for="password">Wi-Fi 密码</label><input id="password" type="password" autocomplete="new-password" maxlength="63"><small>无密码的 Wi-Fi 可留空。</small>
+<details id="pairing" open><summary>首次配对码 / 更换配对码</summary><label for="code">云端配对码</label><input id="code" type="password" autocomplete="off" maxlength="128"><small>首次使用时填写开发板的云端配对码；已有配置可留空。配对码填错时可在此重新保存。</small></details><button id="save">保存并连接</button></form><p id="result" role="status"></p><small>热点开放 2 分钟，到时自动关闭。需要时重新长按旋钮 3 秒。保存后可切回日常网络，打开 studio.leige.online 查看开发板状态。</small></main>
+<script>
+const token='__TOKEN__';
+fetch('/setup-status').then(r=>r.json()).then(s=>{document.getElementById('pairing').open=!s.configured;document.getElementById('code').required=!s.configured}).catch(()=>{});
+document.getElementById('form').addEventListener('submit',async e=>{
+ e.preventDefault();const save=document.getElementById('save'),result=document.getElementById('result');save.disabled=true;result.textContent='正在保存…';
+ try{const r=await fetch('/setup',{method:'POST',headers:{'Content-Type':'application/json','X-Setup-Token':token},body:JSON.stringify({ssid:document.getElementById('ssid').value,password:document.getElementById('password').value,code:document.getElementById('code').value})});const s=await r.json();if(!s.ok)throw new Error(s.message);document.getElementById('form').reset();result.textContent='已保存，开发板正在连接。请切回日常网络，打开 studio.leige.online 查看状态。若未上线，可重新长按旋钮检查 Wi-Fi 名称和密码。';}
+ catch(err){result.textContent=err.message||'连接中断，请重新连接开发板热点后重试。';save.disabled=false;}
+});
+</script></html>

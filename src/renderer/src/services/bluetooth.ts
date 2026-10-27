@@ -39,6 +39,7 @@ export class BluetoothConnection {
   private inFlight = false
   private enabled = false
   private disposed = false
+  private writeQueue: Promise<void> = Promise.resolve()
 
   constructor(private readonly callbacks: Callbacks) {}
 
@@ -266,7 +267,17 @@ export class BluetoothConnection {
     await this.connect()
   }
 
-  async write(frame: Uint8Array): Promise<void> {
+  write(frame: Uint8Array): Promise<void> {
+    const generation = this.generation
+    const operation = this.writeQueue.then(async () => {
+      if (generation !== this.generation) throw new Error('蓝牙连接已更新，请重试')
+      await this.writeFrame(frame)
+    })
+    this.writeQueue = operation.catch(() => undefined)
+    return operation
+  }
+
+  private async writeFrame(frame: Uint8Array): Promise<void> {
     const device = this.device
     const rx = this.rx
     const generation = this.generation

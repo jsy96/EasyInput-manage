@@ -21,6 +21,8 @@
 | 对应源码同目录 | 自动化测试，命名为 `<源码名>.test.ts` 或 `<源码名>.test.tsx` |
 | `public/` | 应用图标等直接发布的静态资源 |
 | `firmware/easyinput-monitor/` | ESP-IDF 固件工程；业务源码放在 `main/`，构建配置、分区表和 `sdkconfig.defaults` 留在工程根目录 |
+| `cloudflare/` | 网站发布配置、云端网关与共享语音群服务；测试放对应源码同目录 |
+| `agent/` | 历史局域网 Agent，仅保留兼容用途 |
 | `scripts/` | 构建、固件导出等项目辅助脚本 |
 | `dist/` | 网页构建产物，由网页构建工具生成，构建时可能清空 |
 | `release/firmware/<版本>-v2-monitor/` | 新导出的版本固件包，每包包含 `firmware.json`、bootloader、分区表和应用镜像 |

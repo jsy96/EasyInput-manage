@@ -8,6 +8,8 @@
 #include "lights.h"
 #include "audio.h"
 #include "cloud.h"
+#include "voice_chat.h"
+#include "network_setup.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/idf_additions.h"
@@ -30,6 +32,7 @@
 #include "esp_image_format.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_private/esp_clk.h"
@@ -58,11 +61,12 @@ void ble_store_config_init(void);
 #define DEBOUNCE_US 25000
 #define INPUT_SCAN_MS 10
 #define STATUS_INTERVAL_MS 1000
-#define USB_LINE_MAX 512
+#define USB_LINE_MAX 2048
 #define PARTITION_COUNT_MAX 24
 #define BLE_TX_QUEUE_DEPTH 16
 #define WIFI_STARTED_BIT (1U << 0)
 #define WIFI_STOPPED_BIT (1U << 1)
+#define WIFI_DISCONNECTED_BIT (1U << 2)
 #define WIFI_TRANSITION_TIMEOUT_MS 3000
 #define WIFI_WS_MAX_CLIENTS 3
 #define WIFI_WS_PENDING_LIMIT 16
@@ -104,6 +108,7 @@ static bool ble_link_encrypted;
 static bool ble_notifications_enabled;
 static uint32_t ble_connection_generation;
 static int ble_notify_tx_status;
+static bool sntp_started;
 static char ble_command_buffer[USB_LINE_MAX];
 static size_t ble_command_length;
 static esp_netif_t *wifi_netif;
@@ -125,6 +130,7 @@ static uint64_t last_flash_sample_us;
 
 static void start_advertising(void);
 static void handle_command(const char *line);
+static void time_sync_notification_cb(struct timeval *tv);
 
 typedef struct {
     char *line;
@@ -303,7 +309,7 @@ static void init_wifi_websocket(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_open_sockets = WIFI_WS_MAX_CLIENTS;
-    config.max_uri_handlers = 1;
+    config.max_uri_handlers = 6;
     config.stack_size = 6144;
     config.send_wait_timeout = 1;
     config.recv_wait_timeout = 1;
@@ -364,7 +370,16 @@ static void send_line(const char *line)
 
 bool cloud_monitor_queue_command(const char *line)
 {
-    return line != NULL && board_command_queue != NULL && xQueueSend(board_command_queue, line, 0) == pdTRUE;
+    if (line == NULL || board_command_queue == NULL || strlen(line) >= USB_LINE_MAX) return false;
+    char copy[USB_LINE_MAX] = {0};
+    strlcpy(copy, line, sizeof(copy));
+    return xQueueSend(board_command_queue, copy, 0) == pdTRUE;
+}
+
+static void send_chat_line(const char *line)
+{
+    if (cloud_monitor_is_online()) cloud_monitor_send(line);
+    else queue_ble_line(line);
 }
 
 static bool ble_frame_is_current(const ble_tx_frame_t *frame)
@@ -689,6 +704,17 @@ static void emit_status(void)
     }
     audio_snapshot_t audio_state;
     audio_get_snapshot(&audio_state);
+    cJSON *cloud = cJSON_AddObjectToObject(root, "cloud");
+    cJSON_AddBoolToObject(cloud, "configured", cloud_monitor_is_configured());
+    cJSON_AddBoolToObject(cloud, "online", cloud_monitor_is_online());
+    voice_chat_snapshot_t voice_state;
+    voice_chat_get_snapshot(&voice_state);
+    cJSON *voice = cJSON_AddObjectToObject(root, "voice");
+    cJSON_AddNumberToObject(voice, "pending", voice_state.pending);
+    cJSON_AddBoolToObject(voice, "sending", voice_state.sending);
+    cJSON_AddBoolToObject(voice, "storage_error", voice_state.storage_error);
+    cJSON_AddBoolToObject(voice, "s8_enabled", voice_state.s8_enabled);
+    cJSON_AddBoolToObject(voice, "setup_active", network_setup_active());
     cJSON *audio = cJSON_AddObjectToObject(root, "audio");
     cJSON_AddBoolToObject(audio, "ready", audio_state.ready && light_state.ready);
     cJSON_AddNumberToObject(audio, "sample_rate_hz", AUDIO_SAMPLE_RATE);
@@ -862,6 +888,8 @@ static void update_debounced_input(debounced_input_t *input, bool pressed, int64
     if (input->stable_pressed != input->raw_pressed && now_us - input->changed_at_us >= DEBOUNCE_US) {
         input->stable_pressed = input->raw_pressed;
         send_input_event(source, input->stable_pressed ? "down" : "up", key, 0);
+        if (key != NULL && strcmp(source, "key") == 0) voice_chat_key(atoi(key + 1) - 1, input->stable_pressed);
+        else if (strcmp(source, "encoder") == 0) voice_chat_key(8, input->stable_pressed);
     }
 }
 
@@ -893,9 +921,11 @@ static void input_task(void *arg)
         previous_ab = current_ab;
         if (detent >= 4) {
             send_input_event("encoder", "rotate", NULL, 1);
+            voice_chat_rotate(1);
             detent = 0;
         } else if (detent <= -4) {
             send_input_event("encoder", "rotate", NULL, -1);
+            voice_chat_rotate(-1);
             detent = 0;
         }
         vTaskDelay(pdMS_TO_TICKS(INPUT_SCAN_MS));
@@ -1105,6 +1135,7 @@ static bool handle_audio_command(const cJSON *command, const char *action)
 static void handle_command(const char *line)
 {
     cJSON *command = cJSON_Parse(line);
+    if (command != NULL && voice_chat_receive(command)) { cJSON_Delete(command); return; }
     if (command == NULL) return;
     const cJSON *protocol = cJSON_GetObjectItemCaseSensitive(command, "protocol");
     const cJSON *action = cJSON_GetObjectItemCaseSensitive(command, "action");
@@ -1183,8 +1214,8 @@ static int ble_command_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     if (!encrypted) return BLE_ATT_ERR_INSUFFICIENT_ENC;
 
     const uint16_t packet_length = OS_MBUF_PKTLEN(context->om);
-    if (packet_length > USB_LINE_MAX - 1) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
-    char chunk[USB_LINE_MAX];
+    if (packet_length > 256) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    char chunk[256];
     uint16_t chunk_length = 0;
     const int rc = ble_hs_mbuf_to_flat(context->om, chunk, sizeof(chunk), &chunk_length);
     if (rc != 0) return BLE_ATT_ERR_UNLIKELY;
@@ -1291,6 +1322,7 @@ static void status_task(void *arg)
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     (void)arg;
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) xEventGroupSetBits(wifi_lifecycle_events, WIFI_DISCONNECTED_BIT);
     portENTER_CRITICAL(&state_lock);
     const bool reconfiguring = wifi_reconfiguring;
     portEXIT_CRITICAL(&state_lock);
@@ -1379,6 +1411,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             strlcpy(wifi_gateway, gateway, sizeof(wifi_gateway));
             strlcpy(wifi_dns, dns, sizeof(wifi_dns));
             portEXIT_CRITICAL(&state_lock);
+            if (!sntp_started) {
+                const esp_err_t sntp_result = esp_netif_sntp_start();
+                if (sntp_result == ESP_OK) {
+                    sntp_started = true;
+                    ESP_LOGI(TAG, "SNTP time synchronization started");
+                } else {
+                    ESP_LOGW(TAG, "Unable to start SNTP: %s", esp_err_to_name(sntp_result));
+                }
+            }
         }
         (void)event;
     }
@@ -1391,6 +1432,11 @@ static void init_wifi_monitor(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     wifi_netif = esp_netif_create_default_wifi_sta();
+    esp_sntp_config_t sntp_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("ntp.aliyun.com");
+    sntp_config.start = false;
+    sntp_config.sync_cb = time_sync_notification_cb;
+    const esp_err_t sntp_result = esp_netif_sntp_init(&sntp_config);
+    if (sntp_result != ESP_OK) ESP_LOGE(TAG, "SNTP initialization failed: %s", esp_err_to_name(sntp_result));
     wifi_init_config_t config = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&config));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
@@ -1398,6 +1444,12 @@ static void init_wifi_monitor(void)
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_FLASH));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+static void time_sync_notification_cb(struct timeval *tv)
+{
+    (void)tv;
+    ESP_LOGI(TAG, "SNTP time synchronized");
 }
 
 static void start_advertising(void)
@@ -1576,6 +1628,47 @@ static void init_ble_monitor(void)
     nimble_port_freertos_init(ble_host_task);
 }
 
+static bool save_phone_config(const char *ssid, const char *password, const char *pairing_code)
+{
+    // Reuse a saved cloud identity. A new board needs its initial pairing code once.
+    if (pairing_code[0] && !cloud_monitor_configure("wss://easy.leige.online", "easyinput-v2", pairing_code)) return false;
+    if (!cloud_monitor_is_configured()) return false;
+    portENTER_CRITICAL(&state_lock); wifi_reconfiguring = true; portEXIT_CRITICAL(&state_lock);
+    xEventGroupClearBits(wifi_lifecycle_events, WIFI_DISCONNECTED_BIT);
+    const esp_err_t disconnect = esp_wifi_disconnect();
+    if (disconnect == ESP_OK) {
+        const EventBits_t bits = xEventGroupWaitBits(wifi_lifecycle_events, WIFI_DISCONNECTED_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(3000));
+        if (!(bits & WIFI_DISCONNECTED_BIT)) {
+            portENTER_CRITICAL(&state_lock); wifi_reconfiguring = false; portEXIT_CRITICAL(&state_lock);
+            (void)esp_wifi_connect(); return false;
+        }
+    }
+    wifi_config_t config = {0};
+    strlcpy((char *)config.sta.ssid, ssid, sizeof(config.sta.ssid));
+    // A 32-byte SSID has no trailing NUL in wifi_config_t.
+    if (strlen(ssid) == sizeof(config.sta.ssid)) memcpy(config.sta.ssid, ssid, sizeof(config.sta.ssid));
+    strlcpy((char *)config.sta.password, password, sizeof(config.sta.password));
+    const esp_err_t rc = esp_wifi_set_config(WIFI_IF_STA, &config);
+    memset(config.sta.password, 0, sizeof(config.sta.password));
+    portENTER_CRITICAL(&state_lock);
+    wifi_reconfiguring = false;
+    if (rc == ESP_OK) {
+        strlcpy(wifi_ssid, ssid, sizeof(wifi_ssid)); wifi_configured = true;
+        strlcpy(wifi_state, "connecting", sizeof(wifi_state));
+        wifi_ip[0] = wifi_netmask[0] = wifi_gateway[0] = wifi_dns[0] = '\0';
+    }
+    portEXIT_CRITICAL(&state_lock);
+    if (rc != ESP_OK) (void)esp_wifi_connect();
+    return rc == ESP_OK;
+}
+
+static void reconnect_phone_wifi(void)
+{
+    // Keep the temporary AP available while the station joins the saved network.
+    // Event callbacks handle reconnecting after the disconnect acknowledgement.
+    (void)esp_wifi_connect();
+}
+
 static bool init_nvs_safely(void)
 {
     esp_err_t result = nvs_flash_init();
@@ -1622,11 +1715,20 @@ void app_main(void)
     init_wifi_monitor();
     init_wifi_websocket();
     cloud_monitor_init();
+    network_setup_init(wifi_websocket_server, save_phone_config, reconnect_phone_wifi);
+    voice_chat_init(send_chat_line);
     init_ble_monitor();
-    xTaskCreate(ble_tx_task, "ble_tx", 4096, NULL, 6, NULL);
+    xTaskCreateWithCaps(ble_tx_task, "ble_tx", 4096, NULL, 6, NULL,
+                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     emit_hello();
     xTaskCreate(input_task, "input_scan", 4096, NULL, 8, NULL);
-    xTaskCreate(usb_task, "usb_command", 6144, NULL, 6, NULL);
-    xTaskCreate(status_task, "status_stream", 6144, NULL, 5, NULL);
+    xTaskCreate(usb_task, "usb_command", 12288, NULL, 6, NULL);
+    xTaskCreateWithCaps(status_task, "status_stream", 6144, NULL, 5, NULL,
+                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ESP_LOGI(TAG, "Worker memory: internal free=%u largest=%u, PSRAM free=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
     ESP_LOGI(TAG, "EasyInput monitor firmware started; lights/audio controllable, shared rail off until requested");
 }

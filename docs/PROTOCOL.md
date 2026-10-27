@@ -139,3 +139,57 @@ TX sends identical 16-bit samples to both slots: 440 Hz for 16,000 frames, with 
 - The speaker has no physical activity feedback pin. Status reports firmware playback state; actual sound requires an audible check.
 - Battery reporting is limited to calibrated voltage and board power/charge pins. There is no qualified battery chemistry or fuel gauge for a remaining-capacity percentage.
 - PSRAM initialization, ADC voltage accuracy and sampling window, GPIO power/charge polarity, Wi-Fi recovery behavior, and CPU/temperature measurements still need verification on the assembled board.
+
+## Shared voice room (web 0.2.1, firmware 0.2.4)
+
+The cloud room is a persistent service, distinct from a direct LAN monitoring socket. The public default room admits Studio browsers with stable `client` / `name` query parameters; board WSS still requires its provisioned token. The room accepts only fresh board telemetry as presence, prioritizes Wi-Fi, and falls back to an authorized browser forwarding its actual BLE frames. Transport changes do not create duplicate messages.
+
+Voice frames have a separate `protocol: 1` namespace from the existing board-monitor protocol 2. Each UTF-8 JSON object remains newline delimited on BLE/USB; a WSS message carries a complete object. The maximum board command line is 2048 bytes. Bluetooth writes are serialized across command producers so chunks from different JSON frames cannot interleave.
+
+```json
+{"type":"chat","protocol":1,"op":"begin","req":"upload-1","id":"message-uuid","samples":8000,"text":"optional original text"}
+{"type":"chat","protocol":1,"op":"ack","req":"upload-1","id":"message-uuid","next":0}
+{"type":"chat","protocol":1,"op":"chunk","req":"chunk-0","id":"message-uuid","index":0,"data":"base64 mu-law bytes"}
+{"type":"chat","protocol":1,"op":"commit","req":"commit-1","id":"message-uuid"}
+{"type":"chat","protocol":1,"op":"ack","req":"commit-1","id":"message-uuid","committed":true}
+```
+
+The sender role and client slot are derived by the server, never taken from an upload's claimed sender. Chunks are 768 bytes, except the final remainder. Index and exact sample count must match before commit. A retry of an acknowledged piece or committed message is idempotent. Errors return `op: error` with the matching `req` and a human-readable `message`.
+
+Browser snapshot/presence frames carry `online`, `via` (`wifi`, `ble`, or null), `clients`, and the initial `self` / `messages`. A committed `op: message` broadcasts full message metadata to every browser. Metadata fields are `id`, `sender`, `name`, `slot`, `samples`, `created` (server Unix ms), optional `text`, `read`, and `cleared`. Board replies use `sender: board`, `slot: -1`. Slots 0–3 map to S1–S4; slot 4 aggregates all later computers on S8. A server retention eviction broadcasts `op: pruned` with IDs.
+
+The board syncs metadata one item at a time with `op: index, offset`. A response contains `id, slot, samples, read, cleared` or `end: true`. Live messages use `op: item` with the same compact fields. The board downloads only the selected message:
+
+```json
+{"type":"chat","protocol":1,"op":"pull","req":"play-0","id":"message-uuid","index":0}
+{"type":"chat","protocol":1,"op":"audio","req":"play-0","id":"message-uuid","index":0,"samples":8000,"data":"base64 mu-law bytes"}
+{"type":"chat","protocol":1,"op":"read","req":"read-1","id":"message-uuid"}
+{"type":"chat","protocol":1,"op":"clear","req":"clear-1","slot":0}
+{"type":"chat","protocol":1,"op":"cleared","req":"clear-1","slot":0,"ids":["message-uuid"]}
+```
+
+`read` is emitted only after complete speaker playback plus DMA drain, never on download or playback start. `clear` can affect only computer messages in that slot that are already read. The server deletes their audio and broadcasts `op: cleared` to browsers; unread messages remain intact. Cleared records are retained as text-only receipts until history retention removes them. Board recording upload IDs are random, permitting retry across a transport reconnect. A failed or interrupted playback does not emit `read`.
+
+A browser Bluetooth gateway sends `{ "type": "gateway", "payload": <actual board frame> }`. The server sends `{ "type": "bridge", "payload": <board-bound frame> }` only to the chosen gateway. BLE disconnection emits `op: gateway.off`. Status frames must continue advancing `uptime_ms`; pings from a browser cannot keep a disconnected board online. Browser `op: ping` / `pong` checks only cloud connectivity. The room alarm updates expired presence while browsers are idle.
+
+Voice data is 8 kHz mono G.711 mu-law, with at most 480,000 bytes per message. The board captures its right I2S slot at 16 kHz / 32-bit stereo and averages adjacent 16-bit samples before encoding; playback repeats each decoded sample at 16 kHz in both 16-bit stereo slots. Physical microphone alignment, speaker gain, rail timing and real LED order still require assembled-board verification.
+
+Status protocol 2 now optionally includes `cloud: { configured: boolean, online: boolean }`, enabling the one-time setup form to hide already saved cloud credentials. This board-reported cloud field does not override the room's presence decision.
+
+### Board delivery and local controls (0.2.1)
+
+A board `ping` receives `pong` with the same `req` and `via: wifi | ble`, derived from the authenticated transport (direct board socket or selected Bluetooth gateway). A connection alone is not proof of Internet reachability. Board announcements use a matching acknowledgement younger than 8 seconds; probes run every 3 seconds.
+
+Board recordings use a durable eight-slot Flash outbox. Each slot is 512 KiB, with its header in the first 4 KiB and at most 480,000 audio bytes. CRCs cover the audio and immutable header fields; the pending header is published after audio. A one-way state bit retires a clip only after a cloud commit acknowledgement. Stable IDs persist across boots. Cloud `delivered:<id>` receipts survive chat/audio retention to deduplicate later board retries. A failed or 12-second timed-out upload is retried after 3 seconds; retries do not rewrite the outbox.
+
+Protocol-2 status optionally adds `voice: { pending, sending, storage_error, s8_enabled, setup_active }`; pending is an integer 0–9 (8 Flash slots plus a possible RAM clip on save failure). The fifth LED prioritizes outgoing delivery: yellow blinking while actively sending, steady yellow while waiting, then the S8 unread/read/off state. S8 disabled affects playback, preserving incoming audio and unread state. Volume and S8 settings persist in the `voice` NVS namespace after one second without changes.
+
+Firmware 0.2.2 gives active recording the highest priority on the fifth LED: orange (`#FF8000`) with approximately 350 ms on / 350 ms off, beginning with an on phase after recording successfully starts. S6, the 60-second cutoff, and other recording-stop paths retire the orange indication before saving audio to Flash. Delivery then uses the yellow states above; a recording that did not start never gets an orange indication.
+
+Firmware 0.2.3 initializes SNTP with `ntp.aliyun.com` and starts it when DHCP supplies the station IPv4 address. The cloud WebSocket task remains closed until system time is at or after 2025-01-01 UTC. This prevents a cold-boot clock from rejecting current TLS certificates as not yet valid. Once connected, the board sends a lightweight protocol-2 status with an advancing `uptime_ms` every three seconds; the server uses it for presence, while full telemetry remains a separate frame.
+
+Firmware 0.2.4 moves status production, BLE transmit and cloud-helper stacks to PSRAM using `xTaskCreateWithCaps`. Tasks that may access flash while caches are disabled, including voice-outbox storage, USB firmware operations and phone setup, remain on internal RAM; the input scanner and audio I/O also remain internal. This preserves internal heap and large contiguous blocks for the mbedTLS handshake without violating the ESP-IDF PSRAM-stack flash rule. Full multi-kilobyte telemetry stays on USB/BLE; the cloud WebSocket receives only the lightweight presence status plus chat frames, and uses a 2 KiB transport buffer.
+
+Knob rotation adjusts voice volume by 5% per detent (0–100%, initially 20%). A short knob press toggles S8 playback; a 3-second hold starts/extends a 120-second WPA2 SoftAP window and suppresses short press. S7 requests a queued local network announcement. Prompts are pre-generated offline assets and are never chat messages or read receipts.
+
+During physical provisioning only, the board exposes `GET /`, `GET /setup-status`, and `POST /setup` at its AP address, http://192.168.4.1. POST JSON contains `ssid`, `password`, and optional `code` (initial cloud pairing code); `X-Setup-Token` matches the fresh page token. The saved station and cloud config survive reboot. Credentials are not in telemetry, chat, responses, or browser storage. The AP closes automatically; this does not erase config or recordings. Phone provisioning does not require Web Bluetooth.

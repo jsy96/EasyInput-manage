@@ -3,19 +3,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "esp_websocket_client.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs.h"
 
 #define CLOUD_LINE_MAX 4096
-#define CLOUD_COMMAND_MAX 512
+#define CLOUD_COMMAND_MAX 2048
 #define CLOUD_EVENT_QUEUE_DEPTH 16
 #define CLOUD_RECONNECT_MS 5000
 #define LEGACY_GATEWAY "wss://easyinput-gateway.jsy96.workers.dev"
@@ -33,6 +36,7 @@ static bool online;
 static char gateway[192];
 static char device_id[65];
 static char token[129];
+static int64_t last_presence_us;
 
 static bool valid_text(const char *value, size_t min_length, size_t max_length)
 {
@@ -47,6 +51,12 @@ static bool valid_text(const char *value, size_t min_length, size_t max_length)
 }
 
 static bool configured(void) { return gateway[0] != '\0' && device_id[0] != '\0' && token[0] != '\0'; }
+static bool system_time_ready(void)
+{
+    const time_t now = time(NULL);
+    // A cold-boot clock can make current TLS certificates look not yet valid.
+    return now >= 1735689600; // 2025-01-01T00:00:00Z
+}
 
 static bool send_text(const char *text, size_t length, TickType_t timeout)
 {
@@ -104,7 +114,8 @@ static void cloud_message(const char *payload, size_t length)
     const bool allowed = cJSON_IsNumber(protocol) && protocol->valueint == 2 && cJSON_IsString(type) &&
         strcmp(type->valuestring, "command") == 0 && cJSON_IsString(action) &&
         (strcmp(action->valuestring, "hello.get") == 0 || strcmp(action->valuestring, "status.get") == 0);
-    if (allowed) {
+    const bool chat = command && cJSON_IsString(type) && strcmp(type->valuestring, "chat") == 0 && cJSON_IsNumber(protocol) && protocol->valueint == 1;
+    if (allowed || chat) {
         extern bool cloud_monitor_queue_command(const char *line);
         (void)cloud_monitor_queue_command(line);
     }
@@ -125,8 +136,15 @@ static void cloud_event_handler(void *arg, esp_event_base_t base, int32_t event_
     } else if (event_id == WEBSOCKET_EVENT_DISCONNECTED) {
         xSemaphoreTake(state_lock, portMAX_DELAY); online = false; xSemaphoreGive(state_lock);
         ESP_LOGW(TAG, "cloud WSS disconnected");
-    } else if (event_id == WEBSOCKET_EVENT_DATA && event != NULL && event->op_code == 0x1) {
-        cloud_message(event->data_ptr, event->data_len);
+    } else if (event_id == WEBSOCKET_EVENT_DATA && event != NULL && (event->op_code == 0x1 || event->op_code == 0x0)) {
+        static char incoming[CLOUD_COMMAND_MAX];
+        static size_t received;
+        if (event->payload_offset == 0) received = 0;
+        if (event->payload_len > 0 && event->payload_len < CLOUD_COMMAND_MAX && event->payload_offset == received && received + event->data_len < sizeof(incoming)) {
+            memcpy(incoming + received, event->data_ptr, event->data_len);
+            received += event->data_len;
+            if (received == event->payload_len) { incoming[received] = '\0'; cloud_message(incoming, received); received = 0; }
+        } else received = 0;
     } else if (event_id == WEBSOCKET_EVENT_ERROR) {
         ESP_LOGW(TAG, "cloud WSS error");
     }
@@ -136,14 +154,15 @@ static void cloud_task(void *arg)
 {
     (void)arg;
     while (true) {
-        if (configured() && client == NULL) {
+        if (configured() && system_time_ready() && client == NULL) {
             char url[512];
             snprintf(url, sizeof(url), "%s/ws?device=%s&role=board&token=%s", gateway, device_id, token);
             esp_websocket_client_config_t config = {
                 .uri = url,
                 .crt_bundle_attach = esp_crt_bundle_attach,
-                .buffer_size = CLOUD_LINE_MAX,
+                .buffer_size = 2048,
                 .task_stack = 6144,
+                .network_timeout_ms = 10000,
                 .reconnect_timeout_ms = CLOUD_RECONNECT_MS,
             };
             client = esp_websocket_client_init(&config);
@@ -154,7 +173,24 @@ static void cloud_task(void *arg)
                 }
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        xSemaphoreTake(state_lock, portMAX_DELAY);
+        const bool connected = online;
+        xSemaphoreGive(state_lock);
+        const int64_t now = esp_timer_get_time();
+        if (connected && (last_presence_us == 0 || now - last_presence_us >= 3000000)) {
+            char presence[128];
+            const int length = snprintf(presence, sizeof(presence),
+                "{\"type\":\"status\",\"protocol\":2,\"uptime_ms\":%lld}",
+                (long long)(now / 1000));
+            if (length > 0 && (size_t)length < sizeof(presence) && send_text(presence, (size_t)length, pdMS_TO_TICKS(1000))) {
+                if (last_presence_us == 0) ESP_LOGI(TAG, "cloud presence heartbeat active");
+                last_presence_us = now;
+            } else {
+                ESP_LOGW(TAG, "cloud presence heartbeat failed");
+                last_presence_us = 0;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -200,8 +236,12 @@ void cloud_monitor_init(void)
     outbound_lock = xSemaphoreCreateMutex();
     event_queue = xQueueCreate(CLOUD_EVENT_QUEUE_DEPTH, sizeof(char *));
     load_config();
-    xTaskCreate(cloud_task, "cloud_wss", 7168, NULL, 4, NULL);
-    xTaskCreate(cloud_sender_task, "cloud_send", 4096, NULL, 5, &sender_task);
+    if (xTaskCreateWithCaps(cloud_task, "cloud_wss", 7168, NULL, 4, NULL,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS ||
+        xTaskCreateWithCaps(cloud_sender_task, "cloud_send", 4096, NULL, 5, &sender_task,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        ESP_LOGE(TAG, "Unable to create cloud worker tasks");
+    }
 }
 
 bool cloud_monitor_configure(const char *gateway_url, const char *device, const char *pairing_token)
@@ -252,9 +292,9 @@ void cloud_monitor_send(const char *line)
     }
     static const char status_prefix[] = "{\"type\":\"status\"";
     if (strncmp(line, status_prefix, sizeof(status_prefix) - 1) == 0) {
-        discarded = pending_status;
-        pending_status = copy;
-        queued = true;
+        // Full telemetry stays on USB/BLE. The cloud path only needs the small
+        // heartbeat sent by cloud_task, which avoids overloading the TLS socket.
+        discarded = copy;
     } else if (xQueueSend(event_queue, &copy, 0) != pdTRUE) {
         (void)xQueueReceive(event_queue, &discarded, 0);
         queued = xQueueSend(event_queue, &copy, 0) == pdTRUE;
@@ -273,3 +313,5 @@ bool cloud_monitor_is_online(void)
     xSemaphoreTake(state_lock, portMAX_DELAY); const bool value = online; xSemaphoreGive(state_lock);
     return value;
 }
+
+bool cloud_monitor_is_configured(void) { return configured(); }
