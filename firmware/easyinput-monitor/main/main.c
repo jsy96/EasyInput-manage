@@ -1696,7 +1696,7 @@ void app_main(void)
         return;
     }
     ble_tx_queue = xQueueCreate(BLE_TX_QUEUE_DEPTH, sizeof(ble_tx_frame_t));
-    board_command_queue = xQueueCreate(4, USB_LINE_MAX);
+    board_command_queue = xQueueCreate(8, USB_LINE_MAX);
     ble_notify_tx_done = xSemaphoreCreateBinary();
     if (ble_tx_queue == NULL || board_command_queue == NULL || ble_notify_tx_done == NULL) {
         ESP_LOGE(TAG, "BLE transport queue allocation failed");

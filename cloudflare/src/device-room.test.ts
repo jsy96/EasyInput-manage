@@ -54,6 +54,20 @@ describe('shared voice room', () => {
     await chat(two, 'ping')
     expect(two.frames.at(-1)).toMatchObject({ op: 'presence', online: false, via: null })
   })
+  it('accepts batched browser uploads and serves batched downloads', async () => {
+    const browser = socket(), board = socket('board')
+    await chat(browser, 'begin', { id: 'batch-audio', samples: 900 })
+    await chat(browser, 'chunks', { id: 'batch-audio', chunks: [
+      { index: 0, data: btoa('a'.repeat(768)) },
+      { index: 1, data: btoa('b'.repeat(132)) },
+    ] })
+    await chat(browser, 'commit', { id: 'batch-audio' })
+    await chat(browser, 'pullBatch', { id: 'batch-audio', index: 0, count: 16 })
+    expect(browser.frames.filter(f => f.op === 'chunks').at(-1)).toMatchObject({ next: 2, complete: true })
+    await room.webSocketMessage(board as unknown as WebSocket, JSON.stringify({ type: 'chat', protocol: 1, op: 'stream', req: 'stream-1', id: 'batch-audio', index: 0, count: 8 }))
+    expect(board.frames.filter(f => f.op === 'audio')).toHaveLength(2)
+    expect(board.frames.filter(f => f.op === 'streamAck').at(-1)).toMatchObject({ next: 2, complete: true })
+  })
   it('only clears messages already played by the board and retains pending messages', async () => {
     const browser = socket(), board = socket('board')
     await upload(browser, 'read-one'); await upload(browser, 'unread-two')

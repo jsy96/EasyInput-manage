@@ -70,8 +70,8 @@ export function VoiceChat({ room, board, connection, busyChanged, disabled }: { 
       {error && <p className="result-note error" role="alert">{error}</p>}
       {draft && !sending && <div className="chat-draft"><span>有一条待发送语音（{Math.ceil(draft.bytes.length / 8000)} 秒）</span><button className="text-button" disabled={!room.connected} onClick={() => void sendVoice(draft)}>重试发送</button><button className="text-button" onClick={() => setDraft(null)}>放弃</button></div>}
       <form onSubmit={e => { e.preventDefault(); void sendText() }} className="chat-text-form"><textarea aria-label="文字留言" maxLength={300} rows={2} value={text} disabled={busy} onChange={e => setText(e.target.value)} placeholder="输入文字，会自动转成语音…" /><button className="button button-primary" disabled={!room.connected || busy || !text.trim() || !!draft} type="submit"><Send size={16} />发送</button></form>
-      <div className="chat-record-row">{recording ? <button className="button button-primary recording-button" onClick={() => recorder.current?.stop()}><Square size={15} />结束并发送 · {Math.floor(seconds)} / 60 秒</button> : <button className="button button-subtle" disabled={!room.connected || busy || !!draft} onClick={() => void record()}><Mic size={16} />录一条语音</button>}<span>{sending ? progress ? `正在发送 ${progress}%` : '正在处理语音…' : room.connected ? '最长 1 分钟 · 支持离线留言' : '正在连接群聊…'}</span></div>
+      <div className="chat-record-row">{recording ? <button className="button button-primary recording-button" onClick={() => recorder.current?.stop()}><Square size={15} />结束并发送 · {Math.floor(seconds)} / 20 秒</button> : <button className="button button-subtle" disabled={!room.connected || busy || !!draft} onClick={() => void record()}><Mic size={16} />录一条语音</button>}<span>{sending ? progress ? `正在发送 ${progress}%` : '正在处理语音…' : room.connected ? '最长 20 秒 · 支持离线留言' : '正在连接群聊…'}</span></div>
     </div>
-    <p className="chat-help">开发板：S1～S4 / S8 播放，长按 1.2 秒清除已读。S5 录音，S6 结束发送，S7 播报网络。旋转调音量，短按切换 S8 播放，长按 3 秒手机配网。第 5 灯发送时黄灯闪烁，失败等待重试时黄灯常亮。</p>
+    <p className="chat-help">开发板：S1～S4 / S8 播放，长按 1.2 秒清除已读。S5 录音，S6 结束发送，最长 20 秒。S7 播报网络。旋转调音量，短按切换 S8 播放，长按 3 秒手机配网。</p>
   </article>
 }

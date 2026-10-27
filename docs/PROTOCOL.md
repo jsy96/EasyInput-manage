@@ -140,7 +140,7 @@ TX sends identical 16-bit samples to both slots: 440 Hz for 16,000 frames, with 
 - Battery reporting is limited to calibrated voltage and board power/charge pins. There is no qualified battery chemistry or fuel gauge for a remaining-capacity percentage.
 - PSRAM initialization, ADC voltage accuracy and sampling window, GPIO power/charge polarity, Wi-Fi recovery behavior, and CPU/temperature measurements still need verification on the assembled board.
 
-## Shared voice room (web 0.2.1, firmware 0.2.4)
+## Shared voice room (web and firmware 0.3.0)
 
 The cloud room is a persistent service, distinct from a direct LAN monitoring socket. The public default room admits Studio browsers with stable `client` / `name` query parameters; board WSS still requires its provisioned token. The room accepts only fresh board telemetry as presence, prioritizes Wi-Fi, and falls back to an authorized browser forwarding its actual BLE frames. Transport changes do not create duplicate messages.
 
@@ -172,7 +172,7 @@ The board syncs metadata one item at a time with `op: index, offset`. A response
 
 A browser Bluetooth gateway sends `{ "type": "gateway", "payload": <actual board frame> }`. The server sends `{ "type": "bridge", "payload": <board-bound frame> }` only to the chosen gateway. BLE disconnection emits `op: gateway.off`. Status frames must continue advancing `uptime_ms`; pings from a browser cannot keep a disconnected board online. Browser `op: ping` / `pong` checks only cloud connectivity. The room alarm updates expired presence while browsers are idle.
 
-Voice data is 8 kHz mono G.711 mu-law, with at most 480,000 bytes per message. The board captures its right I2S slot at 16 kHz / 32-bit stereo and averages adjacent 16-bit samples before encoding; playback repeats each decoded sample at 16 kHz in both 16-bit stereo slots. Physical microphone alignment, speaker gain, rail timing and real LED order still require assembled-board verification.
+Voice data is 8 kHz mono G.711 mu-law, with at most 160,000 bytes (20 seconds) per message. Browser uploads use `chunks` batches, browser downloads use `pullBatch`, and the board uses `stream` windows of eight chunks followed by `streamAck`. The board starts playback after a small prebuffer and extends the active audio buffer while receiving the remaining chunks.
 
 Status protocol 2 now optionally includes `cloud: { configured: boolean, online: boolean }`, enabling the one-time setup form to hide already saved cloud credentials. This board-reported cloud field does not override the room's presence decision.
 
@@ -180,9 +180,9 @@ Status protocol 2 now optionally includes `cloud: { configured: boolean, online:
 
 A board `ping` receives `pong` with the same `req` and `via: wifi | ble`, derived from the authenticated transport (direct board socket or selected Bluetooth gateway). A connection alone is not proof of Internet reachability. Board announcements use a matching acknowledgement younger than 8 seconds; probes run every 3 seconds.
 
-Board recordings use a durable eight-slot Flash outbox. Each slot is 512 KiB, with its header in the first 4 KiB and at most 480,000 audio bytes. CRCs cover the audio and immutable header fields; the pending header is published after audio. A one-way state bit retires a clip only after a cloud commit acknowledgement. Stable IDs persist across boots. Cloud `delivered:<id>` receipts survive chat/audio retention to deduplicate later board retries. A failed or 12-second timed-out upload is retried after 3 seconds; retries do not rewrite the outbox.
+Board recordings use a durable eight-slot Flash outbox. Each slot is 512 KiB, with its header in the first 4 KiB and at most 160,000 audio bytes. CRCs cover the audio and immutable header fields; the pending header is published after audio. A one-way state bit retires a clip only after a cloud commit acknowledgement. Stable IDs persist across boots. Cloud `delivered:<id>` receipts survive chat/audio retention to deduplicate later board retries. A failed or 12-second timed-out upload is retried after 3 seconds; retries do not rewrite the outbox.
 
-Protocol-2 status optionally adds `voice: { pending, sending, storage_error, s8_enabled, setup_active }`; pending is an integer 0–9 (8 Flash slots plus a possible RAM clip on save failure). The fifth LED prioritizes outgoing delivery: yellow blinking while actively sending, steady yellow while waiting, then the S8 unread/read/off state. S8 disabled affects playback, preserving incoming audio and unread state. Volume and S8 settings persist in the `voice` NVS namespace after one second without changes.
+Protocol-2 status optionally adds `voice: { pending, sending, storage_error, s8_enabled, setup_active }`; pending is an integer 0–9 (8 Flash slots plus a possible RAM clip on save failure). WS2812 brightness is 10%. Unread is dim red (`#FF0000`), read is dim blue (`#0040FF`), recording is dim orange, and delivery waiting is dim yellow. The fifth LED restores the S8 unread/read/off state after delivery. S8 disabled affects playback, preserving incoming audio and unread state. Volume and S8 settings persist in the `voice` NVS namespace after one second without changes.
 
 Firmware 0.2.2 gives active recording the highest priority on the fifth LED: orange (`#FF8000`) with approximately 350 ms on / 350 ms off, beginning with an on phase after recording successfully starts. S6, the 60-second cutoff, and other recording-stop paths retire the orange indication before saving audio to Flash. Delivery then uses the yellow states above; a recording that did not start never gets an orange indication.
 

@@ -4,11 +4,11 @@ EasyInput Studio is a browser PWA for monitoring and managing the EasyInput V2.0
 
 File locations and collaboration rules are defined in [AGENTS.md](AGENTS.md). Protocol details are in [docs/PROTOCOL.md](docs/PROTOCOL.md). Web builds go in `dist/`; versioned firmware packages go in `release/firmware/` so rebuilding the website does not remove them.
 
-## 多电脑语音群（网页 0.2.1 / 固件 0.2.4）
+## 多电脑语音群（网页 / 固件 0.3.0）
 
 打开 [EasyInput Studio](https://studio.leige.online)，所有电脑自动加入同一开发板的语音群。日常网络页只显示开发板在线 / 离线，以及 Wi-Fi / 蓝牙网关。浏览器与群聊服务器连上，并不代表开发板在线；状态来自最近 8 秒内的板端数据。
 
-网页可以录制最长 60 秒的语音，或发送自动转成语音的中文文字；全群可以播放网页及开发板留言。前四个浏览器身份固定绑定 S1–S4，其余身份统一绑定 S8（第 5 灯）。红灯表示有未读，绿灯表示全部播放完毕；短按播放未读或重播最后一条，长按 1.2 秒清除该路已读留言，保留未读。S5 开始录音，S6 结束发送，60 秒自动结束。S7 语音播报网络；旋钮调音量、短按切换 S8 播放、长按 3 秒开启手机热点配网。第 5 灯录音时橙闪，S6 或满 60 秒结束后停止橙闪；发送中黄闪、失败待重试黄亮，确认成功后恢复留言灯态。板端 Flash 缓存最多 8 条录音，断电保留、恢复联网后每次失败等待 3 秒重试。
+网页可以录制最长 20 秒的语音，或发送自动转成语音的中文文字；全群可以播放网页及开发板留言。前四个浏览器身份固定绑定 S1–S4，其余身份统一绑定 S8（第 5 灯）。红灯表示有未读，绿灯表示全部播放完毕；短按播放未读或重播最后一条，长按 1.2 秒清除该路已读留言，保留未读。S5 开始录音，S6 结束发送，20 秒自动结束。S7 语音播报网络；旋钮调音量、短按切换 S8 播放、长按 3 秒开启手机热点配网。第 5 灯录音时橙闪，S6 或满 20 秒结束后停止橙闪；发送中黄闪、失败待重试黄亮，确认成功后恢复留言灯态。板端使用分片批量和 8 片滑动窗口传输，约 0.5 秒预缓冲后边收边播。Flash 缓存最多 8 条录音，断电保留、恢复联网后每次失败等待 3 秒重试。
 
 Wi-Fi 与云端配置只需首次通过 USB / 加密蓝牙保存。蓝牙网关需要一台已连接开发板的联网电脑保持网页运行；Wi-Fi 直连则不需要电脑常驻。当前网站是同一共享房间，访问者无需额外登录即可查看状态、收发留言。硬件验收和详细约定见 [docs/VOICE_CHAT.md](docs/VOICE_CHAT.md)。
 
@@ -73,10 +73,10 @@ The board-side project targets ESP32-S3 and uses ESP-IDF 5.5.5 or later. Default
 cd firmware/easyinput-monitor
 idf.py set-target esp32s3
 idf.py build
-python3 ../../scripts/export-firmware.py --version 0.2.4
+python3 ../../scripts/export-firmware.py --version 0.3.0
 ```
 
-The export command writes `release/firmware/0.2.4-v2-monitor` containing `firmware.json` and the bootloader, partition table, and app images. The output is relative to the repository root, regardless of the shell's current directory. Firmware packages stay outside the website build output and are excluded from Git. The app checks the manifest, image sizes and SHA-256 hashes before flashing; the manifest is not a signed publisher identity. The WebSocket options in `sdkconfig.defaults` require ESP-IDF 5.5.5 or later. When reusing older generated configurations, regenerate them from these defaults before building so WebSocket support and both handshake callbacks are enabled. Firmware 0.2.4 synchronizes system time before opening TLS and keeps non-real-time worker stacks in PSRAM so the internal heap is available to the TLS handshake.
+The export command writes `release/firmware/0.3.0-v2-monitor` containing `firmware.json` and the bootloader, partition table, and app images. The output is relative to the repository root, regardless of the shell's current directory. Firmware packages stay outside the website build output and are excluded from Git. The app checks the manifest, image sizes and SHA-256 hashes before flashing; the manifest is not a signed publisher identity. The WebSocket options in `sdkconfig.defaults` require ESP-IDF 5.5.5 or later. When reusing older generated configurations, regenerate them from these defaults before building so WebSocket support and both handshake callbacks are enabled. Firmware 0.3.0 adds 20-second recordings and windowed streaming playback.
 
 ## Automatic connection hardware check
 

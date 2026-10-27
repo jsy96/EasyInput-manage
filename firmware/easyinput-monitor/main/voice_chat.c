@@ -18,7 +18,10 @@
 #include "freertos/task.h"
 
 #define CHUNK 768
-#define MAX_AUDIO 480000
+#define MAX_AUDIO 160000
+#define STREAM_WINDOW 4
+#define UPLOAD_BATCH 1
+#define PREBUFFER 4096
 #define MAX_MESSAGES 100
 #define LONG_US 1200000
 #define RETRY_US 3000000
@@ -52,6 +55,7 @@ static int pending_prompt = -1;
 static bool prompt_playing;
 static int64_t setup_wait_until;
 static uint8_t volume = 20;
+static bool stream_started, stream_complete;
 static voice_outbox_item_t outgoing;
 static voice_chat_snapshot_t snapshot = {.s8_enabled = true};
 static portMUX_TYPE snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -96,7 +100,7 @@ static void refresh_lights(int64_t now)
         int color = 0;
         for (int i = 0; i < count; i++) if (messages[i].slot == slot && !messages[i].cleared) {
             if (!messages[i].read) { color = 0xff0000; break; }
-            color = 0x00ff00;
+            color = 0x0040ff;
         }
         const bool override = slot == 4 && (recording || waiting);
         if (override) {
@@ -105,7 +109,7 @@ static void refresh_lights(int64_t now)
         }
         if (!color && !slot_owned[slot] && !override) continue;
         slot_owned[slot] = color != 0 || override;
-        const light_pixel_t pixel = {.rgb = color, .brightness = 20, .on = color != 0};
+        const light_pixel_t pixel = {.rgb = color, .brightness = 10, .on = color != 0};
         lights_snapshot_t current; lights_get_snapshot(&current);
         if (current.pixels[slot].rgb != pixel.rgb || current.pixels[slot].on != pixel.on || current.pixels[slot].brightness != pixel.brightness)
             (void)lights_set_pixel(slot, &pixel);
@@ -148,12 +152,27 @@ static void upload_chunk(void)
     if (chunk_index * CHUNK >= outgoing.samples) {
         job = UP_COMMIT; cJSON *v = new_frame("commit"); cJSON_AddStringToObject(v, "id", outgoing.id); request(v); return;
     }
-    uint8_t bytes[CHUNK]; const size_t n = outgoing.samples - chunk_index * CHUNK < CHUNK ? outgoing.samples - chunk_index * CHUNK : CHUNK;
-    if (voice_outbox_read(&outgoing, chunk_index * CHUNK, bytes, n) != ESP_OK) { upload_failed(); return; }
-    char encoded[1028]; size_t length = 0;
-    mbedtls_base64_encode((unsigned char *)encoded, sizeof(encoded), &length, bytes, n); encoded[length] = 0;
     job = UP_CHUNK;
-    cJSON *v = new_frame("chunk"); cJSON_AddStringToObject(v, "id", outgoing.id); cJSON_AddNumberToObject(v, "index", chunk_index); cJSON_AddStringToObject(v, "data", encoded); request(v);
+    cJSON *v = new_frame("chunks"); cJSON_AddStringToObject(v, "id", outgoing.id);
+    cJSON *chunks = cJSON_AddArrayToObject(v, "chunks");
+    for (unsigned offset = 0; offset < UPLOAD_BATCH && (chunk_index + offset) * CHUNK < outgoing.samples; offset++) {
+        const unsigned index = chunk_index + offset;
+        uint8_t bytes[CHUNK]; const size_t n = outgoing.samples - index * CHUNK < CHUNK ? outgoing.samples - index * CHUNK : CHUNK;
+        if (voice_outbox_read(&outgoing, index * CHUNK, bytes, n) != ESP_OK) { cJSON_Delete(v); upload_failed(); return; }
+        char encoded[1028]; size_t length = 0;
+        mbedtls_base64_encode((unsigned char *)encoded, sizeof(encoded), &length, bytes, n); encoded[length] = 0;
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "index", index); cJSON_AddStringToObject(item, "data", encoded); cJSON_AddItemToArray(chunks, item);
+    }
+    request(v);
+}
+static void request_stream(void)
+{
+    cJSON *v = new_frame("stream");
+    cJSON_AddStringToObject(v, "id", active_id);
+    cJSON_AddNumberToObject(v, "index", chunk_index);
+    cJSON_AddNumberToObject(v, "count", STREAM_WINDOW);
+    request(v);
 }
 static void request_index(void)
 {
@@ -176,7 +195,7 @@ static void play_slot(int slot)
     audio_data = heap_caps_malloc(selected->samples, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!audio_data) return;
     audio_size = selected->samples; strlcpy(active_id, selected->id, sizeof(active_id)); active_slot = slot;
-    chunk_index = 0; job = DOWNLOAD; pull_chunk();
+    chunk_index = 0; stream_started = stream_complete = false; job = DOWNLOAD; request_stream();
 }
 static void clear_slot(int slot)
 {
@@ -209,14 +228,27 @@ static void receive(cJSON *v)
             }
             finish();
         } else { add_item(v); index_offset++; request_index(); }
-    } else if (job == DOWNLOAD && strcmp(op->valuestring, "audio") == 0) {
+    } else if ((job == DOWNLOAD || job == PLAYING) && strcmp(op->valuestring, "audio") == 0) {
         const cJSON *index = cJSON_GetObjectItemCaseSensitive(v, "index"), *data = cJSON_GetObjectItemCaseSensitive(v, "data");
         if (!cJSON_IsNumber(index) || index->valueint != chunk_index || !cJSON_IsString(data)) return;
         size_t length = 0; const size_t expected = audio_size - chunk_index * CHUNK < CHUNK ? audio_size - chunk_index * CHUNK : CHUNK;
         unsigned char decoded[CHUNK];
         if (mbedtls_base64_decode(decoded, sizeof(decoded), &length, (unsigned char *)data->valuestring, strlen(data->valuestring)) != 0 || length != expected) return;
         memcpy(audio_data + chunk_index * CHUNK, decoded, length); chunk_index++;
-        if (chunk_index * CHUNK < audio_size) pull_chunk(); else { job = READY_PLAY; request_line[0] = 0; }
+        if (!stream_started && chunk_index * CHUNK >= PREBUFFER) {
+            if (audio_play_voice_stream(audio_data, audio_size, chunk_index * CHUNK) == ESP_OK) { stream_started = true; job = PLAYING; }
+            else { release_audio(); finish(); }
+        } else if (stream_started) (void)audio_voice_stream_extend(chunk_index * CHUNK);
+    } else if ((job == DOWNLOAD || job == PLAYING) && strcmp(op->valuestring, "streamAck") == 0) {
+        const cJSON *next = cJSON_GetObjectItemCaseSensitive(v, "next");
+        stream_complete = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(v, "complete"));
+        if (!stream_started) {
+            if (audio_play_voice_stream(audio_data, audio_size, chunk_index * CHUNK) == ESP_OK) { stream_started = true; job = PLAYING; }
+            else { release_audio(); finish(); return; }
+        } else (void)audio_voice_stream_extend(chunk_index * CHUNK);
+        if (stream_complete) { request_line[0] = 0; }
+        else if (!cJSON_IsNumber(next) || next->valueint != (int)chunk_index) { release_audio(); finish(); }
+        else request_stream();
     } else if (uploading() && strcmp(op->valuestring, "ack") == 0) {
         if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(v, "committed"))) {
             if (voice_outbox_ack(&outgoing) != ESP_OK) upload_failed(); else { finish(); retry_at = 0; }
@@ -321,12 +353,13 @@ static void task(void *arg)
             if (audio_play_voice(audio_data, audio_size) == ESP_OK) job = PLAYING; else { release_audio(); finish(); }
         } else if (job == PLAYING && !audio.speaker_playing) {
             release_audio(); message_t *m = find_message(active_id);
-            if (audio.voice_completed && audio.speaker_error == ESP_OK && m) { m->pending_read = true; mark_read(m); } else finish();
+            if (audio.voice_completed && audio.speaker_error == ESP_OK && stream_complete && m) { m->pending_read = true; mark_read(m); } else finish();
         }
         if (request_line[0] && now - sent_at > ACK_TIMEOUT_US) {
             if (uploading()) upload_failed();
             else if (job == INDEX) { finish(); sync_at = now + RETRY_US; }
             else if (job == MARK_READ) finish(); // Receipt remains queued on the message.
+            else if (job == PLAYING && !stream_complete) { (void)audio_stop_speaker(); release_audio(); finish(); }
             else if (now - started_at > 60000000) { release_audio(); finish(); }
             else { send_line(request_line); sent_at = now; }
         }

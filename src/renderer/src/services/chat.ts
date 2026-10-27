@@ -1,4 +1,4 @@
-import { AUDIO_CHUNK, fromBase64, toBase64 } from '@shared/chat'
+import { AUDIO_BATCH, AUDIO_CHUNK, fromBase64, toBase64 } from '@shared/chat'
 import type { ChatMessage, RoomState } from '@shared/chat'
 import { emptyRoom } from '@shared/chat'
 type Frame = Record<string, unknown>
@@ -85,18 +85,25 @@ export class ChatConnection {
     try {
       const id = crypto.randomUUID()
       const begin = await this.request('begin', { id, samples: bytes.length, text })
-      for (let i = Number(begin.next) || 0; i * AUDIO_CHUNK < bytes.length; i++) {
-        await this.request('chunk', { id, index: i, data: toBase64(bytes.subarray(i * AUDIO_CHUNK, (i + 1) * AUDIO_CHUNK)) })
-        progress?.(Math.min(99, Math.floor((i + 1) * AUDIO_CHUNK / bytes.length * 100)))
+      let next = Number(begin.next) || 0
+      while (next * AUDIO_CHUNK < bytes.length) {
+        const chunks = Array.from({ length: AUDIO_BATCH }, (_, offset) => {
+          const index = next + offset
+          if (index * AUDIO_CHUNK >= bytes.length) return null
+          return { index, data: toBase64(bytes.subarray(index * AUDIO_CHUNK, (index + 1) * AUDIO_CHUNK)) }
+        }).filter((chunk): chunk is { index: number; data: string } => chunk !== null)
+        const ack = await this.request('chunks', { id, chunks })
+        next = Number(ack.next)
+        progress?.(Math.min(99, Math.floor(next * AUDIO_CHUNK / bytes.length * 100)))
       }
       await this.request('commit', { id }); progress?.(100)
     } finally { this.uploadBusy = false }
   }
   async download(m: ChatMessage): Promise<Uint8Array> {
     const out = new Uint8Array(m.samples)
-    for (let i = 0; i * AUDIO_CHUNK < m.samples; i++) {
-      const v = await this.request('pull', { id: m.id, index: i })
-      out.set(fromBase64(String(v.data)), i * AUDIO_CHUNK)
+    for (let start = 0; start * AUDIO_CHUNK < m.samples; start += AUDIO_BATCH) {
+      const v = await this.request('pullBatch', { id: m.id, index: start, count: AUDIO_BATCH })
+      for (const chunk of v.chunks as Array<{ index: number; data: string }>) out.set(fromBase64(chunk.data), chunk.index * AUDIO_CHUNK)
     }
     return out
   }

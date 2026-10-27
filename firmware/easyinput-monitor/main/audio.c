@@ -25,6 +25,7 @@ static uint8_t *record_buffer;
 static size_t record_capacity;
 static const uint8_t *voice_buffer;
 static size_t voice_length;
+static size_t voice_available;
 static uint32_t voice_frame;
 static int64_t record_deadline_us;
 static uint8_t mulaw_encode(int sample)
@@ -203,7 +204,7 @@ static void audio_task(void *arg)
                 (void)stop_channel(true);
             }
         }
-        if (state.speaker_playing && voice_buffer != NULL && voice_frame < voice_length * 2) {
+        if (state.speaker_playing && voice_buffer != NULL && voice_frame < voice_available * 2) {
             did_io = true;
             size_t frames = voice_length * 2 - voice_frame;
             if (frames > AUDIO_BLOCK_FRAMES) frames = AUDIO_BLOCK_FRAMES;
@@ -345,7 +346,7 @@ esp_err_t audio_prepare_power_off(void)
     return mic_result != ESP_OK ? mic_result : spk_result;
 }
 
-typedef struct { const uint8_t *buffer; size_t length; } voice_context_t;
+typedef struct { const uint8_t *buffer; size_t length; size_t available; } voice_context_t;
 static esp_err_t start_voice(void *arg)
 {
     const voice_context_t *context = arg;
@@ -355,6 +356,7 @@ static esp_err_t start_voice(void *arg)
     state.speaker_error = result;
     if (result == ESP_OK) {
         voice_buffer = context->buffer; voice_length = context->length;
+        voice_available = context->available;
         state.voice_completed = false;
         state.speaker_playing = true;
         voice_frame = 0;
@@ -366,8 +368,22 @@ static esp_err_t start_voice(void *arg)
 esp_err_t audio_play_voice(const uint8_t *buffer, size_t length)
 {
     if (buffer == NULL || length == 0 || length > 480000) return ESP_ERR_INVALID_ARG;
-    const voice_context_t context = {.buffer = buffer, .length = length};
+    const voice_context_t context = {.buffer = buffer, .length = length, .available = length};
     return lights_with_shared_power(start_voice, (void *)&context);
+}
+esp_err_t audio_play_voice_stream(const uint8_t *buffer, size_t length, size_t available)
+{
+    if (buffer == NULL || length == 0 || length > 480000 || available == 0 || available > length) return ESP_ERR_INVALID_ARG;
+    const voice_context_t context = {.buffer = buffer, .length = length, .available = available};
+    return lights_with_shared_power(start_voice, (void *)&context);
+}
+esp_err_t audio_voice_stream_extend(size_t available)
+{
+    if (!audio_mutex || available == 0 || available > voice_length) return ESP_ERR_INVALID_ARG;
+    xSemaphoreTake(audio_mutex, portMAX_DELAY);
+    if (available > voice_available) voice_available = available;
+    xSemaphoreGive(audio_mutex);
+    return ESP_OK;
 }
 esp_err_t audio_set_volume(uint8_t volume)
 {

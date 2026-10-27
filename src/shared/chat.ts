@@ -1,7 +1,9 @@
 export const CHAT_VERSION = 1
 export const AUDIO_RATE = 8000
-export const AUDIO_LIMIT = AUDIO_RATE * 60
+export const AUDIO_LIMIT = AUDIO_RATE * 20
 export const AUDIO_CHUNK = 768
+export const AUDIO_BATCH = 16
+export const AUDIO_STREAM_WINDOW = 8
 export const CHAT_LIMIT = 100
 export interface ChatMessage {
   id: string

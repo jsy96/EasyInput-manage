@@ -192,8 +192,6 @@ export default function App(): React.JSX.Element {
   const [selectedPixel, setSelectedPixel] = useState(0)
   const [pixelDraft, setPixelDraft] = useState<PixelSetting>({ color: '#ffffff', brightness: 20, on: true })
   const [pixelDirty, setPixelDirty] = useState(false)
-  const [indicatorDraft, setIndicatorDraft] = useState(0)
-  const [indicatorDirty, setIndicatorDirty] = useState(false)
   const [bleConnected, setBleConnected] = useState(false)
   const [bleConnecting, setBleConnecting] = useState(false)
   const [bleRetrying, setBleRetrying] = useState(false)
@@ -310,9 +308,6 @@ export default function App(): React.JSX.Element {
     if (!pixelDirty && selectedSetting) setPixelDraft({ ...selectedSetting })
   }, [selectedPixel, selectedSetting?.color, selectedSetting?.brightness, selectedSetting?.on, pixelDirty])
 
-  useEffect(() => {
-    if (!indicatorDirty && lightControl) setIndicatorDraft(lightControl.status_led_brightness)
-  }, [lightControl?.status_led_brightness, indicatorDirty])
 
   useEffect(() => () => {
     if (outputTimeoutRef.current !== null) window.clearTimeout(outputTimeoutRef.current)
@@ -446,7 +441,6 @@ export default function App(): React.JSX.Element {
     setAudioResult(null)
     if (demoToneTimerRef.current !== null) window.clearTimeout(demoToneTimerRef.current)
     setPixelDirty(false)
-    setIndicatorDirty(false)
     setDemoLastSeen('')
     setDemoLastSeenAt(null)
     setEvents([])
@@ -468,7 +462,6 @@ export default function App(): React.JSX.Element {
       else setLightResult(message)
       if (message.ok && !message.action.startsWith('audio.')) {
         if (message.action !== 'lights.status.set') setPixelDirty(false)
-        if (message.action === 'lights.status.set') setIndicatorDirty(false)
       }
       finishOutputCommand()
     }
@@ -762,7 +755,7 @@ export default function App(): React.JSX.Element {
           setDemoStatus((previous) => previous ? { ...previous, speaker: { ...previous.speaker, state: 'idle' } } : previous)
         }, 1000)
       }
-      if (!isAudio) { setPixelDirty(false); setIndicatorDirty(false) }
+      if (!isAudio) setPixelDirty(false)
       showResult({ type: 'result', protocol: PROTOCOL_VERSION, action: command.action, ok: true, message: '演示设置已更新。' })
       return
     }
@@ -1008,8 +1001,6 @@ export default function App(): React.JSX.Element {
 
             {activePage === 'control' && controlTab === 'power' && <article className="panel control-card">
               <div className="panel-heading"><div><span className="section-kicker">LIGHT & POWER</span><h3>指示灯与共享电源</h3></div><span className="card-icon wifi-icon"><Zap size={18} /></span></div>
-              <div className="led-row"><div><strong>状态指示灯</strong><small>调整开关与亮度</small></div><button className="button button-subtle" disabled={!lightsEditable} onClick={() => void sendOutputCommand({ action: 'lights.status.set', brightness: currentStatus.lights.status_led === 'on' ? 0 : indicatorDraft || 20 })}><span className={`tiny-dot ${currentStatus.lights.status_led === 'on' ? 'tiny-dot-on' : ''}`} />{stateLabel(currentStatus.lights.status_led)}</button></div>
-              <fieldset className="indicator-editor" disabled={!lightsEditable}><label className="light-brightness">亮度<input aria-label="状态指示灯亮度" type="range" min="0" max="100" value={indicatorDraft} onChange={(event) => { setIndicatorDraft(Number(event.target.value)); setIndicatorDirty(true) }} /><output>{indicatorDraft}%</output></label><button className="button button-subtle" onClick={() => void sendOutputCommand({ action: 'lights.status.set', brightness: indicatorDraft })}>应用亮度</button></fieldset>
               <div className="power-control"><div><strong>共享外设电源</strong><small>{stateLabel(currentStatus.peripherals.shared_rail)}</small></div><button className="button button-primary" disabled={!lightsEditable} onClick={() => void sendOutputCommand({ action: 'peripherals.power.set', on: currentStatus.peripherals.shared_rail !== 'on' })}>{currentStatus.peripherals.shared_rail === 'on' ? '关闭电源' : '开启电源'}</button></div>
               <p className="light-note">{lightNote}</p>{outputBusy && !pendingOutputRef.current?.action.startsWith('audio.') && <p className="result-note" role="status">正在应用设置…</p>}{lightResult && <p className={`result-note ${lightResult.ok ? '' : 'error'}`} role="status">{lightResult.message}</p>}
               <div className="panel-bottom-note"><Zap size={14} />共享电源同时供给灯带、麦克风与扬声器；关闭会停止音频。</div>
@@ -1029,7 +1020,7 @@ export default function App(): React.JSX.Element {
               <div className="board-online-card"><span className={`pulse-dot ${room.online ? 'pulse-on' : ''}`} /><strong>开发板状态：{room.online ? '在线' : '离线'}</strong>{room.online && <p>联网方式：{room.via === 'wifi' ? 'Wi-Fi' : '蓝牙网关'}</p>}</div>
               <p className="light-note">配置保存后，开发板开机自动联网。群里的电脑会同步显示状态。</p>
               <details className="first-setup"><summary>首次连接 / 更换 Wi-Fi</summary>
-                <div className="phone-setup"><strong>手机配网 · 安卓 / iPhone</strong><ol><li>长按开发板旋钮 3 秒，进入配网模式。</li><li>手机连接 <b>EasyInput-Setup-XXXX</b> 热点，密码 <b>easyinput</b>。</li><li>在浏览器地址栏输入 <b>http://192.168.4.1</b>，填写 2.4 GHz Wi-Fi 并保存。</li><li>手机切回日常网络，再打开本网址查看状态。</li></ol><p className="light-note">配网窗口为 2 分钟，超时可再次长按旋钮。Wi-Fi 和已有配对信息会保存在开发板内；首次使用还需填写云端配对码。此功能需要 0.2.1 固件。</p></div>
+                <div className="phone-setup"><strong>手机配网 · 安卓 / iPhone</strong><ol><li>长按开发板旋钮 3 秒，进入配网模式。</li><li>手机连接 <b>EasyInput-Setup-XXXX</b> 热点，密码 <b>easyinput</b>。</li><li>在浏览器地址栏输入 <b>http://192.168.4.1</b>，填写 2.4 GHz Wi-Fi 并保存。</li><li>手机切回日常网络，再打开本网址查看状态。</li></ol><p className="light-note">配网窗口为 2 分钟，超时可再次长按旋钮。Wi-Fi 和已有配对信息会保存在开发板内；首次使用还需填写云端配对码。此功能需要 0.2.1 或更新固件。</p></div>
                 <p className="light-note">通过 USB 或蓝牙连接开发板一次，再保存 Wi-Fi。蓝牙网关需要这台电脑保持联网、网页运行。</p>
                 <div className="wifi-actions"><button className="button button-subtle" disabled={deviceBusy} onClick={() => { if (bleConnected || bleConnecting || bleRetrying) disconnectBle(); else void connectBle() }}>{bleConnected ? '断开蓝牙' : bleConnecting || bleRetrying ? '取消重连' : '连接蓝牙'}</button><button className="text-button" disabled={deviceBusy} onClick={() => void connectBle(true)}>重新选择设备</button></div>{bleError && <p className="result-note warn">{bleError}</p>}
                 {currentStatus.wifi.configured && !wifiEditing ? <div className="saved-network"><strong>Wi-Fi 已保存</strong><p>开机后自动连接，无需再次输入密码。</p><button className="text-button" disabled={!wifiConfigOnline} onClick={focusWifiConfiguration}>更换 Wi-Fi</button></div> : <form className="wifi-form" onSubmit={e => { e.preventDefault(); void sendWifiCommand('wifi.configure') }}><label>Wi-Fi 名称<input ref={wifiSsidRef} value={wifiSsid} maxLength={32} onChange={e => setWifiSsid(e.target.value)} disabled={!wifiConfigOnline || wifiBusy} autoComplete="off" placeholder="2.4 GHz Wi-Fi" /></label><label>Wi-Fi 密码<input type="password" value={wifiPassword} maxLength={63} onChange={e => setWifiPassword(e.target.value)} disabled={!wifiConfigOnline || wifiBusy} autoComplete="new-password" /></label><button className="button button-primary" disabled={!wifiConfigOnline || wifiBusy || !wifiSsid.trim()}>保存并自动连接</button></form>}

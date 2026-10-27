@@ -1,10 +1,11 @@
-import { AUDIO_CHUNK, AUDIO_LIMIT, CHAT_LIMIT, slotForClient, validId } from '../../src/shared/chat'
+import { AUDIO_CHUNK, AUDIO_LIMIT, AUDIO_STREAM_WINDOW, CHAT_LIMIT, slotForClient, validId } from '../../src/shared/chat'
 import type { ChatClient, ChatMessage } from '../../src/shared/chat'
 
 type Attachment = { role: 'board' | 'browser'; client?: string; name?: string; slot?: number; last?: number; uptime?: number }
 type Frame = Record<string, unknown>
 type Upload = { id: string; sender: string; name: string; slot: number; samples: number; next: number; created: number; updated?: number; text?: string }
 const frame = (op: string, data: Frame = {}): Frame => ({ type: 'chat', protocol: 1, op, ...data })
+const MAX_BATCH = 32
 
 export class DeviceRoom {
   constructor(private readonly state: DurableObjectState) {}
@@ -128,6 +129,31 @@ export class DeviceRoom {
       reply('index', m ? { offset, id: m.id, slot: m.slot, samples: m.samples, read: m.read, cleared: m.cleared } : { offset, end: true })
       return
     }
+    if ((v.op === 'pullBatch' || v.op === 'stream') && board === (v.op === 'stream')) {
+      if (!validId(id)) return
+      const start = Number(v.index), count = v.op === 'stream' ? Math.min(AUDIO_STREAM_WINDOW, Number(v.count) || AUDIO_STREAM_WINDOW) : Math.min(MAX_BATCH, Number(v.count) || MAX_BATCH)
+      if (!Number.isInteger(start) || start < 0 || !Number.isInteger(count) || count < 1) return
+      const m = (await this.messages()).find((m) => m.id === id)
+      if (!m || m.cleared) throw new Error('这条语音已清除或不可用')
+      const end = Math.min(Math.ceil(m.samples / AUDIO_CHUNK), start + count)
+      if (v.op === 'pullBatch') {
+        const chunks: Array<{ index: number; data: string }> = []
+        for (let index = start; index < end; index++) {
+          const data = await this.state.storage.get<string>(`audio:${id}:${index}`)
+          if (!data) throw new Error('语音分片不存在')
+          chunks.push({ index, data })
+        }
+        reply('chunks', { id, chunks, next: end, complete: end >= Math.ceil(m.samples / AUDIO_CHUNK) })
+      } else {
+        for (let index = start; index < end; index++) {
+          const data = await this.state.storage.get<string>(`audio:${id}:${index}`)
+          if (!data) throw new Error('语音分片不存在')
+          reply('audio', { id, index, data, samples: m.samples })
+        }
+        reply('streamAck', { id, next: end, complete: end >= Math.ceil(m.samples / AUDIO_CHUNK) })
+      }
+      return
+    }
     if (v.op === 'begin') {
       if (!validId(id) || !Number.isInteger(v.samples) || Number(v.samples) < 1 || Number(v.samples) > AUDIO_LIMIT) throw new Error('语音必须在 1 分钟以内')
       const items = await this.messages()
@@ -162,6 +188,22 @@ export class DeviceRoom {
       if (index !== upload.next || bytes !== expected || expected < 1) throw new Error('语音分片顺序或长度无效')
       await this.state.storage.put(`audio:${id}:${index}`, v.data)
       upload.next++
+      upload.updated = Date.now()
+      await this.state.storage.put(`upload:${id}`, upload)
+      reply('ack', { id, next: upload.next }); return
+    }
+    if (v.op === 'chunks') {
+      if (!validId(id) || !Array.isArray(v.chunks) || v.chunks.length < 1 || v.chunks.length > MAX_BATCH) throw new Error('语音批次无效')
+      const upload = await this.state.storage.get<Upload>(`upload:${id}`)
+      if (!upload || upload.sender !== sender) throw new Error('请重新发送语音')
+      for (const raw of v.chunks as Frame[]) {
+        const index = Number(raw.index), data = raw.data
+        if (!Number.isInteger(index) || index !== upload.next || typeof data !== 'string' || data.length > AUDIO_CHUNK / 3 * 4 || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) throw new Error('语音批次顺序或内容无效')
+        const expected = Math.min(AUDIO_CHUNK, upload.samples - index * AUDIO_CHUNK)
+        if (expected < 1 || atob(data).length !== expected) throw new Error('语音批次长度无效')
+        await this.state.storage.put(`audio:${id}:${index}`, data)
+        upload.next++
+      }
       upload.updated = Date.now()
       await this.state.storage.put(`upload:${id}`, upload)
       reply('ack', { id, next: upload.next }); return

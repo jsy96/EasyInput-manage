@@ -25,7 +25,7 @@ export async function textVoice(text: string, gateway: string): Promise<Uint8Arr
   const context = new AudioContext()
   try {
     const audio = await context.decodeAudioData(await response.arrayBuffer())
-    if (audio.duration > 60) throw new Error('转成语音后超过 1 分钟，请缩短文字')
+    if (audio.duration > 20) throw new Error('转成语音后超过 20 秒，请缩短文字')
     return resample(audio.getChannelData(0), audio.sampleRate)
   } finally { await context.close() }
 }
@@ -49,7 +49,7 @@ export class VoiceRecorder {
       if (this.stopped) { this.dispose(); return }
       const context = this.context = new AudioContext()
       const source = context.createMediaStreamSource(this.stream)
-      const code = `class Capture extends AudioWorkletProcessor { constructor(){super();this.frames=0;this.done=false;} process(inputs){const a=inputs[0]?.[0];if(a&&!this.done){const n=Math.min(a.length,Math.floor(sampleRate*60)-this.frames);this.port.postMessage(a.slice(0,n));this.frames+=n;if(this.frames>=sampleRate*60){this.done=true;this.port.postMessage('done');}}return !this.done;}} registerProcessor('voice-capture',Capture);`
+      const code = `class Capture extends AudioWorkletProcessor { constructor(){super();this.frames=0;this.done=false;} process(inputs){const a=inputs[0]?.[0];if(a&&!this.done){const n=Math.min(a.length,${AUDIO_LIMIT}-this.frames);this.port.postMessage(a.slice(0,n));this.frames+=n;if(this.frames>=${AUDIO_LIMIT}){this.done=true;this.port.postMessage('done');}}return !this.done;}} registerProcessor('voice-capture',Capture);`
       this.url = URL.createObjectURL(new Blob([code], { type: 'application/javascript' }))
       await context.audioWorklet.addModule(this.url)
       if (this.stopped) { this.dispose(); return }
@@ -59,11 +59,11 @@ export class VoiceRecorder {
         if (event.data === 'done') { this.stop(); return }
         if (!(event.data instanceof Float32Array) || this.stopped) return
         this.parts.push(event.data); this.frames += event.data.length
-        this.changed(Math.min(60, this.frames / context.sampleRate))
+        this.changed(Math.min(20, this.frames / context.sampleRate))
       }
       source.connect(node); node.connect(context.destination)
       await context.resume()
-      this.timer = setTimeout(() => this.stop(), 60000)
+      this.timer = setTimeout(() => this.stop(), 20000)
     } catch (error) { this.dispose(); throw error } finally { this.starting = false }
   }
   stop(): void {

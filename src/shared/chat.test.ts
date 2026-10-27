@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { decodeMulaw, encodeMulaw, keyForSlot, nextMessage, slotForClient, slotLight } from './chat'
+import { AUDIO_LIMIT, decodeMulaw, encodeMulaw, keyForSlot, nextMessage, slotForClient, slotLight } from './chat'
 import type { ChatMessage } from './chat'
 const message = (id: string, read = false, slot = 0): ChatMessage => ({ id, sender: 'computer', name: '电脑', slot, samples: 8000, created: 1, read, cleared: false })
 describe('voice group behavior', () => {
+  it('limits one recording to twenty seconds', () => { expect(AUDIO_LIMIT).toBe(160_000) })
   it('keeps the first four clients separate and routes every later client to S8', () => {
     expect(Array.from({ length: 8 }, (_, i) => keyForSlot(slotForClient(i)))).toEqual(['S1','S2','S3','S4','S8','S8','S8','S8'])
   })
