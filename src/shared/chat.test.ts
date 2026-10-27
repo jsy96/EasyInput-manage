@@ -1,30 +1,23 @@
 import { describe, expect, it } from 'vitest'
-import { AUDIO_LIMIT, decodeMulaw, encodeMulaw, keyForSlot, nextMessage, slotForClient, slotLight } from './chat'
+import { AUDIO_LIMIT, adjacentMessage, decodeMulaw, encodeMulaw, latestUnreadMessage, sortMessages } from './chat'
 import type { ChatMessage } from './chat'
-const message = (id: string, read = false, slot = 0): ChatMessage => ({ id, sender: 'computer', name: '电脑', slot, samples: 8000, created: 1, read, cleared: false })
-describe('voice group behavior', () => {
+const message = (id: string, created: number, read = false, sender = 'computer'): ChatMessage => ({ id, sender, name: '电脑', samples: 8000, created, read })
+describe('voice timeline behavior', () => {
   it('limits one recording to twenty seconds', () => { expect(AUDIO_LIMIT).toBe(160_000) })
-  it('keeps the first four clients separate and routes every later client to S8', () => {
-    expect(Array.from({ length: 8 }, (_, i) => keyForSlot(slotForClient(i)))).toEqual(['S1','S2','S3','S4','S8','S8','S8','S8'])
+  it('sorts every sender by time without grouping computers', () => {
+    const messages = [message('new-board', 300, false, 'board'), message('old-computer', 100), message('new-computer', 200)]
+    expect(sortMessages(messages).map((value) => value.id)).toEqual(['old-computer', 'new-computer', 'new-board'])
   })
-  it('plays unread messages in order, then repeats the last read message', () => {
-    const messages = [message('one', true), message('two'), message('three')]
-    expect(nextMessage(messages, 0)?.id).toBe('two')
-    expect(slotLight(messages, 0)).toBe('red')
-    messages[1].read = messages[2].read = true
-    expect(nextMessage(messages, 0)?.id).toBe('three')
-    expect(slotLight(messages, 0)).toBe('green')
-    messages.forEach(m => { m.cleared = true })
-    expect(nextMessage(messages, 0)).toBeUndefined()
-    expect(slotLight(messages, 0)).toBe('off')
+  it('selects the newest unread message across the shared timeline', () => {
+    const messages = [message('one', 100), message('two', 200, true), message('three', 300)]
+    expect(latestUnreadMessage(messages)?.id).toBe('three')
   })
-  it('combines unread voice from additional computers on the fifth light', () => {
-    const m = [message('five', true, 4), { ...message('six', false, 4), sender: 'sixth' }]
-    expect(slotLight(m, 4)).toBe('red')
-    m[0].cleared = true
-    expect(slotLight(m, 4)).toBe('red')
-    m[1].read = true
-    expect(slotLight(m, 4)).toBe('green')
+  it('navigates short to older and long to newer without wrapping', () => {
+    const messages = [message('one', 100), message('two', 200), message('three', 300)]
+    expect(adjacentMessage(messages, null, 'older')?.id).toBe('three')
+    expect(adjacentMessage(messages, 'three', 'older')?.id).toBe('two')
+    expect(adjacentMessage(messages, 'two', 'newer')?.id).toBe('three')
+    expect(adjacentMessage(messages, 'three', 'newer')).toBeUndefined()
   })
   it('uses G.711 mu-law reference values and preserves speech-scale samples', () => {
     expect(encodeMulaw(0)).toBe(255)

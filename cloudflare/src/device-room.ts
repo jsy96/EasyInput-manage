@@ -1,10 +1,10 @@
-import { AUDIO_CHUNK, AUDIO_LIMIT, AUDIO_STREAM_WINDOW, CHAT_LIMIT, slotForClient, validId } from '../../src/shared/chat'
+import { AUDIO_CHUNK, AUDIO_LIMIT, AUDIO_STREAM_WINDOW, CHAT_LIMIT, CHAT_VERSION, sortMessages, validId } from '../../src/shared/chat'
 import type { ChatClient, ChatMessage } from '../../src/shared/chat'
 
-type Attachment = { role: 'board' | 'browser'; client?: string; name?: string; slot?: number; last?: number; uptime?: number }
+type Attachment = { role: 'board' | 'browser'; client?: string; name?: string; last?: number; uptime?: number }
 type Frame = Record<string, unknown>
-type Upload = { id: string; sender: string; name: string; slot: number; samples: number; next: number; created: number; updated?: number; text?: string }
-const frame = (op: string, data: Frame = {}): Frame => ({ type: 'chat', protocol: 1, op, ...data })
+type Upload = { id: string; sender: string; name: string; samples: number; next: number; created: number; updated?: number }
+const frame = (op: string, data: Frame = {}): Frame => ({ type: 'chat', protocol: CHAT_VERSION, op, ...data })
 const MAX_BATCH = 32
 
 export class DeviceRoom {
@@ -25,12 +25,28 @@ export class DeviceRoom {
     const route = this.route()
     if (route) this.send(route.socket, route.via === 'ble' ? { type: 'bridge', payload: value } : value)
   }
-  private async messages(): Promise<ChatMessage[]> { return await this.state.storage.get<ChatMessage[]>('messages') ?? [] }
+  private async messages(): Promise<ChatMessage[]> {
+    const stored = await this.state.storage.get<Array<Record<string, unknown>>>('messages') ?? []
+    return sortMessages(stored
+      .filter((message) => message.cleared !== true && typeof message.id === 'string' && typeof message.sender === 'string' &&
+        typeof message.name === 'string' && typeof message.samples === 'number' &&
+        typeof message.created === 'number' && typeof message.read === 'boolean')
+      .map((message) => ({
+        id: message.id as string,
+        sender: message.sender as string,
+        name: message.name as string,
+        samples: message.samples as number,
+        created: message.created as number,
+        read: message.read as boolean,
+      })))
+  }
   private async clients(): Promise<ChatClient[]> { return await this.state.storage.get<ChatClient[]>('clients') ?? [] }
   private async presence(): Promise<void> {
     const route = this.route()
     const clients = (await this.clients()).map((c) => ({ ...c, online: this.sockets().some((s) => this.attachment(s).client === c.id) }))
+    const onlineClients = clients.filter((client) => client.online).length
     this.broadcast(frame('presence', { online: !!route, via: route?.via ?? null, clients }), true)
+    this.toBoard(frame('audience', { online_clients: onlineClients }))
   }
   async fetch(request: Request): Promise<Response> {
     if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') return new Response('WebSocket required', { status: 426 })
@@ -46,7 +62,7 @@ export class DeviceRoom {
         self = clients.find((c) => c.id === id)
         if (!self) {
           if (clients.length >= 128) throw new Error('群客户端名额已满（128）')
-          self = { id: id!, name: (url.searchParams.get('name') ?? '').trim().slice(0, 24) || `电脑 ${clients.length + 1}`, slot: slotForClient(clients.length) }
+          self = { id: id!, name: (url.searchParams.get('name') ?? '').trim().slice(0, 24) || `电脑 ${clients.length + 1}` }
           clients.push(self)
           await this.state.storage.put('clients', clients)
         }
@@ -54,16 +70,21 @@ export class DeviceRoom {
     }
     const [client, server] = Object.values(new WebSocketPair()) as [WebSocket, WebSocket]
     this.state.acceptWebSocket(server)
-    server.serializeAttachment({ role, client: self?.id, name: self?.name, slot: self?.slot } satisfies Attachment)
+    server.serializeAttachment({ role, client: self?.id, name: self?.name } satisfies Attachment)
     if (role === 'browser') {
       const route = this.route()
-      this.send(server, frame('snapshot', { self, messages: await this.messages(), clients: await this.clients(), online: !!route, via: route?.via ?? null }))
+      this.send(server, frame('snapshot', {
+        self, messages: await this.messages(), clients: await this.clients(), online: !!route, via: route?.via ?? null,
+        realtimeEnabled: await this.state.storage.get<boolean>('realtime_enabled') ?? false,
+        realtimeActive: await this.state.storage.get<boolean>('realtime_active') ?? false,
+      }))
       const hello = await this.state.storage.get<Frame>('hello')
       if (hello) this.send(server, hello)
       this.toBoard({ type: 'command', protocol: 2, action: 'hello.get' })
     } else {
       // A socket alone is not proof of board presence; require fresh telemetry.
       this.send(server, { type: 'command', protocol: 2, action: 'hello.get' })
+      this.send(server, frame('settings', { realtime_enabled: await this.state.storage.get<boolean>('realtime_enabled') ?? false }))
     }
     await this.presence()
     await this.state.storage.setAlarm(Date.now() + 5000)
@@ -112,7 +133,7 @@ export class DeviceRoom {
     if (value.type === 'status') await this.presence()
   }
   private async chat(socket: WebSocket, v: Frame, board: boolean): Promise<void> {
-    if (v.protocol !== 1) return
+    if (v.protocol !== CHAT_VERSION) return
     const a = this.attachment(socket)
     const reply = (op: string, data: Frame = {}): void => {
       const response = frame(op, { req: v.req, ...data })
@@ -123,10 +144,10 @@ export class DeviceRoom {
     if (v.op === 'ping') { reply('pong', board ? { via: a.role === 'board' ? 'wifi' : 'ble' } : {}); await this.presence(); return }
     if (v.op === 'gateway.off' && !board) { a.last = 0; socket.serializeAttachment(a); await this.presence(); return }
     if (v.op === 'index' && board) {
-      const items = (await this.messages()).filter((m) => m.sender !== 'board')
+      const items = await this.messages()
       const offset = Number(v.offset) || 0
       const m = items[offset]
-      reply('index', m ? { offset, id: m.id, slot: m.slot, samples: m.samples, read: m.read, cleared: m.cleared } : { offset, end: true })
+      reply('index', m ? { offset, id: m.id, created: m.created, samples: m.samples, read: m.read } : { offset, end: true })
       return
     }
     if ((v.op === 'pullBatch' || v.op === 'stream') && board === (v.op === 'stream')) {
@@ -134,7 +155,7 @@ export class DeviceRoom {
       const start = Number(v.index), count = v.op === 'stream' ? Math.min(AUDIO_STREAM_WINDOW, Number(v.count) || AUDIO_STREAM_WINDOW) : Math.min(MAX_BATCH, Number(v.count) || MAX_BATCH)
       if (!Number.isInteger(start) || start < 0 || !Number.isInteger(count) || count < 1) return
       const m = (await this.messages()).find((m) => m.id === id)
-      if (!m || m.cleared) throw new Error('这条语音已清除或不可用')
+      if (!m) throw new Error('这条语音不可用')
       const end = Math.min(Math.ceil(m.samples / AUDIO_CHUNK), start + count)
       if (v.op === 'pullBatch') {
         const chunks: Array<{ index: number; data: string }> = []
@@ -155,7 +176,7 @@ export class DeviceRoom {
       return
     }
     if (v.op === 'begin') {
-      if (!validId(id) || !Number.isInteger(v.samples) || Number(v.samples) < 1 || Number(v.samples) > AUDIO_LIMIT) throw new Error('语音必须在 1 分钟以内')
+      if (!validId(id) || !Number.isInteger(v.samples) || Number(v.samples) < 1 || Number(v.samples) > AUDIO_LIMIT) throw new Error('语音必须在 20 秒以内')
       const items = await this.messages()
       const existing = items.find((m) => m.id === id)
       if (existing) {
@@ -170,7 +191,7 @@ export class DeviceRoom {
       if (!upload) {
         const pending = await this.state.storage.list<Upload>({ prefix: 'upload:' })
         if ([...pending.values()].filter((u) => u.sender === sender).length >= 2) throw new Error('请先完成上一条语音上传')
-        upload = { id, sender, name: board ? '开发板' : a.name!, slot: board ? -1 : a.slot!, samples: Number(v.samples), next: 0, created: Date.now(), text: typeof v.text === 'string' ? v.text.slice(0, 300) : undefined }
+        upload = { id, sender, name: board ? '开发板' : a.name!, samples: Number(v.samples), next: 0, created: Date.now() }
         await this.state.storage.put(key, upload)
       }
       upload.updated = Date.now()
@@ -223,7 +244,7 @@ export class DeviceRoom {
         await this.deleteAudio(old.id, old.samples)
         this.broadcast(frame('pruned', { ids: [old.id] }), true)
       }
-      const m: ChatMessage = { id, sender, name: upload.name, slot: upload.slot, samples: upload.samples, created: Date.now(), text: upload.text, read: false, cleared: false }
+      const m: ChatMessage = { id, sender, name: upload.name, samples: upload.samples, created: Date.now(), read: false }
       items.push(m)
       await this.state.storage.put('messages', items)
       // Keep a small receipt after audio/history eviction so a rebooted board can
@@ -232,30 +253,53 @@ export class DeviceRoom {
       await this.state.storage.delete(`upload:${id}`)
       reply('ack', { id, committed: true })
       this.broadcast(frame('message', { message: m }), true)
-      if (sender !== 'board') this.toBoard(frame('item', { id, slot: m.slot, samples: m.samples, read: false, cleared: false }))
+      if (sender !== 'board') this.toBoard(frame('item', { id: m.id, created: m.created, samples: m.samples, read: false }))
       return
     }
     if (v.op === 'pull') {
       if (!validId(id) || !Number.isInteger(v.index) || Number(v.index) < 0) return
       const m = (await this.messages()).find((m) => m.id === id)
-      if (!m || m.cleared || Number(v.index) >= Math.ceil(m.samples / AUDIO_CHUNK)) throw new Error('这条语音已清除或不可用')
+      if (!m || Number(v.index) >= Math.ceil(m.samples / AUDIO_CHUNK)) throw new Error('这条语音不可用')
       const data = await this.state.storage.get<string>(`audio:${id}:${v.index}`)
       if (!data) throw new Error('语音分片不存在')
       reply('audio', { id, index: v.index, data, samples: m.samples }); return
     }
     if (v.op === 'read' && board && validId(id)) {
       const items = await this.messages()
-      const m = items.find((m) => m.id === id && m.sender !== 'board')
-      if (m && !m.cleared) { m.read = true; await this.state.storage.put('messages', items); this.broadcast(frame('message', { message: m }), true) }
+      const m = items.find((m) => m.id === id)
+      if (m) { m.read = true; await this.state.storage.put('messages', items); this.broadcast(frame('message', { message: m }), true) }
       reply('ack', { id }); return
     }
-    if (v.op === 'clear' && board && Number.isInteger(v.slot) && Number(v.slot) >= 0 && Number(v.slot) < 5) {
-      const items = await this.messages()
-      const cleared = items.filter((m) => m.sender !== 'board' && m.slot === v.slot && m.read && !m.cleared)
-      for (const m of cleared) { m.cleared = true; await this.deleteAudio(m.id, m.samples) }
-      await this.state.storage.put('messages', items)
-      this.broadcast(frame('cleared', { ids: cleared.map((m) => m.id) }), true)
-      reply('cleared', { slot: v.slot, ids: cleared.map((m) => m.id) }); return
+    if (v.op === 'realtime.set' && !board) {
+      const enabled = v.enabled === true
+      await this.state.storage.put('realtime_enabled', enabled)
+      if (!enabled) {
+        await this.state.storage.put('realtime_active', false)
+        this.broadcast(frame('realtime.stop', {}))
+      }
+      this.broadcast(frame('settings', { realtime_enabled: enabled }))
+      this.toBoard(frame('settings', { realtime_enabled: enabled }))
+      reply('settings', { realtime_enabled: enabled })
+      return
+    }
+    if (v.op === 'realtime.start' && board) {
+      if (!(await this.state.storage.get<boolean>('realtime_enabled') ?? false)) throw new Error('实时监听未在网页开启')
+      await this.state.storage.put('realtime_active', true)
+      this.broadcast(frame('realtime.start', {}), true)
+      reply('ack', { active: true })
+      return
+    }
+    if (v.op === 'realtime.chunk' && board) {
+      if (!(await this.state.storage.get<boolean>('realtime_active') ?? false)) return
+      if (typeof v.data !== 'string' || v.data.length > 4096 || !/^[A-Za-z0-9+/]+={0,2}$/.test(v.data)) return
+      this.broadcast(frame('realtime.chunk', { data: v.data }), true)
+      return
+    }
+    if (v.op === 'realtime.stop') {
+      if (board) await this.state.storage.put('realtime_active', false)
+      this.broadcast(frame('realtime.stop', {}))
+      if (board) reply('ack', { active: false })
+      return
     }
   }
   private async deleteAudio(id: string, samples: number): Promise<void> {
@@ -271,6 +315,18 @@ export class DeviceRoom {
     await this.presence()
     if (this.sockets().length || pending.size) await this.state.storage.setAlarm(Date.now() + 5000)
   }
-  async webSocketClose(): Promise<void> { await this.presence() }
-  async webSocketError(): Promise<void> { await this.presence() }
+  async webSocketClose(): Promise<void> {
+    if (!this.route()) {
+      await this.state.storage.put('realtime_active', false)
+      this.broadcast(frame('realtime.stop', {}), true)
+    }
+    await this.presence()
+  }
+  async webSocketError(): Promise<void> {
+    if (!this.route()) {
+      await this.state.storage.put('realtime_active', false)
+      this.broadcast(frame('realtime.stop', {}), true)
+    }
+    await this.presence()
+  }
 }

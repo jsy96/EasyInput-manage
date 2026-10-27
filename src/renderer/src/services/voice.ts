@@ -19,17 +19,7 @@ export function voiceWav(bytes: Uint8Array): Blob {
   bytes.forEach((b, i) => v.setInt16(44 + i * 2, decodeMulaw(b), true))
   return new Blob([data], { type: 'audio/wav' })
 }
-export async function textVoice(text: string, gateway: string): Promise<Uint8Array> {
-  const response = await fetch(`${gateway.replace('wss:', 'https:')}/tts`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }), signal: AbortSignal.timeout(50000) })
-  if (!response.ok) throw new Error((await response.json() as { error: string }).error)
-  const context = new AudioContext()
-  try {
-    const audio = await context.decodeAudioData(await response.arrayBuffer())
-    if (audio.duration > 20) throw new Error('转成语音后超过 20 秒，请缩短文字')
-    return resample(audio.getChannelData(0), audio.sampleRate)
-  } finally { await context.close() }
-}
-/** Capture PCM in an AudioWorklet so the one-minute cutoff does not depend on a foreground tab. */
+/** Capture PCM in an AudioWorklet so the twenty-second cutoff does not depend on a foreground tab. */
 export class VoiceRecorder {
   private stream: MediaStream | null = null
   private context: AudioContext | null = null

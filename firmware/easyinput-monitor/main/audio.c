@@ -16,8 +16,8 @@
 #define VAD_START_RMS 300
 #define VAD_END_RMS 180
 #define VAD_HOLD_US 300000
-#define TONE_FRAMES AUDIO_SAMPLE_RATE
 #define TONE_FADE_FRAMES (AUDIO_SAMPLE_RATE / 50)
+#define LIVE_CHUNK_BYTES 640
 // Six DMA blocks can still be in flight after the last write returns.
 #define TONE_DRAIN_US (6LL * AUDIO_BLOCK_FRAMES * 1000000 / AUDIO_SAMPLE_RATE + 20000)
 
@@ -56,8 +56,13 @@ static int64_t microphone_started_us;
 static int64_t microphone_last_data_us;
 static int64_t voice_until_us;
 static uint32_t tone_frame;
+static uint32_t tone_target_frames;
+static float tone_frequency;
 static uint8_t tone_volume;
 static int64_t tone_drain_until_us;
+static audio_microphone_sink_t live_sink;
+static uint8_t live_chunk[LIVE_CHUNK_BYTES];
+static size_t live_chunk_length;
 
 static esp_err_t safe_audio_pins(bool microphone)
 {
@@ -194,6 +199,17 @@ static void audio_task(void *arg)
                         }
                         if (state.recorded_bytes >= record_capacity) (void)stop_channel(true);
                     }
+                    if (!state.recording && live_sink != NULL) {
+                        for (size_t i = 0; i + 1 < frames; i += 2) {
+                            const int a = microphone_samples[i * 2 + 1] >> 16;
+                            const int b = microphone_samples[(i + 1) * 2 + 1] >> 16;
+                            live_chunk[live_chunk_length++] = mulaw_encode((a + b) / 2);
+                            if (live_chunk_length == sizeof(live_chunk)) {
+                                live_sink(live_chunk, live_chunk_length);
+                                live_chunk_length = 0;
+                            }
+                        }
+                    }
                 }
                 result = ESP_OK;
             } else if (result == ESP_OK || result == ESP_ERR_TIMEOUT) {
@@ -221,15 +237,15 @@ static void audio_task(void *arg)
                 voice_frame += frames;
                 if (voice_frame == voice_length * 2) tone_drain_until_us = esp_timer_get_time() + TONE_DRAIN_US;
             }
-        } else if (state.speaker_playing && voice_buffer == NULL && tone_frame < TONE_FRAMES) {
+        } else if (state.speaker_playing && voice_buffer == NULL && tone_frame < tone_target_frames) {
             did_io = true;
-            unsigned frames = TONE_FRAMES - tone_frame;
+            unsigned frames = tone_target_frames - tone_frame;
             if (frames > AUDIO_BLOCK_FRAMES) frames = AUDIO_BLOCK_FRAMES;
             for (unsigned i = 0; i < frames; i++) {
                 const uint32_t frame = tone_frame + i;
-                const uint32_t remaining = TONE_FRAMES - 1 - frame;
+                const uint32_t remaining = tone_target_frames - 1 - frame;
                 const float fade = fminf(1.0f, (float)(frame < remaining ? frame : remaining) / TONE_FADE_FRAMES);
-                const int16_t sample = (int16_t)(32767.0f * tone_volume / 100.0f * fade * sinf(2.0f * 3.14159265358979323846f * 440.0f * frame / AUDIO_SAMPLE_RATE));
+                const int16_t sample = (int16_t)(32767.0f * tone_volume / 100.0f * fade * sinf(2.0f * 3.14159265358979323846f * tone_frequency * frame / AUDIO_SAMPLE_RATE));
                 speaker_samples[i * 2] = sample;
                 speaker_samples[i * 2 + 1] = sample;
             }
@@ -240,7 +256,7 @@ static void audio_task(void *arg)
                 (void)stop_channel(false);
             } else {
                 tone_frame += frames;
-                if (tone_frame == TONE_FRAMES) tone_drain_until_us = esp_timer_get_time() + TONE_DRAIN_US;
+                if (tone_frame == tone_target_frames) tone_drain_until_us = esp_timer_get_time() + TONE_DRAIN_US;
             }
         } else if (state.speaker_playing && esp_timer_get_time() >= tone_drain_until_us) {
             const esp_err_t result = stop_channel(false);
@@ -299,16 +315,19 @@ esp_err_t audio_set_microphone(bool on)
     return result;
 }
 
+typedef struct { uint8_t volume; uint16_t duration_ms; float frequency; } tone_context_t;
 static esp_err_t start_test(void *arg)
 {
-    const uint8_t volume = *(uint8_t *)arg;
+    const tone_context_t *context = arg;
     xSemaphoreTake(audio_mutex, portMAX_DELAY);
     const esp_err_t result = start_channel(false);
     state.speaker_error = result;
     if (result == ESP_OK) {
         voice_buffer = NULL;
         state.voice_completed = false;
-        tone_volume = volume;
+        tone_volume = context->volume;
+        tone_target_frames = (uint32_t)AUDIO_SAMPLE_RATE * context->duration_ms / 1000;
+        tone_frequency = context->frequency;
         state.speaker_playing = true;
         tone_frame = 0;
         tone_drain_until_us = 0;
@@ -321,7 +340,19 @@ esp_err_t audio_play_test(uint8_t volume)
 {
     if (volume == 0 || volume > AUDIO_TEST_VOLUME_MAX) return ESP_ERR_INVALID_ARG;
     if (!audio_mutex || !state.ready) return ESP_ERR_INVALID_STATE;
-    return lights_with_shared_power(start_test, &volume);
+    const tone_context_t context = {.volume = volume, .duration_ms = 1000, .frequency = 440.0f};
+    return lights_with_shared_power(start_test, (void *)&context);
+}
+
+esp_err_t audio_play_beep(uint16_t duration_ms, bool strong)
+{
+    if (duration_ms < 30 || duration_ms > 500 || !audio_mutex || !state.ready) return ESP_ERR_INVALID_ARG;
+    const tone_context_t context = {
+        .volume = strong ? 32 : 18,
+        .duration_ms = duration_ms,
+        .frequency = strong ? 660.0f : 880.0f,
+    };
+    return lights_with_shared_power(start_test, (void *)&context);
 }
 
 esp_err_t audio_stop_speaker(void)
@@ -404,7 +435,7 @@ static esp_err_t start_record(void *arg)
         microphone_started_us = microphone_last_data_us = esp_timer_get_time();
         record_buffer = (uint8_t *)context->buffer; record_capacity = context->length;
         state.recorded_bytes = 0; state.recording = true; state.microphone_active = true;
-        record_deadline_us = esp_timer_get_time() + 60000000;
+        record_deadline_us = esp_timer_get_time() + 20000000;
     }
     xSemaphoreGive(audio_mutex);
     return result;
@@ -416,3 +447,23 @@ esp_err_t audio_record_start(uint8_t *buffer, size_t capacity)
     return lights_with_shared_power(start_record, (void *)&context);
 }
 esp_err_t audio_record_stop(void) { return audio_set_microphone(false); }
+
+esp_err_t audio_live_start(audio_microphone_sink_t sink)
+{
+    if (sink == NULL || !audio_mutex || !state.ready) return ESP_ERR_INVALID_ARG;
+    live_sink = sink;
+    live_chunk_length = 0;
+    const esp_err_t result = audio_set_microphone(true);
+    if (result != ESP_OK) {
+        live_sink = NULL;
+        live_chunk_length = 0;
+    }
+    return result;
+}
+
+esp_err_t audio_live_stop(void)
+{
+    live_sink = NULL;
+    live_chunk_length = 0;
+    return audio_set_microphone(false);
+}

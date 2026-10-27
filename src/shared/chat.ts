@@ -1,4 +1,4 @@
-export const CHAT_VERSION = 1
+export const CHAT_VERSION = 2
 export const AUDIO_RATE = 8000
 export const AUDIO_LIMIT = AUDIO_RATE * 20
 export const AUDIO_CHUNK = 768
@@ -9,14 +9,11 @@ export interface ChatMessage {
   id: string
   sender: string
   name: string
-  slot: number
   samples: number
   created: number
-  text?: string
   read: boolean
-  cleared: boolean
 }
-export interface ChatClient { id: string; name: string; slot: number; online?: boolean }
+export interface ChatClient { id: string; name: string; online?: boolean }
 export interface RoomState {
   online: boolean
   via: 'wifi' | 'ble' | null
@@ -24,17 +21,34 @@ export interface RoomState {
   clients: ChatClient[]
   messages: ChatMessage[]
   self: ChatClient | null
+  realtimeEnabled: boolean
+  realtimeActive: boolean
 }
-export const emptyRoom: RoomState = { online: false, via: null, connected: false, clients: [], messages: [], self: null }
-export function slotForClient(index: number): number { return Math.min(4, Math.max(0, index)) }
-export function keyForSlot(slot: number): string { return slot < 4 ? `S${slot + 1}` : 'S8' }
-export function slotLight(messages: ChatMessage[], slot: number): 'red' | 'green' | 'off' {
-  const items = messages.filter((m) => m.sender !== 'board' && m.slot === slot && !m.cleared)
-  return items.some((m) => !m.read) ? 'red' : items.length ? 'green' : 'off'
+export const emptyRoom: RoomState = {
+  online: false, via: null, connected: false, clients: [], messages: [], self: null,
+  realtimeEnabled: false, realtimeActive: false,
 }
-export function nextMessage(messages: ChatMessage[], slot: number): ChatMessage | undefined {
-  const items = messages.filter((m) => m.sender !== 'board' && m.slot === slot && !m.cleared)
-  return items.find((m) => !m.read) ?? items.at(-1)
+export function sortMessages(messages: ChatMessage[]): ChatMessage[] {
+  return [...messages].sort((a, b) => a.created - b.created || a.id.localeCompare(b.id))
+}
+export function latestUnreadMessage(messages: ChatMessage[]): ChatMessage | undefined {
+  const sorted = sortMessages(messages)
+  for (let index = sorted.length - 1; index >= 0; index--) if (!sorted[index].read) return sorted[index]
+  return undefined
+}
+export function latestMessage(messages: ChatMessage[]): ChatMessage | undefined {
+  return sortMessages(messages).at(-1)
+}
+export function adjacentMessage(
+  messages: ChatMessage[],
+  currentId: string | null,
+  direction: 'older' | 'newer',
+): ChatMessage | undefined {
+  const sorted = sortMessages(messages)
+  if (!currentId) return direction === 'older' ? latestUnreadMessage(sorted) ?? sorted.at(-1) : sorted.at(-1)
+  const index = sorted.findIndex((message) => message.id === currentId)
+  if (index < 0) return direction === 'older' ? sorted.at(-1) : sorted[0]
+  return sorted[index + (direction === 'older' ? -1 : 1)]
 }
 export function encodeMulaw(sample: number): number {
   let pcm = Math.max(-32768, Math.min(32767, Math.round(sample)))

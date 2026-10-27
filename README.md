@@ -1,134 +1,74 @@
 # EasyInput Studio
 
-EasyInput Studio is a browser PWA for monitoring and managing the EasyInput V2.0 development board (firmware board alias `v2`, PCB marking `AI Keyboard V2.1`). The PWA is published at https://studio.leige.online and uses a Cloudflare Worker / Durable Object for shared board presence and voice messages. There is no desktop runtime.
+EasyInput Studio 是 EasyInput V2.0 开发板的浏览器 PWA。网页和开发板共用一条语音时间线，不区分电脑数量，也不提供文字消息或文字转语音消息。
 
-File locations and collaboration rules are defined in [AGENTS.md](AGENTS.md). Protocol details are in [docs/PROTOCOL.md](docs/PROTOCOL.md). Web builds go in `dist/`; versioned firmware packages go in `release/firmware/` so rebuilding the website does not remove them.
+- 线上网页：https://studio.leige.online
+- 语音服务：`wss://easy.leige.online`
+- 目录约定：[AGENTS.md](AGENTS.md)
+- 使用说明：[docs/VOICE_CHAT.md](docs/VOICE_CHAT.md)
+- 协议：[docs/PROTOCOL.md](docs/PROTOCOL.md)
 
-## 多电脑语音群（网页 / 固件 0.3.0）
+## 当前功能
 
-打开 [EasyInput Studio](https://studio.leige.online)，所有电脑自动加入同一开发板的语音群。日常网络页只显示开发板在线 / 离线，以及 Wi-Fi / 蓝牙网关。浏览器与群聊服务器连上，并不代表开发板在线；状态来自最近 8 秒内的板端数据。
+- 网页与开发板录音统一按时间排序，最新一条显示在最上方。
+- 网页只发送语音；每条录音最长 20 秒。
+- S1 选择最新未读语音并播报时刻，短按向更早、长按向更新。
+- S2 播放当前语音，再按 S2 从头重播，其他键停止。
+- S3 设置每日闹钟，长按 S3 取消。
+- S4 设置倒计时，运行中每秒短滴答、每分钟长滴答并播报剩余分钟。
+- S5 开始录音，S6 发送；发送失败自动重试，成功后语音提示。
+- S7 实时发送开发板麦克风声音到网页，实时内容不写入历史。
+- S8 语音播报开发板是否联网，以及当前唯一在线的网页电脑数。
+- 网页只保留“语音”和“设备”两页。设备页负责在线状态、Wi-Fi/语音服务配置和固件升级。
 
-网页可以录制最长 20 秒的语音，或发送自动转成语音的中文文字；全群可以播放网页及开发板留言。前四个浏览器身份固定绑定 S1–S4，其余身份统一绑定 S8（第 5 灯）。红灯表示有未读，绿灯表示全部播放完毕；短按播放未读或重播最后一条，长按 1.2 秒清除该路已读留言，保留未读。S5 开始录音，S6 结束发送，20 秒自动结束。S7 语音播报网络；旋钮调音量、短按切换 S8 播放、长按 3 秒开启手机热点配网。第 5 灯录音时橙闪，S6 或满 20 秒结束后停止橙闪；发送中黄闪、失败待重试黄亮，确认成功后恢复留言灯态。板端使用分片批量和 8 片滑动窗口传输，约 0.5 秒预缓冲后边收边播。Flash 缓存最多 8 条录音，断电保留、恢复联网后每次失败等待 3 秒重试。
+完整按键和灯效约定见 [VOICE_CHAT.md](docs/VOICE_CHAT.md)。
 
-Wi-Fi 与云端配置只需首次通过 USB / 加密蓝牙保存。蓝牙网关需要一台已连接开发板的联网电脑保持网页运行；Wi-Fi 直连则不需要电脑常驻。当前网站是同一共享房间，访问者无需额外登录即可查看状态、收发留言。硬件验收和详细约定见 [docs/VOICE_CHAT.md](docs/VOICE_CHAT.md)。
-
-## Features
-
-- Board telemetry and input events over USB Serial/JTAG, encrypted BLE GATT, or local-network Wi-Fi WebSocket.
-- Independent USB, BLE and Wi-Fi monitoring sessions, with duplicate input events suppressed and USB preferred for network configuration commands.
-- Remembered Bluetooth authorization, automatic reconnection, and persistent board-side pairing.
-- Wi-Fi configuration, saved-credential reconnection, and connection diagnostics.
-- Individual RGB color, brightness and on/off control for five WS2812 pixels, independent status LED dimming, and explicit shared-power control (firmware 0.1.5+; USB/BLE commands).
-- Microphone capture, live RMS level and basic energy-based voice activity, plus a one-second low-volume speaker test (firmware 0.1.6+; USB/BLE commands).
-- Firmware package validation, ESP32-S3 identification, explicit write confirmation, progress, and per-image flashing without whole-flash erase.
-- A clearly marked interface preview mode that works without connecting to hardware.
-- Installable PWA shell with offline-cached static application assets. Device telemetry and credentials are not cached.
-
-## Run the web app
+## 本地运行
 
 ```sh
 npm install
 npm run dev
 ```
 
-Open `http://127.0.0.1:5173`. For production, `npm run build` writes static files to `dist/`; serve those files from an HTTPS origin to enable PWA installation and device APIs. `npm run preview` serves the production build locally.
+打开 `http://127.0.0.1:5173`。生产构建：
 
-USB Serial and Web Bluetooth require a secure browser context and an explicit browser permission. Use a current desktop Chrome or Edge browser for board connection and firmware flashing. Safari and iOS browsers do not provide the required device APIs. The firmware package importer uses Chromium's directory picker.
+```sh
+npm run build
+```
 
-USB and Bluetooth can connect to the same board simultaneously. Connecting or disconnecting one does not close the other. Each connection has its own handshake and protocol state; commands use healthy USB first and fall back to healthy Bluetooth. Each USB connection requests a fresh board handshake, allowing Wi-Fi configuration after a late connection or reconnect without restarting the board. This requires monitor firmware 0.1.2 or later with `hello.get` support.
+网页构建产物写入 `dist/`。USB Serial、Web Bluetooth 和 PWA 安装需要 HTTPS 或 localhost，并使用当前版本的桌面 Chrome / Edge。
 
-The service worker caches the versioned static app shell and build assets. While the app is visible, it checks for new deployments every 30 minutes. A detected update activates automatically and reloads once USB, BLE, Wi-Fi monitoring, Wi-Fi/light/audio commands, and firmware operations are idle. It does not cache Wi-Fi passwords, board telemetry, or device commands. The browser owns USB/Bluetooth device selection and permission prompts.
+## 网页与云端检查
 
-## Automatic Bluetooth connection
+```sh
+npm run typecheck
+npm test
+cd cloudflare
+npm run typecheck
+```
 
-Select and authorize the board once using **连接**. Studio remembers only the browser's opaque device ID and the automatic connection preference in local storage. On the same browser profile and origin, it restores the authorized device with `Bluetooth.getDevices()` when opening the page. Unexpected disconnects retry with increasing delays, capped at 30 seconds; background retries wait until the page is visible. No background path opens a device chooser. Use **重新选择设备** to change boards or recover a revoked authorization.
+## 固件构建
 
-**断开** or **取消重连** disables automatic connection until **连接** is clicked again, including after a page reload. Preview and firmware preparation pause it for the current page session. Browsers without `getDevices()` can still reconnect within the same page session, but may require selection again after reopening the page. Initial authorization, cleared site data, revoked permissions and system pairing prompts still require user interaction. Keep using the same site address and browser profile to retain authorization.
-
-Monitor firmware **0.1.3** enables persistent encrypted BLE bonding in NVS (up to three peers). Update the board to retain pairing across power cycles; the first connection after updating may require pairing once. Repeated pairing replaces the affected peer's stale bond, and full bond storage evicts its oldest peer. It does not erase Wi-Fi credentials or the NVS partition.
-
-## Wi-Fi credentials
-
-Enter Wi-Fi credentials once with **保存并自动连接**. They are stored in the board's NVS and automatically retried after startup and disconnection, independently of the webpage. The default view shows the saved network; **重连** / **使用已保存配置连接** reuses its credentials without asking for a password. The password form appears only for initial setup or **更换网络**. The PWA does not save the password on the host. The current partition table does not enable NVS encryption, so configure Wi-Fi only from a trusted session.
-
-Wi-Fi connects the board to its router independently of USB and Bluetooth. Either monitoring connection can configure it; disconnecting the monitoring sessions does not disconnect Wi-Fi. Wi-Fi and Bluetooth share radio resources, so simultaneous traffic may change speed or latency. Firmware flashing and loss of board power restart the whole device and interrupt its connections.
-
-## Monitor over Wi-Fi with the USB cable unplugged
-
-This requires monitor firmware **0.1.4** or later and the local Studio page at `http://127.0.0.1:5173` (or HTTP localhost). The computer and board must be on the same reachable LAN; guest networks or client isolation can prevent access.
-
-1. Update the firmware to 0.1.4, then connect USB or Bluetooth and configure the board's 2.4 GHz Wi-Fi once.
-2. After the board receives an IP address, Studio fills it into **网页监控 · Wi-Fi** in the Wi-Fi diagnostics section. Click **连接 Wi-Fi** in the header or **连接 Wi-Fi 监控** in that section. A known board IP can also be entered manually. Allow local-network access if the browser prompts.
-3. Wait until Wi-Fi monitoring shows **通信正常**. Unplug USB, keep the board switched on with its lithium battery, and disconnect Bluetooth. Telemetry, runtime and key/encoder events should keep updating, with **Wi-Fi** shown beside the latest-data time.
-4. Studio saves only the board IP and automatic-connection preference. Unexpected disconnects reconnect with backoff up to 30 seconds; missing status for eight seconds triggers recovery. Clicking **断开 Wi-Fi** or **取消重连** disables automatic reconnection, including after a reload. Preview and flashing pause it for the current page session.
-5. If the router changes the board IP, disconnect/cancel Wi-Fi monitoring and update the IP manually, or reconnect USB/Bluetooth to learn it again. The browser does not scan the LAN. A DHCP reservation on the router can keep the address stable.
-
-Display preference is USB, then BLE, then Wi-Fi, using each connection's own handshake and recent status. Disconnecting USB and BLE leaves a healthy Wi-Fi session active. Wi-Fi monitoring is read-only; network credentials and configuration changes still use USB or encrypted BLE. The board exposes `ws://<board-ip>/ws` on port 80, accepts only HTTP loopback Studio origins, and does not provide TLS or peer authentication. Use it on a trusted LAN. This direct connection is disabled on HTTPS pages, which need a separate secure transport/proxy design.
-
-## Build board firmware
-
-The board-side project targets ESP32-S3 and uses ESP-IDF 5.5.5 or later. Defaults enable the board's Octal PSRAM, per-core FreeRTOS runtime statistics, SPI Flash API counters and the WebSocket server so the app can report those resources over all three monitoring transports.
+开发板目标为 ESP32-S3，当前工程使用 ESP-IDF 5.5.5：
 
 ```sh
 cd firmware/easyinput-monitor
-idf.py set-target esp32s3
 idf.py build
-python3 ../../scripts/export-firmware.py --version 0.3.0
+python3 ../../scripts/export-firmware.py --version 0.4.1
 ```
 
-The export command writes `release/firmware/0.3.0-v2-monitor` containing `firmware.json` and the bootloader, partition table, and app images. The output is relative to the repository root, regardless of the shell's current directory. Firmware packages stay outside the website build output and are excluded from Git. The app checks the manifest, image sizes and SHA-256 hashes before flashing; the manifest is not a signed publisher identity. The WebSocket options in `sdkconfig.defaults` require ESP-IDF 5.5.5 or later. When reusing older generated configurations, regenerate them from these defaults before building so WebSocket support and both handshake callbacks are enabled. Firmware 0.3.0 adds 20-second recordings and windowed streaming playback.
+固件包写入 `release/firmware/0.4.1-v2-monitor/`。`build/`、`release/`、`node_modules/`、生成的 `sdkconfig` 和 `managed_components/` 不提交 Git。
 
-## Automatic connection hardware check
+中文提示音由 [scripts/build-voice-prompts.py](scripts/build-voice-prompts.py) 使用 `edge-tts-chinese` 的云健男声生成，再转换为 8 kHz 单声道 μ-law 并打包为 `firmware/easyinput-monitor/main/assets/prompts.bin`。
 
-Use Studio with monitor firmware 0.1.3:
+## 烧录
 
-1. Connect and authorize Bluetooth once, then reload the same site in the same browser profile. A supporting browser should restore the same board without a device chooser. Power-cycle the board while keeping the page visible; Bluetooth should reconnect and resume telemetry using the stored pairing.
-2. Click **断开** or **取消重连**, then reload. Bluetooth should stay disconnected until **连接** is clicked. Preview and firmware preparation should also stop reconnection attempts. USB should remain usable throughout ordinary Bluetooth connections and disconnections.
-3. Configure Wi-Fi once, then reload and power-cycle the board. After reconnecting USB or Bluetooth, confirm the saved SSID and Wi-Fi connection without entering its password again. Turn the router off and on and confirm automatic recovery. Use **更换网络** only to change its credentials.
-4. Revoke Bluetooth site permission and reopen the page. It should request a manual connection without repeatedly opening choosers. Use **重新选择设备** to authorize again. If the browser lacks `getDevices()`, verify reconnection while the page remains open and expect manual selection after reopening it.
+在“设备 → 固件升级”中选择包含 `firmware.json`、bootloader、分区表和应用镜像的完整目录。网页会校验清单、文件大小和 SHA-256，识别到 ESP32-S3 后要求再次确认才写入。
 
-## Connection independence hardware check
+自动进入下载模式失败时，保持开发板开机，短按并松开一次 BOOT，再重试并选择 ESP32 下载端口。板上没有独立 RESET/EN 键；更新完成后关机再开机恢复正常运行。
 
-Use the updated Studio with monitor firmware 0.1.2 or later:
+## 尚未完成或需要真机验收
 
-1. Leave the board powered on for at least five seconds before connecting USB in Studio. The USB status should become **通信正常** and the Wi-Fi section should show the saved network or an enabled **保存并自动连接** setup action.
-2. Connect Bluetooth while USB is connected. Both should stay connected; a key press should appear once in the input events.
-3. Click **断开 USB** in Studio while leaving the board powered on. Bluetooth should stay connected and continue updating inputs and Wi-Fi status. Reconnect USB without restarting the board; USB should return to **通信正常**.
-4. Disconnect Bluetooth while USB is connected. USB, Wi-Fi status and input updates should continue. Also try connecting Bluetooth first, then USB, and canceling each device picker while the other transport is connected.
-5. With Wi-Fi configured and connected, disconnect both monitoring sessions in Studio while leaving the board powered on. Reconnect either transport and confirm that Wi-Fi is still connected and board uptime has continued.
-
-With firmware 0.1.4, also connect Wi-Fi monitoring before step 5 and verify that it continues updating after both USB and BLE disconnect. Press and rotate inputs, reconnect USB/BLE, and confirm each input appears once. Power-cycle the board or briefly interrupt the router, confirm Wi-Fi monitoring reconnects, then deliberately disconnect it and reload to confirm it stays disconnected. If Wi-Fi cannot connect, verify the IP, local-network browser permission and router client isolation rather than repeatedly reinstalling dependencies.
-
-## Light and shared-power control (firmware 0.1.5+)
-
-Update the board using `release/firmware/0.1.5-v2-monitor/firmware.json` and all three adjacent images. Connect USB or encrypted Bluetooth; Wi-Fi monitoring remains read-only. Older firmware still reports telemetry but shows an upgrade prompt for light control.
-
-In **灯光与电源**, select pixel **1–5**, choose a color, enable **开启**, choose brightness, then click **应用此灯**. **应用到全部** copies that color, brightness and on/off setting to all five. **全部熄灭** preserves each pixel's color/brightness while switching all five off. Wire index 0 is displayed as pixel 1; the physical order needs checking on the board. Status LED GPIO42 has an independent toggle and brightness slider with **应用亮度**; it can work while shared power is off. Changes take effect only after applying. Preview mode simulates these operations without controlling hardware.
-
-Shared power starts off after reboot. A lit pixel automatically enables GPIO8; **全部熄灭** leaves power on. **关闭共享电源** sends a black frame, stops and detaches microphone/speaker I²S and RMT, returns downstream outputs low and GPIO11 floating, then lowers GPIO8. It also clears pixel enable flags, so explicitly enabling power again does not restore old lights. Status LED GPIO42 is unaffected. Firmware 0.1.6 adds on-demand audio drivers; turning power on alone leaves audio idle. Settings live in RAM and reset on reboot; disconnecting the page leaves the last settings running.
-
-The project currently waits at least **100 ms** after GPIO8 rises, then creates/enables the RMT driver, sends a black frame, and applies colors. This is a provisional bring-up parameter, not a measured board guarantee. Before accepting the hardware behavior, verify rail settling, USB/battery voltage and 3.3 V DIN margin. RMT sends five GRB pixels at 800 kbit/s with a 300 µs low latch; GPIO42 PWM uses 5 kHz/13-bit resolution. Start board checks at 20% brightness: test red/green/blue and off on each pixel, copy to all, switch all off while power stays on, then power off/on and test status LED independently. Verify USB/BLE status follows changes and key events still arrive.
-
-## Audio control (firmware 0.1.6+)
-
-Import the complete `release/firmware/0.1.6-v2-monitor/` folder in Studio, confirm the identified board, flash it, then switch the board off and on. Refresh Studio and connect USB or encrypted Bluetooth. In **音频设备**, click **开始采集** and speak near the board; the level meter, voice-activity indicator and microphone events should respond. **停止采集** resets RMS/VAD and releases the microphone controller. The indicator uses simple energy thresholds, so other loud sounds and the test tone can also trigger it; it is not speech recognition.
-
-Click **播放测试音（10%）** to play a 440 Hz tone for about one second; it stops automatically, or click **停止播放**. The firmware permits test amplitudes of 1–20%, with 20 ms fades. These percentages describe digital amplitude, not calibrated acoustic loudness. Playback status confirms the firmware operation only; listen to verify the speaker physically works. Driver errors appear on the card and the affected start action can retry. Missing audio capability on older firmware displays an upgrade prompt.
-
-Audio starts idle and shared power stays off after reboot. Starting capture or a test powers GPIO8 automatically and uses the existing provisional 100 ms settling wait. Stopping either audio function keeps shared power and lights unchanged. **关闭共享电源** stops both audio controllers and the pixels before powering down; turning power back on leaves capture and playback idle. GPIO42 stays independent. Disconnecting Studio leaves capture running until stopped, powered down, or rebooted. No PCM recording is stored or transmitted; only levels, activity and playback state are reported. Wi-Fi can monitor these values, while audio commands require USB/BLE. Preview mode simulates state and plays no sound.
-
-Board check: start capture, speak, play the test with capture running, then stop each independently. Turn shared power off during capture/playback and check that both stop; turn it back on and verify they remain idle until explicitly restarted. Check that lit pixels and key/encoder events continue working during audio. The microphone slot/alignment, sensitivity/VAD thresholds, simultaneous I²S behavior, rail settling and audible output still need this assembled-board validation.
-
-## Flashing behavior
-
-The browser filters device access through the Web Serial permission prompt. Firmware flashing uses the board's USB Serial/JTAG connection. The app first attempts automatic entry into download mode using the USB reset sequence. If that connection fails, keep the board powered on, short-press/release **BOOT**, then retry and select its download port. After writing, switch the board off and on to return to normal startup. Do not use the generic “hold BOOT while powering on” sequence. The app requires a separate confirmation after identifying the ESP32-S3 and reading its MAC address.
-
-## Public monitoring and voice through Cloudflare
-
-`cloudflare/` contains the gateway, durable voice room, Edge read-aloud adapter, and static website deployment configuration. The board opens outbound WSS on Wi-Fi; a browser with encrypted BLE can act as a gateway when direct Wi-Fi is unavailable. Browsers automatically join the public default device room, with no gateway/IP/token form. Board authentication still requires the existing `PAIRING_SECRET`, saved once by `cloud.configure`. Custom private room identifiers can continue using token authentication.
-
-The server stores at most 100 committed messages, recovers them after page reloads, and never evicts pending unread computer messages to make room. See [cloudflare/README.md](cloudflare/README.md) for deployment and [docs/VOICE_CHAT.md](docs/VOICE_CHAT.md) for usage, protocol, and verification limits.
-
-## Hardware validation boundary
-
-Physical USB enumeration, simultaneous USB/BLE/Wi-Fi sessions, Wi-Fi provisioning/recovery and WebSocket monitoring on battery power, PSRAM initialization, ADC voltage accuracy and sampling, power/charge detection, CPU/temperature readings, key/encoder polarity, BLE radio behavior, and flash/resume behavior still need a board-side check. The encoder direction is a project choice and should be checked against the actual knob. Light control is implemented for board bring-up; the 100 ms shared-rail wait, electrical margins, pixel order and visible behavior still require assembled-board validation. Compilation and software tests do not qualify the circuit. Audio drivers are implemented for bring-up; microphone sample alignment/levels, energy-based VAD thresholds, concurrent capture/playback and physical speaker output remain to be verified on the assembled board.
+- 所有红色慢闪状态统一为亮 0.1 秒、熄灭 2 秒；五颗 WS2812 点亮亮度为 1%。
+- 固件编译和自动化测试不能替代板载麦克风、扬声器、GPIO8 共享电源、灯序、按键方向和声音水平/音质的实板验证。
+- 实时聆听依赖 Wi-Fi 直连或保持运行的蓝牙网关网页；网络中断时会停止并语音提示离线。

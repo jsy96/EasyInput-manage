@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { DeviceRoom } from './device-room'
+import { CHAT_VERSION } from '../../src/shared/chat'
 class Socket {
   readyState = 1
   attachment: unknown
@@ -17,9 +18,9 @@ class Store {
   setAlarm = vi.fn(async () => {})
 }
 let store: Store, sockets: Socket[], room: DeviceRoom
-const chat = async (s: Socket, op: string, data: Record<string, unknown> = {}): Promise<void> => room.webSocketMessage(s as unknown as WebSocket, JSON.stringify({ type: 'chat', protocol: 1, op, req: op, ...data }))
-function socket(role = 'browser', client = 'client', slot = 0): Socket {
-  const s = new Socket(); s.serializeAttachment({ role, client, name: client, slot }); sockets.push(s); return s
+const chat = async (s: Socket, op: string, data: Record<string, unknown> = {}): Promise<void> => room.webSocketMessage(s as unknown as WebSocket, JSON.stringify({ type: 'chat', protocol: CHAT_VERSION, op, req: op, ...data }))
+function socket(role = 'browser', client = 'client'): Socket {
+  const s = new Socket(); s.serializeAttachment({ role, client, name: client }); sockets.push(s); return s
 }
 async function upload(s: Socket, id: string): Promise<void> {
   await chat(s, 'begin', { id, samples: 900 })
@@ -33,19 +34,19 @@ beforeEach(() => {
 })
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks() })
 describe('shared voice room', () => {
-  it('registers stable identities and assigns sixth and later computers to the S8 group', async () => {
+  it('registers stable identities without per-computer playback slots', async () => {
     vi.stubGlobal('WebSocketPair', class { 0 = new Socket(); 1 = new Socket() })
     vi.stubGlobal('Response', class { status: number; constructor(_body: unknown, init: { status: number }) { this.status = init.status } })
     for (let i = 0; i < 7; i++) {
       await room.fetch(new Request(`https://room.internal/ws?role=browser&client=computer-${i}&name=Computer-${i}`, { headers: { Upgrade: 'websocket' } }))
-      expect(sockets.at(-1)?.frames[0]).toMatchObject({ op: 'snapshot', self: { id: `computer-${i}`, slot: Math.min(4, i) } })
+      expect(sockets.at(-1)?.frames[0]).toMatchObject({ op: 'snapshot', self: { id: `computer-${i}` } })
     }
     await room.fetch(new Request('https://room.internal/ws?role=browser&client=computer-0', { headers: { Upgrade: 'websocket' } }))
-    expect(sockets.at(-1)?.frames[0]).toMatchObject({ self: { slot: 0 } })
+    expect(sockets.at(-1)?.frames[0]).toMatchObject({ self: { id: 'computer-0' } })
     expect((store.values.get('clients') as unknown[])).toHaveLength(7)
   })
   it('stores complete audio and broadcasts it to every browser while the board is offline', async () => {
-    const one = socket(), two = socket('browser','second',1)
+    const one = socket(), two = socket('browser','second')
     await upload(one, 'voice-1')
     expect(one.frames.some(f => f.op === 'message')).toBe(true)
     expect(two.frames.some(f => f.op === 'message')).toBe(true)
@@ -64,18 +65,17 @@ describe('shared voice room', () => {
     await chat(browser, 'commit', { id: 'batch-audio' })
     await chat(browser, 'pullBatch', { id: 'batch-audio', index: 0, count: 16 })
     expect(browser.frames.filter(f => f.op === 'chunks').at(-1)).toMatchObject({ next: 2, complete: true })
-    await room.webSocketMessage(board as unknown as WebSocket, JSON.stringify({ type: 'chat', protocol: 1, op: 'stream', req: 'stream-1', id: 'batch-audio', index: 0, count: 8 }))
+    await room.webSocketMessage(board as unknown as WebSocket, JSON.stringify({ type: 'chat', protocol: CHAT_VERSION, op: 'stream', req: 'stream-1', id: 'batch-audio', index: 0, count: 8 }))
     expect(board.frames.filter(f => f.op === 'audio')).toHaveLength(2)
     expect(board.frames.filter(f => f.op === 'streamAck').at(-1)).toMatchObject({ next: 2, complete: true })
   })
-  it('only clears messages already played by the board and retains pending messages', async () => {
+  it('marks a played item read without deleting shared timeline audio', async () => {
     const browser = socket(), board = socket('board')
     await upload(browser, 'read-one'); await upload(browser, 'unread-two')
     await chat(board, 'read', { id: 'read-one' })
-    await chat(board, 'clear', { slot: 0 })
-    const messages = store.values.get('messages') as { id: string; read: boolean; cleared: boolean }[]
-    expect(messages).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'read-one', read: true, cleared: true }), expect.objectContaining({ id: 'unread-two', read: false, cleared: false })]))
-    expect(store.values.has('audio:read-one:0')).toBe(false)
+    const messages = store.values.get('messages') as { id: string; read: boolean }[]
+    expect(messages).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'read-one', read: true }), expect.objectContaining({ id: 'unread-two', read: false })]))
+    expect(store.values.has('audio:read-one:0')).toBe(true)
     expect(store.values.has('audio:unread-two:0')).toBe(true)
     await chat(board, 'index', { offset: 1 })
     expect(board.frames.at(-1)).toMatchObject({ op: 'index', id: 'unread-two', read: false })
@@ -85,9 +85,9 @@ describe('shared voice room', () => {
     await chat(browser, 'ping')
     expect(browser.frames.at(-1)).toMatchObject({ online: false })
     await room.webSocketMessage(browser as unknown as WebSocket, JSON.stringify({ type: 'gateway', payload: { type: 'status', protocol: 2, uptime_ms: 1000 } }))
-    expect(browser.frames.at(-1)).toMatchObject({ online: true, via: 'ble' })
+    expect(browser.frames.filter(f => f.op === 'presence').at(-1)).toMatchObject({ online: true, via: 'ble' })
     await room.webSocketMessage(board as unknown as WebSocket, JSON.stringify({ type: 'status', protocol: 2, uptime_ms: 1001 }))
-    expect(browser.frames.at(-1)).toMatchObject({ online: true, via: 'wifi' })
+    expect(browser.frames.filter(f => f.op === 'presence').at(-1)).toMatchObject({ online: true, via: 'wifi' })
     await chat(browser, 'gateway.off')
     expect(browser.frames.at(-1)).toMatchObject({ online: true, via: 'wifi' })
     board.readyState = 3
@@ -95,11 +95,11 @@ describe('shared voice room', () => {
     expect(browser.frames.at(-1)).toMatchObject({ online: false, via: null })
   })
   it('synchronizes board replies to the whole group and accepts retried commits once', async () => {
-    const first = socket(), later = socket('browser','sixth',4), board = socket('board')
+    const first = socket(), later = socket('browser','sixth'), board = socket('board')
     await upload(board, 'reply')
     await chat(board, 'commit', { id: 'reply' })
     expect((store.values.get('messages') as unknown[])).toHaveLength(1)
-    expect(first.frames.find(f => f.op === 'message')).toMatchObject({ message: { sender: 'board', slot: -1 } })
+    expect(first.frames.find(f => f.op === 'message')).toMatchObject({ message: { sender: 'board' } })
     expect(later.frames.find(f => f.op === 'message')).toMatchObject({ message: { sender: 'board' } })
   })
   it('remembers a committed board recording after history eviction and a lost acknowledgement', async () => {
@@ -117,8 +117,8 @@ describe('shared voice room', () => {
     await chat(board, 'ping')
     expect(board.frames.find(f => f.op === 'pong')).toMatchObject({ via: 'wifi' })
     await room.webSocketMessage(bridge as unknown as WebSocket, JSON.stringify({ type: 'gateway', payload: { type: 'status', protocol: 2, uptime_ms: 100 } }))
-    await room.webSocketMessage(bridge as unknown as WebSocket, JSON.stringify({ type: 'gateway', payload: { type: 'chat', protocol: 1, op: 'ping', req: 'probe' } }))
-    expect(bridge.frames.find(f => f.type === 'bridge')).toMatchObject({ payload: { op: 'pong', via: 'ble', req: 'probe' } })
+    await room.webSocketMessage(bridge as unknown as WebSocket, JSON.stringify({ type: 'gateway', payload: { type: 'chat', protocol: CHAT_VERSION, op: 'ping', req: 'probe' } }))
+    expect(bridge.frames.find(f => f.type === 'bridge' && (f.payload as Record<string, unknown>).op === 'pong')).toMatchObject({ payload: { op: 'pong', via: 'ble', req: 'probe' } })
   })
   it('keeps a slow upload while chunks progress and expires it only after ten idle minutes', async () => {
     const time = vi.spyOn(Date, 'now').mockReturnValue(1_000_000), board = socket('board')
@@ -136,7 +136,37 @@ describe('shared voice room', () => {
   it('returns a failed upload reply through the Bluetooth gateway for retry', async () => {
     const bridge = socket()
     await room.webSocketMessage(bridge as unknown as WebSocket, JSON.stringify({ type: 'gateway', payload: { type: 'status', protocol: 2, uptime_ms: 100 } }))
-    await room.webSocketMessage(bridge as unknown as WebSocket, JSON.stringify({ type: 'gateway', payload: { type: 'chat', protocol: 1, op: 'commit', req: 'commit-try', id: 'not-yet-complete' } }))
+    await room.webSocketMessage(bridge as unknown as WebSocket, JSON.stringify({ type: 'gateway', payload: { type: 'chat', protocol: CHAT_VERSION, op: 'commit', req: 'commit-try', id: 'not-yet-complete' } }))
     expect(bridge.frames.at(-1)).toMatchObject({ type: 'bridge', payload: { op: 'error', req: 'commit-try' } })
+  })
+  it('stores the webpage realtime toggle and forwards board audio only to browsers', async () => {
+    const browser = socket(), board = socket('board')
+    await room.webSocketMessage(board as unknown as WebSocket, JSON.stringify({ type: 'status', protocol: 2, uptime_ms: 100 }))
+    await chat(browser, 'realtime.set', { enabled: true })
+    expect(store.values.get('realtime_enabled')).toBe(true)
+    expect(board.frames.at(-1)).toMatchObject({ type: 'chat', op: 'settings', realtime_enabled: true })
+    await chat(board, 'realtime.start')
+    expect(browser.frames.at(-1)).toMatchObject({ op: 'realtime.start' })
+    await chat(board, 'realtime.chunk', { data: btoa('pcm') })
+    expect(browser.frames.at(-1)).toMatchObject({ op: 'realtime.chunk', data: btoa('pcm') })
+    expect(board.frames.some(f => f.op === 'realtime.chunk')).toBe(false)
+    await chat(board, 'realtime.stop')
+    expect(browser.frames.at(-1)).toMatchObject({ op: 'realtime.stop' })
+  })
+  it('sends the board the current unique online browser count', async () => {
+    store.values.set('clients', [
+      { id: 'first', name: 'first' }, { id: 'second', name: 'second' }, { id: 'third', name: 'third' },
+    ])
+    const board = socket('board'), first = socket('browser', 'first'), second = socket('browser', 'second'), duplicate = socket('browser', 'first')
+    await room.webSocketMessage(board as unknown as WebSocket, JSON.stringify({ type: 'status', protocol: 2, uptime_ms: 100 }))
+    await chat(first, 'ping')
+    expect(board.frames.filter(f => f.op === 'audience').at(-1)).toMatchObject({ online_clients: 2 })
+    duplicate.readyState = 3
+    await chat(second, 'ping')
+    expect(board.frames.filter(f => f.op === 'audience').at(-1)).toMatchObject({ online_clients: 2 })
+    first.readyState = 3
+    second.readyState = 3
+    await chat(socket('browser', 'third'), 'ping')
+    expect(board.frames.filter(f => f.op === 'audience').at(-1)).toMatchObject({ online_clients: 1 })
   })
 })

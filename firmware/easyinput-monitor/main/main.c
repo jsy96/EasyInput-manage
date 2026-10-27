@@ -713,8 +713,12 @@ static void emit_status(void)
     cJSON_AddNumberToObject(voice, "pending", voice_state.pending);
     cJSON_AddBoolToObject(voice, "sending", voice_state.sending);
     cJSON_AddBoolToObject(voice, "storage_error", voice_state.storage_error);
-    cJSON_AddBoolToObject(voice, "s8_enabled", voice_state.s8_enabled);
     cJSON_AddBoolToObject(voice, "setup_active", network_setup_active());
+    if (voice_state.alarm_minute >= 0) cJSON_AddNumberToObject(voice, "alarm_minute", voice_state.alarm_minute);
+    else cJSON_AddNullToObject(voice, "alarm_minute");
+    cJSON_AddNumberToObject(voice, "countdown_seconds", voice_state.countdown_seconds);
+    cJSON_AddBoolToObject(voice, "realtime_active", voice_state.realtime_active);
+    cJSON_AddBoolToObject(voice, "realtime_enabled", voice_state.realtime_enabled);
     cJSON *audio = cJSON_AddObjectToObject(root, "audio");
     cJSON_AddBoolToObject(audio, "ready", audio_state.ready && light_state.ready);
     cJSON_AddNumberToObject(audio, "sample_rate_hz", AUDIO_SAMPLE_RATE);

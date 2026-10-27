@@ -21,10 +21,13 @@ describe('board protocol', () => {
       speaker: { state: 'playing', volume: 10 },
     }
     expect(parseBoardMessage(JSON.stringify(audioStatus))).toEqual(audioStatus)
-    const voice = { pending: 8, sending: false, storage_error: false, s8_enabled: false, setup_active: true }
+  const voice = {
+    pending: 8, sending: false, storage_error: false, setup_active: true,
+    alarm_minute: 750, countdown_seconds: 0, realtime_active: false, realtime_enabled: true,
+  }
     expect(parseBoardMessage(JSON.stringify({ ...audioStatus, voice }))).toEqual({ ...audioStatus, voice })
     expect(parseBoardMessage(JSON.stringify({ ...audioStatus, voice: { ...voice, sending: true, pending: 1 } }))).not.toBeNull()
-    for (const value of [null, { ...voice, pending: -1 }, { ...voice, pending: 10 }, { ...voice, s8_enabled: 'off' }]) {
+  for (const value of [null, { ...voice, pending: -1 }, { ...voice, pending: 10 }, { ...voice, realtime_enabled: 'off' }, { ...voice, alarm_minute: 1440 }]) {
       expect(parseBoardMessage(JSON.stringify({ ...audioStatus, voice: value }))).toBeNull()
     }
     expect(parseBoardMessage(JSON.stringify({ ...audioStatus, audio: { ready: false, sample_rate_hz: 16000 }, microphone: { state: 'unavailable', error: 'ESP_ERR_TIMEOUT' } }))).not.toBeNull()

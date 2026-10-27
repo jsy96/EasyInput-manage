@@ -1,8 +1,8 @@
 {
   "name": "easyinput-studio",
-  "version": "0.3.0",
+  "version": "0.4.1",
   "private": true,
-  "description": "Browser PWA monitor and firmware manager for the EasyInput V2 development board",
+  "description": "Browser voice timeline and firmware manager for the EasyInput V2 development board",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build",

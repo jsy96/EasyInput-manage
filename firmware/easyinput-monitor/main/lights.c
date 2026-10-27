@@ -151,7 +151,7 @@ esp_err_t lights_init(void)
         return state.error;
     }
     for (int index = 0; index < LIGHT_PIXEL_COUNT; index++) {
-        state.pixels[index] = (light_pixel_t){.rgb = 0xffffff, .brightness = 10, .on = false};
+        state.pixels[index] = (light_pixel_t){.rgb = 0xffffff, .brightness = 1, .on = false};
     }
     const rmt_copy_encoder_config_t encoder_config = {};
     esp_err_t result = rmt_new_copy_encoder(&encoder_config, &pixel_encoder);

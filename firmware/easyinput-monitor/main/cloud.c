@@ -21,6 +21,7 @@
 #define CLOUD_COMMAND_MAX 2048
 #define CLOUD_EVENT_QUEUE_DEPTH 16
 #define CLOUD_RECONNECT_MS 5000
+#define CHAT_PROTOCOL 2
 #define LEGACY_GATEWAY "wss://easyinput-gateway.jsy96.workers.dev"
 #define CURRENT_GATEWAY "wss://easy.leige.online"
 
@@ -114,7 +115,8 @@ static void cloud_message(const char *payload, size_t length)
     const bool allowed = cJSON_IsNumber(protocol) && protocol->valueint == 2 && cJSON_IsString(type) &&
         strcmp(type->valuestring, "command") == 0 && cJSON_IsString(action) &&
         (strcmp(action->valuestring, "hello.get") == 0 || strcmp(action->valuestring, "status.get") == 0);
-    const bool chat = command && cJSON_IsString(type) && strcmp(type->valuestring, "chat") == 0 && cJSON_IsNumber(protocol) && protocol->valueint == 1;
+    const bool chat = command && cJSON_IsString(type) && strcmp(type->valuestring, "chat") == 0 &&
+        cJSON_IsNumber(protocol) && protocol->valueint == CHAT_PROTOCOL;
     if (allowed || chat) {
         extern bool cloud_monitor_queue_command(const char *line);
         (void)cloud_monitor_queue_command(line);

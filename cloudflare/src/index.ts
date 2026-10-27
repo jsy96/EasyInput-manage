@@ -1,5 +1,5 @@
 import { DeviceRoom } from './device-room'
-import { synthesize } from './tts'
+import { CHAT_VERSION } from '../../src/shared/chat'
 export interface Env {
   DEVICE_ROOMS: DurableObjectNamespace
   ALLOWED_ORIGINS: string
@@ -16,20 +16,8 @@ export default {
     const origin = allowedOrigin(request, env)
     const cors = { 'Access-Control-Allow-Origin': origin ? request.headers.get('Origin')! : 'null', 'Access-Control-Allow-Headers': 'Content-Type', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS', Vary: 'Origin' }
     if (request.method === 'OPTIONS') return new Response(null, { status: origin ? 204 : 403, headers: cors })
-    if (url.pathname === '/health') return Response.json({ ok: true, service: 'easyinput-gateway', chat: 1 })
+    if (url.pathname === '/health') return Response.json({ ok: true, service: 'easyinput-gateway', chat: CHAT_VERSION })
     if (url.pathname === '/session' && origin) return Response.json({ device: env.PUBLIC_DEVICE_ID ?? 'easyinput-v2', gateway: url.origin.replace('https:', 'wss:') }, { headers: cors })
-    if (url.pathname === '/tts' && request.method === 'POST') {
-      if (!origin) return new Response('Origin not allowed', { status: 403 })
-      try {
-        if (Number(request.headers.get('content-length')) > 4096) throw new Error('文字过长')
-        const body = await request.text()
-        if (body.length > 4096) throw new Error('文字过长')
-        const text = (JSON.parse(body) as { text?: unknown }).text
-        if (typeof text !== 'string' || !text.trim() || text.length > 300) throw new Error('请输入 1～300 字的文字')
-        const audio = await synthesize(text)
-        return new Response(audio, { headers: { ...cors, 'Content-Type': 'audio/mpeg', 'Cache-Control': 'no-store' } })
-      } catch (error) { return Response.json({ error: error instanceof Error ? error.message : '文字转语音失败' }, { status: 503, headers: cors }) }
-    }
     if (url.pathname !== '/ws' || request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') return new Response('EasyInput gateway', { status: 200 })
     const device = url.searchParams.get('device')?.trim()
     const role = url.searchParams.get('role')
