@@ -54,6 +54,12 @@ PROMPT_VOICE_OVERRIDES = {
     index: ("zh-CN-XiaoxiaoNeural", "+20%")
     for index in range(VOLUME_FIRST_INDEX, len(TEXTS))
 }
+TEXTS.extend([
+    "妈妈高压", "妈妈低压", "爸爸高压", "爸爸低压", "爸爸血糖", "妈妈血糖",
+    "上次记录", "暂无上次记录", "请旋转旋钮记录本次测量值，当前值",
+    "点", "已记录", "本次记录已取消", "测量值保存失败，请重试",
+    "已切换为精细调整", "已切换为快速调整",
+])
 
 
 def load_existing(path: Path) -> list[bytes]:

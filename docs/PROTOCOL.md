@@ -1,6 +1,6 @@
 # EasyInput Studio board protocol
 
-Studio and `firmware/easyinput-monitor` exchange UTF-8 JSON control and telemetry frames over the board's native USB Serial/JTAG interface, encrypted BLE GATT, or a local-network WebSocket. Realtime S7 audio additionally uses binary PCM16 frames over the board's direct cloud WSS. All monitoring connections can remain open simultaneously. JSON frames are newline delimited on USB/BLE. The firmware sends a `hello` frame at startup or when requested, a `status` frame every second, and an `event` frame for each debounced input transition or encoder detent.
+Studio and `firmware/easyinput-monitor` exchange UTF-8 JSON control and telemetry frames over the board's native USB Serial/JTAG interface, encrypted BLE GATT, or a local-network WebSocket. Webpage-controlled realtime audio additionally uses binary PCM16 frames over the board's direct cloud WSS. All monitoring connections can remain open simultaneously. JSON frames are newline delimited on USB/BLE. The firmware sends a `hello` frame at startup or when requested, a `status` frame every second, and an `event` frame for each debounced input transition or encoder detent.
 
 All frames use `protocol: 2`. The desktop ignores older, unknown, or malformed versions. Credentials are accepted only in the `wifi.configure` command and are never included in board status, result frames, or firmware logs.
 
@@ -192,7 +192,7 @@ Realtime listening uses transient frames:
 {"type":"chat","protocol":2,"op":"realtime.stop"}
 ```
 
-`realtime.set` comes from a browser and persists only a small room flag. The board sends `realtime.start` synchronously on the same ordered WebSocket, then immediately starts binary audio. The matching acknowledgement is retained for diagnostics but does not block the audio stream. Realtime audio uses binary WebSocket messages, not JSON or Base64:
+`realtime.set` comes from a browser and directly requests capture on/off; it is no longer permission for a physical key. The boolean `enabled` field is required. Opening requires a fresh direct Wi-Fi board route. The room persists a small requested-state flag and start timestamp, broadcasts settings to browsers and sends `settings.realtime_enabled` to the board. The board immediately starts/stops capture on that setting; S7/S8 do not control it. The board sends `realtime.start` synchronously on the same ordered WebSocket, then immediately starts binary audio. Its matching acknowledgement uses an independent request ID so timeline replies cannot interfere. Realtime audio uses binary WebSocket messages, not JSON or Base64:
 
 ```text
 bytes 0..3   "EIV2"
@@ -203,7 +203,7 @@ bytes 8..11  uint32 little-endian sequence
 bytes 12..   exactly 320 mono samples, 640 bytes
 ```
 
-Each packet is 652 bytes and represents 20 ms at 16 kHz. Only an authenticated board may send binary packets, and the Worker forwards them only to browsers while the room realtime session is active. Realtime packets are not stored and do not enter the timeline. Turning the room flag off, starting another session, or closing the board transport stops the stream.
+Each packet is 652 bytes and represents 20 ms at 16 kHz. Only an authenticated board may send binary packets, and the Worker forwards them only to browsers while the room realtime session is active. Realtime packets are not stored and do not enter the timeline. Turning the room flag off, direct board disconnection, stale Wi-Fi presence, or failure to start within eight seconds clears both requested and active state. Heartbeats repair lost start/stop notifications, including `voice.realtime_active` in full telemetry; telemetry never enables a session without a webpage request. S7/S8 and measurement knob actions leave capture running.
 
 This PCM16 realtime phase requires the board's direct Wi-Fi cloud connection. The browser Bluetooth gateway continues to carry monitoring and timeline frames, but does not carry realtime audio.
 
@@ -237,6 +237,24 @@ Firmware 0.2.3 initializes SNTP with `ntp.aliyun.com` and starts it when DHCP su
 
 Status production, BLE transmit and cloud-helper stacks remain on PSRAM. Tasks that may access flash while caches are disabled, including the voice outbox, USB firmware operations and phone setup, remain on internal RAM. The input scanner and audio I/O also remain internal. Full telemetry stays on USB/BLE; the cloud WebSocket receives the lightweight presence status and chat frames.
 
-Knob rotation changes the current alarm or countdown draft only while S3 alarm setup or S4 countdown setup is active. In every other mode, each detent changes the runtime speaker volume by 10% within 10–100% and the board announces only the corresponding Chinese number. Volume feedback is deferred while the microphone is recording or realtime listening; it plays after that audio mode ends. A 3-second hold starts or extends the 120-second WPA2 SoftAP window and suppresses short press. Prompt clips are generated at build time, packed into `prompts.bin`, and never become chat messages.
+Knob rotation adjusts the active S3 alarm, S4 countdown, or S7/S8 measurement draft. Outside those editors each detent changes runtime speaker volume by 10% within 10–100%; volume feedback is deferred while recording. A three-second hold cancels an active measurement; outside measurement editing it starts or extends the 120-second WPA2 SoftAP window and suppresses short press. Prompt clips are generated at build time, packed into `prompts.bin`, and never become chat messages.
+
+S7 cycles mother systolic, mother diastolic, father systolic, father diastolic. S8 cycles father glucose, mother glucose. Every selection announces the last saved value (or no previous record) before editing; a new selection discards the unsaved draft. Pressure uses integer bounds 80–220 / 50–120 and defaults 130 / 70, with coarse/fine steps 10 / 1. Glucose uses integer tenths internally, bounds 30–200 (3.0–20.0), default 75 (7.5), and steps 10 / 1 (1.0 / 0.1). A short knob press toggles the step. After at least one rotation, two seconds without further rotation saves once; holding the knob pauses saving so a three-second hold can cancel safely. The `health` NVS namespace stores a versioned `history_v1` blob containing all six latest values and a FIFO of up to 64 pending measurements. A save persists the latest value and pending record together; failed writes or a full queue leave the previous value intact and report save failure. Legacy six-key values are imported only as latest values; no past measurement is invented.
 
 During physical provisioning only, the board exposes `GET /`, `GET /setup-status`, and `POST /setup` at its AP address, http://192.168.4.1. POST JSON contains `ssid`, `password`, and optional `code` (initial cloud pairing code); `X-Setup-Token` matches the fresh page token. The saved station and cloud config survive reboot. Credentials are not in telemetry, chat, responses, or browser storage. The AP closes automatically; this does not erase config or recordings. Phone provisioning does not require Web Bluetooth.
+
+
+### Measurement history synchronization and CSV
+
+After each successful S7/S8 save the board queues a distinct measurement, including when its numeric value matches a prior save. Pending records survive reboot. The voice task sends `health.put` independently of audio transfer request IDs and retries after 12 seconds until a matching `health.ack` has been persisted locally. Direct Wi-Fi and the selected Bluetooth gateway use the same transport path. The board removes only the acknowledged queue head; a lost acknowledgement is safe to retry.
+
+```json
+{"type":"chat","protocol":2,"op":"health.put","req":"health-1","record":{"id":"0123456789abcdef0123456789abcdef","kind":"father_glucose","value":75,"measuredAt":null,"uptimeMs":12345}}
+{"type":"chat","protocol":2,"op":"health.ack","req":"health-1","id":"0123456789abcdef0123456789abcdef"}
+```
+
+`id` is 16 random bytes encoded as 32 lowercase hex characters. `kind` is one of `mother_high`, `mother_low`, `father_high`, `father_low`, `father_glucose`, `mother_glucose`. Glucose is an integer in tenths (75 = 7.5 mmol/L); pressure is an integer in mmHg. The existing editor bounds apply. `measuredAt` is Unix milliseconds or null when the board clock is not calibrated; `uptimeMs` is captured at save. Only board frames, including selected gateway frames, can write measurements. Browsers cannot write them through `health.put`.
+
+The room atomically stores each unique ID, a monotonically increasing `sequence`, and server `receivedAt`. It does not prune measurement history with the 100-message voice timeline or the voice-history clear operation. Duplicate IDs acknowledge the original stored measurement without appending another row. Browsers request `health.list` with `after` (default 0) and optional `through`; the response contains up to 100 `records`, `next`, `through` and `complete`. The first page fixes `through` to the current record count; subsequent pages reuse it so incoming measurements do not change an export in progress. Export includes every sequence up to that bound.
+
+`voice.health_pending` in full board status and top-level `health_pending` in the compact Wi-Fi heartbeat report the pending measurement count (0–64). Browser snapshots and presence expose the selected fresh route's count as `healthPending` (null when unknown or offline). The device page exports all synchronized history to a UTF-8 BOM CSV with measurement ID, UTC measurement time, clock status, person, metric, value, unit, UTC receive time and uptime. Unknown measurement time remains blank and is labeled; receipt time is never substituted as measurement time. Upgrading from legacy firmware cannot recover previously overwritten measurements. Gateway and firmware updates are both required for history synchronization.

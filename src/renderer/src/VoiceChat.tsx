@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
-import { Bell, Keyboard, Lightbulb, Mic, Radio, Square, Timer, Volume2 } from 'lucide-react'
+import { Bell, Download, Keyboard, Lightbulb, Mic, Play, Radio, Square, Timer, Volume2 } from 'lucide-react'
 import type { ChatMessage, RoomState } from '@shared/chat'
+import { sortMessages } from '@shared/chat'
 import type { BoardLights, BoardStatus } from '@shared/protocol'
 import type { ChatConnection } from './services/chat'
 import { LiveVoicePlayer } from './services/live-audio'
-import { VoiceRecorder, voiceWav } from './services/voice'
+import { VoiceRecorder, VoiceSequencePlayer, voiceWav } from './services/voice'
+import { downloadFile, voiceZip } from './services/downloads'
 const BOARD_LIGHTS = [
   { label: '灯 1', hint: '未读慢闪 · 批量已读确认常亮' },
   { label: '灯 2', hint: '闹钟到点常亮 1 分钟' },
@@ -17,29 +19,82 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
   const [sending, setSending] = useState(false), [progress, setProgress] = useState(0), [error, setError] = useState('')
   const [draft, setDraft] = useState<Uint8Array | null>(null)
   const [playing, setPlaying] = useState(false)
+  const [batchDownloading, setBatchDownloading] = useState(false), [batchProgress, setBatchProgress] = useState(0)
+  const [sequencePlaying, setSequencePlaying] = useState(false), [sequenceProgress, setSequenceProgress] = useState(0)
+  const sequencePlayer = useRef<VoiceSequencePlayer | null>(null)
+  const sequenceRun = useRef(0)
+  const audioCache = useRef(new Map<string, Uint8Array>())
   const [realtimeBusy, setRealtimeBusy] = useState(false)
   const players = useRef<Record<string, HTMLAudioElement | null>>({})
   const [loading, setLoading] = useState(''), [urls, setUrls] = useState<Record<string, string>>({})
   const recorder = useRef<VoiceRecorder | null>(null), alive = useRef(true), urlsRef = useRef<Record<string, string>>({})
   const livePlayer = useRef<LiveVoicePlayer | null>(null)
-  const messages = [...room.messages].sort((a, b) => b.created - a.created)
+  const messages = sortMessages(room.messages)
   const unread = room.messages.filter((message) => !message.read).length
   const alarmMinute = board?.voice?.alarm_minute
   const countdownSeconds = board?.voice?.countdown_seconds ?? 0
-  useEffect(() => { busyChanged(recording || sending || !!loading || playing); return () => busyChanged(false) }, [recording, sending, loading, playing, busyChanged])
+  useEffect(() => { busyChanged(recording || sending || !!loading || playing || batchDownloading || sequencePlaying); return () => busyChanged(false) }, [recording, sending, loading, playing, batchDownloading, sequencePlaying, busyChanged])
   useEffect(() => {
     alive.current = true
     return () => {
       alive.current = false
       recorder.current?.dispose()
       livePlayer.current?.dispose()
+      sequenceRun.current++
+      sequencePlayer.current?.stop()
       Object.values(urlsRef.current).forEach(URL.revokeObjectURL)
     }
   }, [])
   useEffect(() => {
+    const ids = new Set(room.messages.map(m => m.id))
+    for (const id of audioCache.current.keys()) if (!ids.has(id)) audioCache.current.delete(id)
+  }, [room.messages])
+  async function audioBytes(message: ChatMessage): Promise<Uint8Array> {
+    const cached = audioCache.current.get(message.id)
+    if (cached) return cached
+    if (!connection) throw new Error('语音服务未连接')
+    const bytes = await connection.download(message)
+    if (alive.current) audioCache.current.set(message.id, bytes)
+    return bytes
+  }
+  function stopSequence(): void {
+    sequenceRun.current++
+    sequencePlayer.current?.stop()
+    setSequencePlaying(false); setSequenceProgress(0)
+  }
+  async function playAll(): Promise<void> {
+    const snapshot = [...messages], run = ++sequenceRun.current
+    if (!snapshot.length) return
+    Object.values(players.current).forEach(player => player?.pause())
+    setSequencePlaying(true); setError('')
+    const player = sequencePlayer.current ??= new VoiceSequencePlayer()
+    try { await player.play(snapshot, audioBytes, (_message, index) => { if (alive.current) setSequenceProgress(index + 1) }) }
+    catch (e) { if (alive.current && run === sequenceRun.current) setError(e instanceof Error ? e.message : '连续播放失败') }
+    finally { if (alive.current && run === sequenceRun.current) { setSequencePlaying(false); setSequenceProgress(0) } }
+  }
+  async function downloadAll(): Promise<void> {
+    const snapshot = [...messages]
+    if (!snapshot.length || batchDownloading) return
+    setBatchDownloading(true); setBatchProgress(0); setError('')
+    try {
+      const files: Array<{ name: string; blob: Blob }> = []
+      for (const [index, m] of snapshot.entries()) {
+        const bytes = await audioBytes(m)
+        if (!alive.current) return
+        files.push({ name: `${String(index + 1).padStart(3, '0')}_${new Date(m.created).toISOString().replaceAll(':', '-')}_${m.sender === 'board' ? '开发板' : '网页'}_${m.id}.wav`, blob: voiceWav(bytes) })
+        setBatchProgress(index + 1)
+      }
+      const zip = await voiceZip(files)
+      if (alive.current) downloadFile(zip, `全部语音-${new Date().toISOString().slice(0, 10)}.zip`)
+    } catch (e) { if (alive.current) setError(e instanceof Error ? e.message : '语音打包失败，请重试') }
+    finally { if (alive.current) setBatchDownloading(false) }
+  }
+  useEffect(() => {
     if (!connection) return
     return connection.onRealtime((event) => {
       if (event.type === 'start') {
+        stopSequence()
+        Object.values(players.current).forEach(player => player?.pause())
         const player = livePlayer.current ??= new LiveVoicePlayer()
         void player.start()
       } else if (event.type === 'packet') {
@@ -70,7 +125,7 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
     if (!connection || loading) return
     setLoading(m.id); setError('')
     try {
-      const bytes = await connection.download(m)
+      const bytes = await audioBytes(m)
       if (!alive.current) return
       const url = URL.createObjectURL(voiceWav(bytes)); urlsRef.current[m.id] = url; setUrls({ ...urlsRef.current })
     } catch (e) { setError(e instanceof Error ? e.message : '语音加载失败') }
@@ -89,22 +144,26 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
       }
       await connection.setRealtimeEnabled(enabled)
     }
-    catch (e) { setError(e instanceof Error ? e.message : '实时监听设置失败') }
+    catch (e) { if (!room.realtimeEnabled) livePlayer.current?.stop(); setError(e instanceof Error ? e.message : '实时麦克风设置失败') }
     finally { if (alive.current) setRealtimeBusy(false) }
   }
-  const busy = recording || sending || disabled
+  const busy = recording || sending || disabled || batchDownloading || sequencePlaying
   return <article className="panel voice-page">
     <div className="voice-main">
       <div className="panel-heading voice-heading">
         <div><span className="section-kicker">SHARED VOICE TIMELINE</span><h3>所有声音，一条时间线</h3></div>
         <div className="voice-heading-stats"><span className={unread ? 'unread-pill' : 'status-chip'}>{unread ? `${unread} 条未读` : '全部已读'}</span><span className="status-chip">{room.messages.length} 条语音</span></div>
       </div>
+      <div className="voice-batch-actions">
+        <button className="button button-subtle" disabled={!room.connected || busy || !!loading || !messages.length} onClick={() => void downloadAll()}><Download size={15} />{batchDownloading ? `正在打包 ${batchProgress} 条` : '下载全部语音 ZIP'}</button>
+        <button className="button button-subtle" disabled={!sequencePlaying && (!room.connected || busy || !!loading || !messages.length || room.realtimeEnabled)} onClick={() => sequencePlaying ? stopSequence() : void playAll()}>{sequencePlaying ? <Square size={15} /> : <Play size={15} />}{sequencePlaying ? `停止播放 · 第 ${sequenceProgress} 条` : '顺序播放全部'}</button>
+      </div>
       {board?.voice && <p className="chat-board-state" role="status">{alarmMinute === null || alarmMinute === undefined ? '未设置闹钟' : `闹钟 ${String(Math.floor(alarmMinute / 60)).padStart(2, '0')}:${String(alarmMinute % 60).padStart(2, '0')}`} · {countdownSeconds ? `倒计时 ${Math.ceil(countdownSeconds / 60)} 分钟` : '无倒计时'}{board.voice.pending > 0 ? ` · ${board.voice.sending ? '发送中' : '待发送'} ${board.voice.pending} 条` : ''}{board.voice.storage_error ? ' · 录音存储异常' : ''}</p>}
       <div className="chat-messages" aria-live="polite">
         {!messages.length && <div className="empty-state"><Mic size={30} /><strong>还没有语音</strong><p>网页或开发板 S5 录下的语音<br />都会进入同一条时间线</p></div>}
         {messages.map(m => <div key={m.id} className={`chat-message ${m.sender === room.self?.id ? 'chat-mine' : ''}`}>
           <div className="chat-message-meta"><strong>{m.sender === 'board' ? '开发板' : m.name}</strong><span>{m.sender === 'board' ? '录音' : '网页'}</span><time>{new Date(m.created).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</time></div>
-          {urls[m.id] ? <audio controls autoPlay preload="metadata" ref={element => { players.current[m.id] = element }} onPlay={() => { Object.entries(players.current).forEach(([id, player]) => { if (id !== m.id) player?.pause() }); setPlaying(true) }} onPause={() => setPlaying(false)} onEnded={() => setPlaying(false)} src={urls[m.id]} aria-label={`${m.name}的语音留言`} /> : <button className="button button-subtle chat-play" disabled={!room.connected || !!loading || disabled} onClick={() => void load(m)}><Volume2 size={16} />{loading === m.id ? '加载语音…' : '播放语音'}<span>{Math.ceil(m.samples / 8000)}″</span></button>}
+          {urls[m.id] ? <audio controls autoPlay preload="metadata" ref={element => { players.current[m.id] = element }} onPlay={() => { stopSequence(); Object.entries(players.current).forEach(([id, player]) => { if (id !== m.id) player?.pause() }); setPlaying(true) }} onPause={() => setPlaying(false)} onEnded={() => setPlaying(false)} src={urls[m.id]} aria-label={`${m.name}的语音留言`} /> : <button className="button button-subtle chat-play" disabled={!room.connected || !!loading || busy} onClick={() => void load(m)}><Volume2 size={16} />{loading === m.id ? '加载语音…' : '播放语音'}<span>{Math.ceil(m.samples / 8000)}″</span></button>}
           <small className={m.read ? 'is-live' : 'is-muted'}>{m.read ? '开发板已播放' : '开发板未读'}</small>
         </div>)}
       </div>
@@ -126,9 +185,9 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
         </ul>
       </section>
       <section className={`realtime-card ${room.realtimeActive ? 'is-active' : ''}`}>
-        <div className="side-title"><span><Radio size={17} />实时麦克风</span><i className={room.realtimeActive ? 'live-dot active' : 'live-dot'} /></div>
-        <p>{room.realtimeActive ? '开发板正在采集，声音仅实时播放，不会保存；按开发板 S8 可结束。' : room.realtimeEnabled ? '房间已允许开发板按 S7 开始采集；当前没有采集。再次点击可关闭权限。' : '允许后，按开发板 S7 可实时收听麦克风，按 S8 结束。'}</p>
-        <button className={`button ${room.realtimeEnabled ? 'button-primary' : 'button-subtle'} full-button`} disabled={!room.connected || realtimeBusy || disabled} onClick={() => void toggleRealtime()}><Radio size={15} />{room.realtimeEnabled ? '关闭实时监听权限' : '允许实时监听'}</button>
+        <div className="side-title"><span><Radio size={17} />实时监听状态</span><span>{room.realtimeActive ? '监听中' : room.realtimeEnabled ? '开启中' : '关闭'}<i className={room.realtimeActive ? 'live-dot active' : 'live-dot'} /></span></div>
+        <p>{room.realtimeActive ? '开发板正在采集，声音仅实时播放，不会保存。点击下方按钮关闭。' : room.realtimeEnabled ? '正在打开开发板实时麦克风…可点击下方按钮关闭。' : '点击下方按钮即可收听开发板麦克风；开关由网页控制，需要开发板 Wi-Fi 直连在线。'}</p>
+        <button className={`button ${room.realtimeEnabled ? 'button-primary' : 'button-subtle'} full-button`} disabled={!room.connected || realtimeBusy || disabled || (!room.realtimeEnabled && (busy || !room.online || room.via !== 'wifi'))} onClick={() => void toggleRealtime()}><Radio size={15} />{room.realtimeEnabled ? '关闭实时监听' : '打开实时监听'}</button>
       </section>
       <section className="key-map">
         <div className="side-title"><span><Keyboard size={17} />开发板按键</span></div>
@@ -138,8 +197,9 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
           <div><dt>S3</dt><dd><Bell size={13} />设置每日闹钟，长按取消</dd></div>
           <div><dt>S4</dt><dd><Timer size={13} />设置倒计时</dd></div>
           <div><dt>S5 / S6</dt><dd>录音 / 发送</dd></div>
-          <div><dt>S7</dt><dd>实时麦克风；按 S8 结束并语音提示</dd></div>
-          <div><dt>S8</dt><dd>播报联网状态和电脑端在线人数；实时中按下停止监听</dd></div>
+          <div><dt>S7</dt><dd>记录血压：妈妈高压 → 妈妈低压 → 爸爸高压 → 爸爸低压；先播报上次值。高压 80～220，低压 50～120</dd></div>
+          <div><dt>S8</dt><dd>记录血糖：爸爸 → 妈妈；先播报上次值，范围 3.0～20.0</dd></div>
+          <div><dt>旋钮</dt><dd>记录时血压每格 ±10，血糖每格 ±1；短按切换精细调整（±1 / ±0.1）。停止旋转 2 秒自动保存，长按 3 秒取消本次记录</dd></div>
         </dl>
       </section>
     </aside>

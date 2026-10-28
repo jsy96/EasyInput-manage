@@ -82,6 +82,7 @@ size_t voice_prompt_number(int value, int ids[8])
             return length;
         }
         if (remainder < 20) {
+            ids[length++] = PROMPT_DIGIT_1;
             ids[length++] = PROMPT_TEN;
             if (remainder > 10) ids[length++] = PROMPT_DIGIT_0 + remainder - 10;
             return length;

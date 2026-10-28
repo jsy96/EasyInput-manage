@@ -24,6 +24,41 @@ export function voiceWav(bytes: Uint8Array): Blob {
   bytes.forEach((b, i) => v.setInt16(44 + i * 2, decodeMulaw(b), true))
   return new Blob([data], { type: 'audio/wav' })
 }
+
+/** Resume the audio context in the click handler before fetching any clips. */
+export class VoiceSequencePlayer {
+  private generation = 0
+  private context: AudioContext | null = null
+  private source: AudioBufferSourceNode | null = null
+  private ended: (() => void) | null = null
+  stop(): void {
+    this.generation++
+    this.source?.stop(); this.source = null
+    this.ended?.(); this.ended = null
+    if (this.context) void this.context.close().catch(() => undefined)
+    this.context = null
+  }
+  async play<T>(items: T[], load: (item: T) => Promise<Uint8Array>, changed: (item: T, index: number) => void): Promise<void> {
+    this.stop()
+    const generation = this.generation, context = this.context = new AudioContext()
+    try {
+      await context.resume()
+      for (let index = 0; index < items.length; index++) {
+        if (generation !== this.generation) return
+        changed(items[index], index)
+        const bytes = await load(items[index])
+        if (generation !== this.generation) return
+        const buffer = context.createBuffer(1, bytes.length, AUDIO_RATE), pcm = buffer.getChannelData(0)
+        bytes.forEach((byte, i) => { pcm[i] = decodeMulaw(byte) / 32768 })
+        const source = this.source = context.createBufferSource()
+        source.buffer = buffer; source.connect(context.destination)
+        await new Promise<void>((resolve) => { this.ended = resolve; source.onended = () => resolve(); source.start() })
+        this.ended = null; this.source = null
+      }
+    } catch (error) { if (generation === this.generation) throw error }
+    finally { if (generation === this.generation) this.stop() }
+  }
+}
 /** Capture PCM in an AudioWorklet so the twenty-second cutoff does not depend on a foreground tab. */
 export class VoiceRecorder {
   private stream: MediaStream | null = null

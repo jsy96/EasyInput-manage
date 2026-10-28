@@ -27,10 +27,12 @@ export interface RoomState {
   self: ChatClient | null
   realtimeEnabled: boolean
   realtimeActive: boolean
+  healthPending: number | null
 }
 export const emptyRoom: RoomState = {
   online: false, via: null, connected: false, clients: [], messages: [], self: null,
   realtimeEnabled: false, realtimeActive: false,
+  healthPending: null,
 }
 export function sortMessages(messages: ChatMessage[]): ChatMessage[] {
   return [...messages].sort((a, b) => a.created - b.created || a.id.localeCompare(b.id))

@@ -4,6 +4,8 @@ import {
 } from '@shared/chat'
 import type { ChatMessage, RoomState } from '@shared/chat'
 import { emptyRoom } from '@shared/chat'
+import { isHealthRecord } from '@shared/health'
+import type { HealthRecord } from '@shared/health'
 type Frame = Record<string, unknown>
 export type RealtimeEvent =
   | { type: 'start' }
@@ -77,8 +79,9 @@ export class ChatConnection {
         self: v.self as RoomState['self'],
         realtimeEnabled: v.realtimeEnabled === true,
         realtimeActive: v.realtimeActive === true,
+        healthPending: typeof v.healthPending === 'number' ? v.healthPending : null,
       })
-      if (v.op === 'presence') this.update({ online: Boolean(v.online), via: v.via as RoomState['via'], clients: v.clients as RoomState['clients'] })
+      if (v.op === 'presence') this.update({ online: Boolean(v.online), via: v.via as RoomState['via'], clients: v.clients as RoomState['clients'], healthPending: typeof v.healthPending === 'number' ? v.healthPending : null })
       if (v.op === 'settings') this.update({ realtimeEnabled: v.realtime_enabled === true })
       if (v.op === 'realtime.start') { this.update({ realtimeActive: true }); this.emitRealtime({ type: 'start' }) }
       if (v.op === 'realtime.chunk' && typeof v.data === 'string') this.emitRealtime({ type: 'chunk', data: v.data })
@@ -96,7 +99,7 @@ export class ChatConnection {
     socket.onclose = () => {
       if (this.socket !== socket) return
       this.socket = null; if (this.heartbeat) clearInterval(this.heartbeat); this.heartbeat = null
-      this.update({ connected: false, online: false, via: null })
+      this.update({ connected: false, online: false, via: null, healthPending: null })
       for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error('群聊连接中断，请重新发送')) } this.pending.clear()
       if (!this.stopped) this.timer = setTimeout(() => { this.timer = null; this.connect() }, Math.min(30000, 1000 * 2 ** this.retries++))
     }
@@ -143,6 +146,23 @@ export class ChatConnection {
   }
   async setRealtimeEnabled(enabled: boolean): Promise<void> {
     await this.request('realtime.set', { enabled })
+  }
+  async healthHistory(progress?: (count: number) => void): Promise<HealthRecord[]> {
+    const records: HealthRecord[] = []
+    let after = 0, through: number | undefined
+    for (;;) {
+      const page = await this.request('health.list', { after, ...(through === undefined ? {} : { through }) })
+      if (!Array.isArray(page.records) || !page.records.every(isHealthRecord) || !Number.isSafeInteger(page.through) ||
+        Number(page.through) < after || (through !== undefined && page.through !== through) ||
+        !Number.isSafeInteger(page.next) || Number(page.next) < after || Number(page.next) > Number(page.through) ||
+        page.records.length !== Number(page.next) - after || page.records.some((r, i) => r.sequence !== after + i + 1)) throw new Error('测量记录响应异常')
+      through = Number(page.through)
+      records.push(...page.records)
+      progress?.(records.length)
+      if (page.next === through) return records
+      if (Number(page.next) <= after) throw new Error('测量记录下载未能继续')
+      after = Number(page.next)
+    }
   }
   async download(m: ChatMessage): Promise<Uint8Array> {
     const out = new Uint8Array(m.samples)

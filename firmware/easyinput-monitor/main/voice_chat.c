@@ -13,6 +13,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "health_records.h"
 #include "lights.h"
 #include "mbedtls/base64.h"
 #include "network_setup.h"
@@ -84,12 +85,12 @@ typedef enum {
     MODE_PLAYING,
     MODE_REALTIME,
     MODE_COUNTDOWN,
+    MODE_SETTING_HEALTH,
 } ui_mode_t;
 
 typedef enum {
     PROMPT_ACTION_NONE,
     PROMPT_ACTION_START_RECORDING,
-    PROMPT_ACTION_START_REALTIME,
     PROMPT_ACTION_SETTINGS_CONFIRM,
 } prompt_action_t;
 
@@ -115,6 +116,13 @@ static unsigned chunk_index;
 static int index_offset;
 static bool outbox_ready;
 static bool realtime_enabled;
+static bool realtime_active;
+static health_edit_t health_edit;
+static char health_request_id[40];
+static char health_inflight_id[33];
+static int64_t health_retry_at;
+static unsigned next_pressure;
+static unsigned next_glucose;
 static int online_clients;
 static int64_t last_audience_at;
 static bool send_when_saved;
@@ -174,6 +182,8 @@ static int diag_stage;
 static uint32_t realtime_sequence;
 static bool realtime_ready;
 static bool realtime_start_pending;
+static char realtime_start_id[24];
+static int64_t realtime_start_sent_at;
 static int diag_last_key = -1;
 static unsigned diag_last_key_mode;
 
@@ -197,6 +207,30 @@ static cJSON *new_frame(const char *op)
     return value;
 }
 
+static void sync_health(int64_t now)
+{
+    if (now < health_retry_at || !network_fresh(now)) return;
+    health_pending_t record;
+    if (!health_pending_oldest(&record)) return;
+    static const char *const kinds[] = {"mother_high", "mother_low", "father_high", "father_low", "father_glucose", "mother_glucose"};
+    cJSON *frame = new_frame("health.put");
+    if (!frame) return;
+    snprintf(health_request_id, sizeof(health_request_id), "health-%lu", (unsigned long)++sequence);
+    strlcpy(health_inflight_id, record.id, sizeof(health_inflight_id));
+    cJSON_AddStringToObject(frame, "req", health_request_id);
+    cJSON *item = cJSON_AddObjectToObject(frame, "record");
+    cJSON_AddStringToObject(item, "id", record.id);
+    cJSON_AddStringToObject(item, "kind", kinds[record.kind]);
+    cJSON_AddNumberToObject(item, "value", record.value);
+    if (record.measured_at_ms) cJSON_AddNumberToObject(item, "measuredAt", record.measured_at_ms);
+    else cJSON_AddNullToObject(item, "measuredAt");
+    cJSON_AddNumberToObject(item, "uptimeMs", record.uptime_ms);
+    char *line = cJSON_PrintUnformatted(frame);
+    if (line) { send_line(line); free(line); }
+    cJSON_Delete(frame);
+    health_retry_at = now + ACK_TIMEOUT_US;
+}
+
 static void request(cJSON *value)
 {
     if (value == NULL) return;
@@ -214,9 +248,12 @@ static void request(cJSON *value)
 
 static bool request_immediate(cJSON *value)
 {
-    if (value == NULL || send_immediate_line == NULL) return false;
-    snprintf(request_id, sizeof(request_id), "board-%lu", (unsigned long)++sequence);
-    cJSON_AddStringToObject(value, "req", request_id);
+    if (value == NULL || send_immediate_line == NULL) {
+        cJSON_Delete(value);
+        return false;
+    }
+    snprintf(realtime_start_id, sizeof(realtime_start_id), "live-%lu", (unsigned long)++sequence);
+    cJSON_AddStringToObject(value, "req", realtime_start_id);
     char *line = cJSON_PrintUnformatted(value);
     const bool sent = line != NULL && send_immediate_line(line);
     free(line);
@@ -399,15 +436,13 @@ static void send_realtime_stop(void)
 
 static void stop_realtime(void)
 {
-    if (mode != MODE_REALTIME) return;
-    // Exit the mode and report offline first so the browser red dot clears
-    // immediately, then stop the microphone (the only potentially slow step).
-    mode = MODE_IDLE;
+    if (!realtime_active) return;
+    realtime_active = false;
+    realtime_enabled = false;
     portENTER_CRITICAL(&snapshot_lock);
     realtime_ready = false;
     portEXIT_CRITICAL(&snapshot_lock);
     realtime_start_pending = false;
-    request_line[0] = '\0';
     diag_realtime_stops++;
     send_realtime_stop();
     (void)audio_live_stop();
@@ -450,7 +485,7 @@ static void refresh_lights(int64_t now)
     const bool unread = earliest_unread() != NULL;
     const bool recording = mode == MODE_RECORDING;
     const bool sending = uploading() || job == JOB_CACHE || voice_outbox_count() > 0;
-    const bool realtime = mode == MODE_REALTIME;
+    const bool realtime = realtime_active;
     const bool alarm_set = timers_alarm_minute() >= 0;
     const bool alarm_fired = alarm_set && alarm_fired_at_us != 0 &&
         now - alarm_fired_at_us < ALARM_SOLID_US;
@@ -630,11 +665,6 @@ static void begin_recording_with_prompt(void)
     start_prompt(PROMPT_RECORDING, PROMPT_ACTION_START_RECORDING);
 }
 
-static void begin_realtime_with_prompt(void)
-{
-    start_prompt(PROMPT_REALTIME_START, PROMPT_ACTION_START_REALTIME);
-}
-
 static void realtime_sink(const uint8_t *data, size_t length)
 {
     portENTER_CRITICAL(&snapshot_lock);
@@ -680,7 +710,7 @@ static void realtime_sink(const uint8_t *data, size_t length)
 
 static void send_realtime_chunk(const uint8_t *data, size_t length)
 {
-    if (mode != MODE_REALTIME || !realtime_ready || data == NULL || length != REALTIME_FRAME_BYTES) {
+    if (!realtime_active || !realtime_ready || data == NULL || length != REALTIME_FRAME_BYTES) {
         portENTER_CRITICAL(&snapshot_lock);
         diag_realtime_chunks_dropped++;
         portEXIT_CRITICAL(&snapshot_lock);
@@ -776,6 +806,78 @@ static void upload_chunk(void)
     request(value);
 }
 
+static void append_health_value(int *ids, int *length, health_kind_t kind, int value)
+{
+    if (kind >= HEALTH_FATHER_GLUCOSE) {
+        append_number(ids, length, value / 10);
+        append_prompt(ids, length, PROMPT_DECIMAL_POINT);
+        append_number(ids, length, value % 10);
+    } else append_number(ids, length, value);
+}
+
+static void begin_health_record(bool blood_pressure)
+{
+    stop_message_playback();
+    stop_prompt();
+    const health_kind_t kind = blood_pressure ? (health_kind_t)(next_pressure++ % 4) :
+        (health_kind_t)(HEALTH_FATHER_GLUCOSE + next_glucose++ % 2);
+    health_edit_begin(&health_edit, kind);
+    mode = MODE_SETTING_HEALTH;
+    int ids[16], length = 0, previous;
+    append_prompt(ids, &length, PROMPT_MOTHER_HIGH + kind);
+    if (health_record_get(kind, &previous)) {
+        append_prompt(ids, &length, PROMPT_HEALTH_LAST);
+        append_health_value(ids, &length, kind, previous);
+    } else append_prompt(ids, &length, PROMPT_HEALTH_NO_PREVIOUS);
+    append_prompt(ids, &length, PROMPT_HEALTH_INPUT);
+    append_health_value(ids, &length, kind, health_edit.value);
+    start_prompt_sequence(ids, length, PROMPT_ACTION_NONE);
+}
+
+static void commit_health_record(int64_t now)
+{
+    if (!health_edit_save_due(&health_edit, now)) return;
+    const health_kind_t kind = health_edit.kind;
+    const int value = health_edit.value;
+    const bool saved = health_edit_save(&health_edit);
+    mode = MODE_IDLE;
+    int ids[16], length = 0;
+    if (saved) {
+        append_prompt(ids, &length, PROMPT_MOTHER_HIGH + kind);
+        append_health_value(ids, &length, kind, value);
+    }
+    append_prompt(ids, &length, saved ? PROMPT_HEALTH_SAVED : PROMPT_HEALTH_SAVE_FAILED);
+    start_prompt_sequence(ids, length, PROMPT_ACTION_NONE);
+}
+
+static void start_realtime(void)
+{
+    if (realtime_active) return;
+    audio_snapshot_t audio;
+    audio_get_snapshot(&audio);
+    if (audio.recording || prompt_action == PROMPT_ACTION_START_RECORDING ||
+        !cloud_online || !cloud_online() || audio_live_start(realtime_sink) != ESP_OK) {
+        realtime_enabled = false;
+        diag_realtime_failures++;
+        send_realtime_stop();
+        return;
+    }
+    realtime_active = true;
+    realtime_sequence = 0;
+    realtime_stop_pending = false;
+    realtime_start_pending = true;
+    realtime_start_sent_at = esp_timer_get_time();
+    diag_realtime_starts++;
+    if (request_immediate(new_frame("realtime.start"))) {
+        portENTER_CRITICAL(&snapshot_lock);
+        realtime_ready = true;
+        portEXIT_CRITICAL(&snapshot_lock);
+    } else {
+        diag_realtime_failures++;
+        stop_realtime();
+    }
+}
+
 static void on_short_key(int key)
 {
     const int64_t now = esp_timer_get_time();
@@ -816,34 +918,17 @@ static void on_short_key(int key)
             }
             break;
         case 6:
-            if (!realtime_enabled) {
-                start_prompt(PROMPT_REALTIME_DISABLED, PROMPT_ACTION_NONE);
-            } else if (!network_fresh(now)) {
-                start_prompt(PROMPT_OFFLINE, PROMPT_ACTION_NONE);
-            } else {
-                begin_realtime_with_prompt();
-            }
+            begin_health_record(true);
             break;
         case 7:
-        {
-            int ids[16], length = 0;
-            if (network_fresh(now)) {
-                append_prompt(ids, &length, PROMPT_BOARD_ONLINE);
-                append_prompt(ids, &length, PROMPT_COMPUTERS);
-                if (last_audience_at && now - last_audience_at < 10000000) {
-                    append_number(ids, &length, online_clients);
-                    append_prompt(ids, &length, PROMPT_PEOPLE_ONLINE);
-                } else {
-                    append_prompt(ids, &length, PROMPT_UNKNOWN);
-                }
-            } else {
-                append_prompt(ids, &length, PROMPT_BOARD_OFFLINE);
-                append_prompt(ids, &length, PROMPT_COMPUTERS);
-                append_prompt(ids, &length, PROMPT_UNKNOWN);
-            }
-            start_prompt_sequence(ids, length, PROMPT_ACTION_NONE);
+            begin_health_record(false);
             break;
-        }
+        case 8:
+            if (health_edit.active) {
+                health_edit_toggle_step(&health_edit, now);
+                start_prompt(health_edit.fine ? PROMPT_HEALTH_FINE : PROMPT_HEALTH_COARSE, PROMPT_ACTION_NONE);
+            }
+            break;
         default:
             break;
     }
@@ -861,6 +946,36 @@ static void on_key(int key, bool down)
         else diag_s6_up_events++;
     }
     if (down && key == 6) diag_s7_events++;
+    if (health_edit.active && key == 8) {
+        health_edit_button(&health_edit, down, now);
+        if (down) {
+            key_consumed[key] = key_held[key] = key_long_handled[key] = false;
+            key_down[key] = now;
+        } else {
+            const bool handled = key_long_handled[key];
+            key_down[key] = 0;
+            key_held[key] = key_long_handled[key] = key_consumed[key] = false;
+            if (!handled) on_short_key(key);
+        }
+        return;
+    }
+    // S7/S8 can advance the measurement even while its introduction is speaking.
+    if (down && (key == 6 || key == 7) && !mark_all_read_confirming &&
+        mode != MODE_RECORDING && mode != MODE_COUNTDOWN) {
+        stop_message_playback();
+        stop_prompt();
+        key_consumed[key] = key_held[key] = key_long_handled[key] = false;
+        key_down[key] = now;
+        // A new selection discards the previous unsaved draft.
+        health_edit_cancel(&health_edit);
+        if (mode == MODE_SETTING_HEALTH) mode = MODE_IDLE;
+        return;
+    }
+    if (health_edit.active && down) {
+        health_edit_cancel(&health_edit);
+        stop_prompt();
+        mode = MODE_IDLE;
+    }
     if (mark_all_read_confirming && down && key != 0 && key != 1) {
         stop_prompt();
         mark_all_read_confirming = false;
@@ -877,12 +992,8 @@ static void on_key(int key, bool down)
             key_consumed[key] = true;
             return;
         }
-        if (mode == MODE_REALTIME) {
-            // Only S8 ends realtime listening, and it announces the stop.
-            if (key == 7) {
-                stop_realtime();
-                start_prompt(PROMPT_REALTIME_STOP, PROMPT_ACTION_NONE);
-            }
+        if (realtime_active && key <= 5) {
+            // The webpage owns capture; physical voice keys cannot stop it.
             key_consumed[key] = true;
             return;
         }
@@ -923,7 +1034,6 @@ static bool on_long_key(int key)
 {
     if (key == 0) {
         stop_message_playback();
-        stop_realtime();
         cancel_countdown(false);
         mode = MODE_IDLE;
         mark_all_read_confirming = true;
@@ -946,6 +1056,12 @@ static bool on_long_key(int key)
         start_prompt(removed ? PROMPT_ALARM_CANCEL : PROMPT_SAVE_FAILED, PROMPT_ACTION_NONE);
         return true;
     } else if (key == 8) {
+        if (health_edit.active) {
+            health_edit_cancel(&health_edit);
+            mode = MODE_IDLE;
+            start_prompt(PROMPT_HEALTH_CANCELLED, PROMPT_ACTION_NONE);
+            return true;
+        }
         network_setup_begin();
         setup_waiting = true;
         setup_deadline = esp_timer_get_time() + SETUP_LONG_US;
@@ -957,7 +1073,12 @@ static bool on_long_key(int key)
 static void on_rotate(int delta)
 {
     if (delta == 0) return;
-    if (mode == MODE_SETTING_ALARM) {
+    if (health_edit.active) {
+        health_edit_rotate(&health_edit, delta, esp_timer_get_time());
+        int ids[16], length = 0;
+        append_health_value(ids, &length, health_edit.kind, health_edit.value);
+        start_prompt_sequence(ids, length, PROMPT_ACTION_NONE);
+    } else if (mode == MODE_SETTING_ALARM) {
         alarm_draft += delta * 30;
         if (alarm_draft < 0) alarm_draft = 0;
         if (alarm_draft >= 1440) alarm_draft = 1439 - 29;
@@ -1016,12 +1137,13 @@ static void handle_timer_events(unsigned timer_events, int64_t now)
     if (timer_events & TIMER_EVENT_ALARM) {
         alarm_fired_at_us = now;
         stop_message_playback();
-        stop_realtime();
+        health_edit_cancel(&health_edit);
         stop_prompt();
         mode = MODE_IDLE;
         start_prompt(PROMPT_ALARM_DUE, PROMPT_ACTION_NONE);
     }
     if (timer_events & TIMER_EVENT_DONE) {
+        health_edit_cancel(&health_edit);
         stop_prompt();
         mode = MODE_IDLE;
         start_prompt(PROMPT_COUNTDOWN_DONE, PROMPT_ACTION_NONE);
@@ -1044,6 +1166,14 @@ static void receive(cJSON *value)
     const cJSON *op = cJSON_GetObjectItemCaseSensitive(value, "op");
     const cJSON *req = cJSON_GetObjectItemCaseSensitive(value, "req");
     if (!cJSON_IsString(op)) return;
+    if (cJSON_IsString(req) && health_request_id[0] && strcmp(req->valuestring, health_request_id) == 0) {
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(value, "id");
+        if (strcmp(op->valuestring, "health.ack") == 0 && cJSON_IsString(id) && strcmp(id->valuestring, health_inflight_id) == 0 && health_pending_ack(id->valuestring)) {
+            health_request_id[0] = '\0';
+            health_retry_at = esp_timer_get_time() + 200000;
+        }
+        return;
+    }
     if (strcmp(op->valuestring, "pong") == 0 && cJSON_IsString(req) && strcmp(req->valuestring, probe_id) == 0) {
         const cJSON *via = cJSON_GetObjectItemCaseSensitive(value, "via");
         if (cJSON_IsString(via) && (strcmp(via->valuestring, "wifi") == 0 || strcmp(via->valuestring, "ble") == 0)) {
@@ -1054,7 +1184,8 @@ static void receive(cJSON *value)
     }
     if (strcmp(op->valuestring, "settings") == 0) {
         realtime_enabled = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(value, "realtime_enabled"));
-        if (!realtime_enabled && mode == MODE_REALTIME) stop_realtime();
+        if (realtime_enabled) start_realtime();
+        else stop_realtime();
         return;
     }
     if (strcmp(op->valuestring, "audience") == 0) {
@@ -1065,7 +1196,8 @@ static void receive(cJSON *value)
         }
         return;
     }
-    if (strcmp(op->valuestring, "realtime.stop") == 0 && mode == MODE_REALTIME) {
+    if (strcmp(op->valuestring, "realtime.stop") == 0) {
+        realtime_enabled = false;
         stop_realtime();
         return;
     }
@@ -1081,23 +1213,24 @@ static void receive(cJSON *value)
         add_item(value);
         return;
     }
-    if (!cJSON_IsString(req) || strcmp(req->valuestring, request_id) != 0) return;
-    if (realtime_start_pending && strcmp(op->valuestring, "ack") == 0) {
+    if (realtime_start_pending && cJSON_IsString(req) && strcmp(req->valuestring, realtime_start_id) == 0 &&
+        strcmp(op->valuestring, "ack") == 0) {
         realtime_start_pending = false;
         portENTER_CRITICAL(&snapshot_lock);
         realtime_ready = true;
         diag_realtime_acks++;
         portEXIT_CRITICAL(&snapshot_lock);
-        request_line[0] = '\0';
         return;
     }
-    if (realtime_start_pending && strcmp(op->valuestring, "error") == 0) {
+    if (realtime_start_pending && cJSON_IsString(req) && strcmp(req->valuestring, realtime_start_id) == 0 &&
+        strcmp(op->valuestring, "error") == 0) {
         realtime_start_pending = false;
         diag_realtime_failures++;
         stop_realtime();
         start_prompt(PROMPT_OFFLINE, PROMPT_ACTION_NONE);
         return;
     }
+    if (!cJSON_IsString(req) || strcmp(req->valuestring, request_id) != 0) return;
     if (strcmp(op->valuestring, "error") == 0) {
         if (uploading()) upload_failed();
         else if (job == JOB_MARK_ALL_READ) {
@@ -1217,32 +1350,7 @@ static void prompt_task_step(int64_t now)
             prompt_length = 0;
             prompt_action = PROMPT_ACTION_NONE;
             if (action == PROMPT_ACTION_START_RECORDING) start_recording();
-            else if (action == PROMPT_ACTION_START_REALTIME) {
-                portENTER_CRITICAL(&snapshot_lock);
-                realtime_ready = false;
-                portEXIT_CRITICAL(&snapshot_lock);
-                if (audio_live_start(realtime_sink) == ESP_OK) {
-                    mode = MODE_REALTIME;
-                    diag_realtime_starts++;
-                    realtime_start_pending = true;
-                    realtime_stop_pending = false;
-                    realtime_sequence = 0;
-                    cJSON *value = new_frame("realtime.start");
-                    if (request_immediate(value)) {
-                        portENTER_CRITICAL(&snapshot_lock);
-                        realtime_ready = true;
-                        portEXIT_CRITICAL(&snapshot_lock);
-                    } else {
-                        realtime_start_pending = false;
-                        diag_realtime_failures++;
-                        stop_realtime();
-                        start_prompt(PROMPT_OFFLINE, PROMPT_ACTION_NONE);
-                    }
-                } else {
-                    diag_realtime_failures++;
-                    start_prompt(PROMPT_SAVE_FAILED, PROMPT_ACTION_NONE);
-                }
-            } else if (action == PROMPT_ACTION_SETTINGS_CONFIRM) {
+            else if (action == PROMPT_ACTION_SETTINGS_CONFIRM) {
                 settings_commit_at = now + SETTINGS_COMMIT_US;
             }
         }
@@ -1302,6 +1410,8 @@ static void task(void *argument)
         const unsigned timer_events = timers_poll(now);
         handle_timer_events(timer_events, now);
         commit_settings(now);
+        commit_health_record(now);
+        sync_health(now);
 
         diag_stage = 7;
         audio_snapshot_t audio;
@@ -1353,11 +1463,7 @@ static void task(void *argument)
         diag_stage = 10;
 
         if (request_line[0] && now - sent_at > ACK_TIMEOUT_US) {
-            if (realtime_start_pending && mode == MODE_REALTIME) {
-                diag_realtime_failures++;
-                stop_realtime();
-                start_prompt(PROMPT_OFFLINE, PROMPT_ACTION_NONE);
-            } else if (uploading()) upload_failed();
+            if (uploading()) upload_failed();
             else if (job == JOB_INDEX) { finish_job(); sync_at = now + RETRY_US; }
             else if (job == JOB_MARK_READ) {
                 finish_job();
@@ -1385,8 +1491,8 @@ static void task(void *argument)
         }
         diag_stage = 11;
 
-        if (job == JOB_IDLE && network_fresh(now) && !prompt_playing && mode != MODE_RECORDING &&
-            mode != MODE_PLAYING && mode != MODE_REALTIME && mode != MODE_COUNTDOWN) {
+        if (job == JOB_IDLE && network_fresh(now) && !prompt_playing && !health_edit.active && !realtime_active && mode != MODE_RECORDING &&
+            mode != MODE_PLAYING && mode != MODE_COUNTDOWN) {
             message_t *receipt = NULL;
             for (int i = 0; i < message_count; i++) if (messages[i].pending_read) { receipt = &messages[i]; break; }
             if (receipt != NULL) mark_read(receipt);
@@ -1398,14 +1504,16 @@ static void task(void *argument)
             } else if (voice_outbox_count() && now >= retry_at) {
                 upload_begin();
             }
-        } else if (job == JOB_IDLE && network_fresh(now) && mode == MODE_IDLE &&
+        } else if (job == JOB_IDLE && network_fresh(now) && mode == MODE_IDLE && !health_edit.active && !realtime_active &&
                    !prompt_playing && voice_outbox_count() && now >= retry_at) {
             upload_begin();
         }
         diag_stage = 12;
-        if (mode == MODE_REALTIME && !network_fresh(now)) {
+        if (realtime_active && (!network_fresh(now) || !cloud_online || !cloud_online() ||
+            (realtime_start_pending && now - realtime_start_sent_at >= ACK_TIMEOUT_US))) {
+            if (realtime_start_pending) diag_realtime_failures++;
             stop_realtime();
-            start_prompt(PROMPT_OFFLINE, PROMPT_ACTION_NONE);
+            if (!health_edit.active) start_prompt(PROMPT_OFFLINE, PROMPT_ACTION_NONE);
         }
         if (realtime_stop_pending && network_fresh(now) &&
             now - realtime_stop_sent_at >= REALTIME_STOP_RETRY_US) {
@@ -1421,11 +1529,12 @@ static void task(void *argument)
         diag_stage = 14;
         const voice_chat_snapshot_t value = {
             .pending = voice_outbox_count() + (job == JOB_CACHE ? 1 : 0),
+            .health_pending = health_pending_count(),
             .sending = uploading(),
             .storage_error = !outbox_ready || job == JOB_CACHE,
             .alarm_minute = timers_alarm_minute(),
             .countdown_seconds = timers_countdown_seconds(),
-            .realtime_active = mode == MODE_REALTIME,
+            .realtime_active = realtime_active,
             .realtime_enabled = realtime_enabled,
             .network_via = network_fresh(now) ? network_via : 0,
             .message_count = message_count,
@@ -1477,6 +1586,7 @@ void voice_chat_init(void (*send)(const char *line),
     send_immediate_line = send_immediate;
     cloud_online = is_cloud_online;
     timers_init();
+    health_records_init();
     snapshot.alarm_minute = -1;
     events = xQueueCreate(64, sizeof(event_t));
     input_events = xQueueCreate(INPUT_QUEUE_DEPTH, sizeof(event_t));

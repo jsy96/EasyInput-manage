@@ -3,8 +3,10 @@ import {
   isRealtimePacket, sortMessages, validId,
 } from '../../src/shared/chat'
 import type { ChatClient, ChatMessage } from '../../src/shared/chat'
+import { isHealthMeasurement } from '../../src/shared/health'
+import type { HealthRecord } from '../../src/shared/health'
 
-type Attachment = { role: 'board' | 'browser'; client?: string; name?: string; last?: number; uptime?: number }
+type Attachment = { role: 'board' | 'browser'; client?: string; name?: string; last?: number; uptime?: number; healthPending?: number }
 type Frame = Record<string, unknown>
 type Upload = { id: string; sender: string; name: string; samples: number; next: number; created: number; updated?: number }
 const frame = (op: string, data: Frame = {}): Frame => ({ type: 'chat', protocol: CHAT_VERSION, op, ...data })
@@ -30,6 +32,16 @@ export class DeviceRoomV2 {
     this.realtimeOpen = active
     await this.state.storage.put('realtime_active', active)
     this.broadcast(frame(active ? 'realtime.start' : 'realtime.stop', {}), true)
+  }
+  private async stopRealtime(): Promise<void> {
+    const enabled = await this.state.storage.get<boolean>('realtime_enabled') ?? false
+    await this.state.storage.put('realtime_enabled', false)
+    await this.state.storage.delete('realtime_requested_at')
+    await this.syncRealtime(false)
+    if (enabled) {
+      this.broadcast(frame('settings', { realtime_enabled: false }), true)
+      this.toBoard(frame('settings', { realtime_enabled: false }))
+    }
   }
   private route(): { socket: WebSocket; via: 'wifi' | 'ble' } | null {
     const fresh = this.sockets().filter((s) => Date.now() - (this.attachment(s).last ?? 0) < 8000)
@@ -59,9 +71,14 @@ export class DeviceRoomV2 {
   private async clients(): Promise<ChatClient[]> { return await this.state.storage.get<ChatClient[]>('clients') ?? [] }
   private async presence(): Promise<void> {
     const route = this.route()
+    if (await this.state.storage.get<boolean>('realtime_enabled')) {
+      const requested = await this.state.storage.get<number>('realtime_requested_at') ?? 0
+      const active = await this.state.storage.get<boolean>('realtime_active') ?? false
+      if (route?.via !== 'wifi' || (!active && Date.now() - requested >= 8000)) await this.stopRealtime()
+    }
     const clients = (await this.clients()).map((c) => ({ ...c, online: this.sockets().some((s) => this.attachment(s).client === c.id) }))
     const onlineClients = clients.filter((client) => client.online).length
-    this.broadcast(frame('presence', { online: !!route, via: route?.via ?? null, clients }), true)
+    this.broadcast(frame('presence', { online: !!route, via: route?.via ?? null, clients, healthPending: route ? this.attachment(route.socket).healthPending ?? null : null }), true)
     this.toBoard(frame('audience', { online_clients: onlineClients }))
   }
   async fetch(request: Request): Promise<Response> {
@@ -97,6 +114,7 @@ export class DeviceRoomV2 {
         self, messages: await this.messages(), clients: await this.clients(), online: !!route, via: route?.via ?? null,
         realtimeEnabled: await this.state.storage.get<boolean>('realtime_enabled') ?? false,
         realtimeActive: await this.state.storage.get<boolean>('realtime_active') ?? false,
+        healthPending: route ? this.attachment(route.socket).healthPending ?? null : null,
       }))
       const hello = await this.state.storage.get<Frame>('hello')
       if (hello) this.send(server, hello)
@@ -150,15 +168,22 @@ export class DeviceRoomV2 {
     }
     if (value.protocol !== 2 || !['hello', 'status', 'event', 'result', 'lights'].includes(String(value.type))) return
     const a = this.attachment(socket)
+    const voice = value.voice && typeof value.voice === 'object' ? value.voice as Frame : value
     if (value.type === 'status' && typeof value.uptime_ms === 'number' && value.uptime_ms !== a.uptime) {
       a.last = Date.now(); a.uptime = value.uptime_ms
+      if (Number.isInteger(voice.health_pending) && Number(voice.health_pending) >= 0 && Number(voice.health_pending) <= 64) a.healthPending = Number(voice.health_pending)
       socket.serializeAttachment(a)
     }
     const route = this.route()
     if (value.type === 'hello') await this.state.storage.put('hello', value)
     if (route?.socket === socket || value.type === 'hello') this.broadcast(value, true)
-    if (a.role === 'board' && !bridge && typeof value.realtime_active === 'boolean') {
-      await this.syncRealtime(value.realtime_active)
+    if (a.role === 'board' && !bridge && value.type === 'status' && typeof voice.realtime_active === 'boolean') {
+      const enabled = await this.state.storage.get<boolean>('realtime_enabled') ?? false
+      const requested = await this.state.storage.get<number>('realtime_requested_at') ?? 0
+      if (voice.realtime_active && enabled) await this.syncRealtime(true)
+      else if (voice.realtime_active) this.send(socket, frame('settings', { realtime_enabled: false }))
+      // Allow telemetry captured just before the start command to drain first.
+      else if (Date.now() - requested >= 2000 && await this.state.storage.get<boolean>('realtime_active')) await this.stopRealtime()
     }
     if (value.type === 'status') await this.presence()
   }
@@ -171,6 +196,32 @@ export class DeviceRoomV2 {
     }
     const sender = board ? 'board' : a.client!
     const id = v.id
+    if (v.op === 'health.put') {
+      if (!board) throw new Error('只有开发板可以写入测量记录')
+      if (!isHealthMeasurement(v.record)) throw new Error('测量记录格式错误')
+      const input = v.record
+      await this.state.blockConcurrencyWhile(async () => {
+        const previous = await this.state.storage.get<number>(`health-id:${input.id}`)
+        if (!previous) {
+          const sequence = (await this.state.storage.get<number>('health-count') ?? 0) + 1
+          const record: HealthRecord = { id: input.id, kind: input.kind, value: input.value, measuredAt: input.measuredAt,
+            uptimeMs: input.uptimeMs, receivedAt: Date.now(), sequence }
+          await this.state.storage.put({ [`health:${sequence}`]: record, [`health-id:${input.id}`]: sequence, 'health-count': sequence })
+        }
+      })
+      reply('health.ack', { id: input.id })
+      return
+    }
+    if (v.op === 'health.list' && !board) {
+      const count = await this.state.storage.get<number>('health-count') ?? 0
+      const after = v.after ?? 0, through = v.through ?? count
+      if (!Number.isSafeInteger(after) || !Number.isSafeInteger(through) || Number(after) < 0 || Number(through) < Number(after) || Number(through) > count) throw new Error('测量记录分页参数错误')
+      const next = Math.min(Number(through), Number(after) + 100)
+      const records = await Promise.all(Array.from({ length: next - Number(after) }, (_, i) => this.state.storage.get<HealthRecord>(`health:${Number(after) + i + 1}`)))
+      if (records.some(r => !r)) throw new Error('测量记录暂时不可用，请稍后重试')
+      reply('health.list', { records, next, through, complete: next === through })
+      return
+    }
     if (v.op === 'ping') { reply('pong', board ? { via: a.role === 'board' ? 'wifi' : 'ble' } : {}); await this.presence(); return }
     if (v.op === 'gateway.off' && !board) { a.last = 0; socket.serializeAttachment(a); await this.presence(); return }
     if (v.op === 'index' && board) {
@@ -311,16 +362,21 @@ export class DeviceRoomV2 {
       reply('ack', { count: changed.length }); return
     }
     if (v.op === 'realtime.set' && !board) {
+      if (typeof v.enabled !== 'boolean') throw new Error('实时麦克风开关必须为布尔值')
       const enabled = v.enabled === true
-      await this.state.storage.put('realtime_enabled', enabled)
-      if (!enabled) await this.syncRealtime(false)
-      this.broadcast(frame('settings', { realtime_enabled: enabled }))
-      this.toBoard(frame('settings', { realtime_enabled: enabled }))
+      if (enabled) {
+        if (this.route()?.via !== 'wifi') throw new Error('请先让开发板通过 Wi-Fi 直连语音服务')
+        await this.state.storage.put('realtime_enabled', true)
+        await this.state.storage.put('realtime_requested_at', Date.now())
+        this.broadcast(frame('settings', { realtime_enabled: true }), true)
+        this.toBoard(frame('settings', { realtime_enabled: true }))
+      } else await this.stopRealtime()
       reply('settings', { realtime_enabled: enabled })
       return
     }
     if (v.op === 'realtime.start' && board) {
-      if (!(await this.state.storage.get<boolean>('realtime_enabled') ?? false)) throw new Error('实时监听未在网页开启')
+      if (a.role !== 'board' || this.route()?.socket !== socket ||
+          !(await this.state.storage.get<boolean>('realtime_enabled') ?? false)) throw new Error('实时麦克风未在网页打开，或开发板未通过 Wi-Fi 直连')
       await this.syncRealtime(true)
       reply('ack', { active: true })
       return
@@ -331,8 +387,9 @@ export class DeviceRoomV2 {
       this.broadcast(frame('realtime.chunk', { data: v.data }), true)
       return
     }
-    if (v.op === 'realtime.stop') {
-      await this.syncRealtime(false)
+    if (v.op === 'realtime.stop' && board) {
+      if (a.role !== 'board') return
+      await this.stopRealtime()
       if (board) reply('ack', { active: false })
       return
     }
@@ -365,9 +422,9 @@ export class DeviceRoomV2 {
     if (socket) {
       const role = this.attachment(socket).role
       const replacementBoard = this.sockets().some((s) => s !== socket && this.attachment(s).role === 'board')
-      if (role === 'board' && !replacementBoard) await this.syncRealtime(false)
+      if (role === 'board' && !replacementBoard) await this.stopRealtime()
     } else if (!this.route()) {
-      await this.syncRealtime(false)
+      await this.stopRealtime()
     }
     await this.presence()
   }
@@ -375,9 +432,9 @@ export class DeviceRoomV2 {
     if (socket) {
       const role = this.attachment(socket).role
       const replacementBoard = this.sockets().some((s) => s !== socket && this.attachment(s).role === 'board')
-      if (role === 'board' && !replacementBoard) await this.syncRealtime(false)
+      if (role === 'board' && !replacementBoard) await this.stopRealtime()
     } else if (!this.route()) {
-      await this.syncRealtime(false)
+      await this.stopRealtime()
     }
     await this.presence()
   }

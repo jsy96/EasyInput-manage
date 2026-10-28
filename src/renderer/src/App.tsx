@@ -7,6 +7,7 @@ import {
 } from 'lucide-react'
 import { ESPLoader, Transport } from 'esptool-js'
 import { VoiceChat } from './VoiceChat'
+import { downloadFile, healthCsv } from './services/downloads'
 import { ChatConnection } from './services/chat'
 import { BluetoothConnection } from './services/bluetooth'
 import { emptyRoom } from '@shared/chat'
@@ -125,6 +126,8 @@ export default function App(): React.JSX.Element {
   const [clock, setClock] = useState(Date.now())
   const [, refreshConnections] = useState(0)
   const [chatBusy, setChatBusy] = useState(false)
+  const [healthDownloading, setHealthDownloading] = useState(false)
+  const [healthNote, setHealthNote] = useState('')
   const [notice, setNotice] = useState('')
   const [serialOpen, setSerialOpen] = useState(false)
   const [serialConnecting, setSerialConnecting] = useState(false)
@@ -175,7 +178,7 @@ export default function App(): React.JSX.Element {
   const bleProtocolOnline = bleConnected && connectionsRef.current.isOnline('ble', clock)
   const configTransport = usbProtocolOnline ? 'usb' as const : bleProtocolOnline ? 'ble' as const : null
   const deviceBusy = flashing || flashPreparing || flashCandidate !== null
-  const updateBlocked = chatBusy || serialOpen || bleConnected || serialConnecting || bleConnecting || wifiBusy || cloudBusy || deviceBusy
+  const updateBlocked = chatBusy || healthDownloading || serialOpen || bleConnected || serialConnecting || bleConnecting || wifiBusy || cloudBusy || deviceBusy
 
   useEffect(() => {
     const chat = new ChatConnection({
@@ -529,7 +532,17 @@ export default function App(): React.JSX.Element {
   }
 
   const boardOnline = room.online
-  const onlineComputers = room.clients.filter((client) => client.online).length
+  async function downloadHealth(): Promise<void> {
+    if (!chatRef.current || healthDownloading) return
+    setHealthDownloading(true); setHealthNote('正在读取历史记录…')
+    try {
+      const records = await chatRef.current.healthHistory(count => setHealthNote(`已读取 ${count} 条记录…`))
+      if (!records.length) { setHealthNote('暂无已同步的测量历史；请更新开发板固件并联网完成同步。'); return }
+      downloadFile(new Blob([healthCsv(records)], { type: 'text/csv;charset=utf-8' }), `血压血糖历史-${new Date().toISOString().slice(0, 10)}.csv`)
+      setHealthNote(`已导出 ${records.length} 条测量记录（时间为 UTC）。${room.healthPending ? `板端还有 ${room.healthPending} 条待同步，请稍后再次导出。` : !room.online ? '开发板离线，可能还有未同步记录。' : ''}`)
+    } catch (error) { setHealthNote(error instanceof Error ? error.message : '测量记录下载失败') }
+    finally { setHealthDownloading(false) }
+  }
   const alarmMinute = currentStatus.voice?.alarm_minute
   const countdownSeconds = currentStatus.voice?.countdown_seconds ?? 0
   return <main className="app-shell">
@@ -549,8 +562,6 @@ export default function App(): React.JSX.Element {
           <button aria-current={activePage === 'device' ? 'page' : undefined} className={activePage === 'device' ? 'active' : ''} onClick={() => setActivePage('device')}><Settings size={18} /><span>设备</span></button>
         </nav>
         <div className="connection-transports">
-          <span className={usbProtocolOnline ? 'is-live' : 'is-muted'}><Usb size={12} /> USB</span>
-          <span className={bleProtocolOnline ? 'is-live' : 'is-muted'}><Bluetooth size={12} /> BLE</span>
           <span className="app-version">v{appVersion}</span>
         </div>
       </div>
@@ -568,22 +579,22 @@ export default function App(): React.JSX.Element {
               <span className={`status-chip ${boardOnline ? 'is-live' : 'is-muted'}`}>{boardOnline ? '在线' : '离线'}</span>
             </div>
             <div className="device-status-grid">
-              <div><Wifi size={17} /><span>Wi-Fi</span><strong>{stateLabel(currentStatus.wifi.state)}</strong><small>{currentStatus.wifi.ssid || currentStatus.wifi.ip || '尚未配置'}</small></div>
-              <div><Bluetooth size={17} /><span>蓝牙</span><strong>{bleConnecting ? '连接中' : bleConnected ? '已连接' : '未连接'}</strong><small>{bleRetrying ? '等待自动重连' : '可作语音网关'}</small></div>
               <div><Bell size={17} /><span>每日闹钟</span><strong>{formatTime(alarmMinute)}</strong><small>{alarmMinute === null || alarmMinute === undefined ? '短按 S3 设置' : '按住 S3 取消'}</small></div>
               <div><Timer size={17} /><span>倒计时</span><strong>{countdownSeconds ? `${Math.ceil(countdownSeconds / 60)} 分钟` : '未运行'}</strong><small>{countdownSeconds ? '任意键取消' : '短按 S4 设置'}</small></div>
-              <div><Radio size={17} /><span>实时监听</span><strong>{room.realtimeEnabled ? '允许' : '关闭'}</strong><small>{room.realtimeActive ? '正在传输' : '在语音页设置'}</small></div>
-              <div><Mic size={17} /><span>电脑端在线</span><strong>{onlineComputers} 人</strong><small>S8 可语音播报</small></div>
+              <div><Radio size={17} /><span>实时监听状态</span><strong>{room.realtimeActive ? '监听中' : room.realtimeEnabled ? '开启中' : '关闭'}</strong><small>在语音页打开或关闭</small></div>
+              <div><Download size={17} /><span>血压血糖记录</span><button className="text-button" disabled={!room.connected || healthDownloading || deviceBusy} onClick={() => void downloadHealth()}>{healthDownloading ? '正在下载…' : '下载历史 CSV'}</button><small>{room.healthPending ? `板端还有 ${room.healthPending} 条待同步` : '导出云端已同步的全部历史'}</small></div>
             </div>
-            <div className="device-actions">
-              <button className="button button-subtle" disabled={deviceBusy} onClick={() => void connectBoard()}>{serialConnecting ? <LoaderCircle className="spin" size={15} /> : <Usb size={15} />}{serialOpen ? '重新选择 USB' : '连接 USB'}</button>
-              <button className="button button-subtle" disabled={deviceBusy} onClick={() => void (bleConnected ? bleConnectionRef.current?.disconnect() : bleConnectionRef.current?.connect())}><Bluetooth size={15} />{bleConnected ? '断开蓝牙' : '连接蓝牙'}</button>
-              {serialOpen && <button className="text-button" onClick={() => void closeSerial()}>断开 USB</button>}
-            </div>
-            {(serialError || bleError) && <p className="result-note error">{serialError || bleError}</p>}
-
-            <details className="setup-section" open={!currentStatus.wifi.configured}>
+            {healthNote && <p className="result-note" role="status">{healthNote}</p>}
+            <details className="setup-section">
               <summary><Wifi size={16} />连接 Wi-Fi 与语音服务<ChevronDown size={15} /></summary>
+              <p className="light-note">Wi-Fi：{stateLabel(currentStatus.wifi.state)} · {currentStatus.wifi.ssid || '尚未配置'}；USB：{usbProtocolOnline ? '已连接' : serialConnecting ? '连接中' : '未连接'}；蓝牙：{bleConnecting ? '连接中' : bleConnected ? '已连接' : '未连接'}{bleRetrying ? '（等待自动重连）' : ''}</p>
+              <div className="device-actions">
+                <button className="button button-subtle" disabled={deviceBusy} onClick={() => void connectBoard()}>{serialConnecting ? <LoaderCircle className="spin" size={15} /> : <Usb size={15} />}{serialOpen ? '重新选择 USB' : '连接 USB'}</button>
+                <button className="button button-subtle" disabled={deviceBusy} onClick={() => void (bleConnected ? bleConnectionRef.current?.disconnect() : bleConnectionRef.current?.connect())}><Bluetooth size={15} />{bleConnected ? '断开蓝牙' : '连接蓝牙'}</button>
+                {serialOpen && <button className="text-button" onClick={() => void closeSerial()}>断开 USB</button>}
+              </div>
+              {(serialError || bleError) && <p className="result-note error">{serialError || bleError}</p>}
+
               <div className="setup-grid">
                 <section>
                   <h4>Wi-Fi</h4>
