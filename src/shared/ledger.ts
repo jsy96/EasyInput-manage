@@ -6,6 +6,8 @@ export interface LedgerEntry {
   uptimeMs: number
 }
 export interface LedgerRecord extends LedgerEntry { receivedAt: number; sequence: number }
+export const LEDGER_DAY_MS = 86_400_000
+export function ledgerDay(timestamp: number): number { return Math.floor((timestamp + 8 * 3_600_000) / LEDGER_DAY_MS) }
 
 export function isLedgerEntry(value: unknown): value is LedgerEntry {
   if (!value || typeof value !== 'object') return false

@@ -1,4 +1,5 @@
 import type { ChatMessage } from '@shared/chat'
+import { isVoiceMessage } from '@shared/chat'
 import type { HealthRecord } from '@shared/health'
 import type { LedgerRecord } from '@shared/ledger'
 
@@ -58,6 +59,7 @@ export function downloadFile(blob: Blob, name: string): void {
 
 export const VOICE_ZIP_BATCH_SIZE = 100
 export function voiceZipBatches(messages: ChatMessage[]): ChatMessage[][] {
+  messages = messages.filter(isVoiceMessage)
   const batches: ChatMessage[][] = []
   for (let i = 0; i < messages.length; i += VOICE_ZIP_BATCH_SIZE) batches.push(messages.slice(i, i + VOICE_ZIP_BATCH_SIZE))
   return batches

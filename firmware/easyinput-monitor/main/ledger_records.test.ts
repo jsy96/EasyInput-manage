@@ -22,6 +22,8 @@ it('runs the actual ledger and measurement C code against isolated synthetic sto
 #include "voice_prompts.h"
 #define LONG_US 1200000
 #define SETUP_LONG_US 3000000
+#define DOUBLE_CLICK_US 400000LL
+#define PROMPT_SEQUENCE_CAPACITY 128
 ${enums}
 static job_t job;
 static ui_mode_t mode;
@@ -34,6 +36,14 @@ static int64_t key_down[9], settings_commit_at, retry_at, alarm_fired_at_us, set
 static char hold_id[65], discarded_id[65];
 static int alarm_draft, timer_draft, last_prompt;
 static unsigned next_pressure, next_glucose, diag_s5_events, diag_s6_down_events, diag_s6_up_events, diag_s6_actions, diag_s7_events, diag_last_key_mode;
+static unsigned ledger_generation;
+static int64_t summary_retry_at, click_deadline, input_timestamp;
+static int pending_click = -1;
+static bool second_click, stt_busy, stt_pending;
+static char summary_request_id[40], text_request_id[40];
+static bool xiaozhi_stt_busy(void) { return stt_busy; }
+static bool xiaozhi_stt_pending(void *t) { (void)t; return stt_pending; }
+static bool xiaozhi_stt_cancel(void) { stt_pending = false; return true; }
 static int diag_last_key, stopped, released, uploads, setup_calls, volume_changes, stop_error, discard_error;
 static void stop_prompt(void) { prompt_playing = false; prompt_action = PROMPT_ACTION_NONE; }
 static void start_prompt(int p, prompt_action_t a) { last_prompt = p; prompt_playing = true; prompt_action = a; }
@@ -62,11 +72,13 @@ static int audio_set_volume(uint8_t v) { (void)v; volume_changes++; return 0; }
 static void announce_alarm_draft(void) {}
 static void announce_timer_draft(void) {}
 static void announce_volume(void) {}
+static bool uploading(void) { return job == JOB_UP_BEGIN || job == JOB_UP_CHUNK || job == JOB_UP_COMMIT; }
 static bool on_long_key(int key);
 ${['begin_recording_with_prompt', 'append_health_value', 'begin_health_record', 'commit_health_record', 'begin_ledger_record',
-      'confirm_ledger_record', 'cancel_recording', 'on_short_key', 'key_long_threshold', 'on_key', 'on_long_key', 'on_rotate'].map(extractFunction).join('\n')}
+      'confirm_ledger_record', 'cancel_recording', 'on_short_key', 'announce_recent_health', 'append_amount', 'announce_ledger', 'on_double_key', 'poll_click', 'key_long_threshold', 'on_key', 'on_long_key', 'on_rotate'].map(extractFunction).join('\n')}
 static void reset_input(void) {
   mode = MODE_IDLE; job = JOB_IDLE; stop_prompt();
+  pending_click = -1; second_click = stt_busy = stt_pending = false;
   health_edit_cancel(&health_edit); ledger_edit_cancel(&ledger_edit);
   memset(key_down, 0, sizeof key_down); memset(key_held, 0, sizeof key_held);
   memset(key_long_handled, 0, sizeof key_long_handled); memset(key_consumed, 0, sizeof key_consumed);
@@ -76,6 +88,7 @@ static void reset_input(void) {
 }
 static void press_key(int key, int64_t duration) {
   on_key(key, true); monotonic_us += duration; on_key(key, false);
+  monotonic_us += DOUBLE_CLICK_US + 1; poll_click(monotonic_us);
 }
 static void test_inputs(void) {
   sizes[0] = sizes[1] = 0; ledger_records_init(); health_records_init();
@@ -118,6 +131,43 @@ static void test_inputs(void) {
   reset_input(); mode = MODE_RECORD_READY; strcpy(hold_id, "synthetic-current-draft");
   on_key(4, true); monotonic_us += 3000000; key_long_handled[4] = on_long_key(4); on_key(4, false);
   assert(uploads == 0 && !send_when_saved && mode == MODE_IDLE);
+  // First release to second press <= 400 ms, without an early single action.
+  for (int key = 4; key <= 7; key++) {
+    for (int boundary = 0; boundary < 3; boundary++) {
+      reset_input(); next_pressure = next_glucose = 0;
+      const unsigned count = ledger_pending_count();
+      on_key(key, true); monotonic_us += 50000; on_key(key, false);
+      assert(mode == MODE_IDLE && !ledger_edit.active && !health_edit.active);
+      monotonic_us += DOUBLE_CLICK_US + boundary - 1;
+      if (boundary == 2) poll_click(monotonic_us);
+      on_key(key, true); monotonic_us += 50000; on_key(key, false);
+      if (boundary <= 1) {
+        assert(!ledger_edit.active && !health_edit.active && next_pressure == 0 && next_glucose == 0);
+        if (key == 4) assert(prompt_action == PROMPT_ACTION_START_STT);
+        assert(ledger_pending_count() == count);
+      }
+    }
+  }
+  reset_input();
+  on_key(4, true); monotonic_us += 50000; on_key(4, false);
+  monotonic_us += 200000; on_key(4, true); monotonic_us += 3000000; on_key(4, false);
+  poll_click(monotonic_us + 500000);
+  assert(prompt_action != PROMPT_ACTION_START_RECORDING && prompt_action != PROMPT_ACTION_START_STT);
+  // Resolve clicks from scanner timestamps even if the voice task handles them later.
+  reset_input();
+  input_timestamp = monotonic_us; on_key(4, true);
+  input_timestamp += 50000; on_key(4, false);
+  input_timestamp += DOUBLE_CLICK_US; monotonic_us = input_timestamp + 1000000;
+  on_key(4, true); input_timestamp += 50000; on_key(4, false); input_timestamp = 0;
+  assert(prompt_action == PROMPT_ACTION_START_STT);
+  reset_input(); press_key(5, 50000); on_rotate(1);
+  assert(ledger_edit.active && ledger_edit.high == 1);
+  reset_input();
+  on_key(5, true); monotonic_us += 50000; on_key(5, false);
+  on_rotate(27); assert(ledger_edit.active && ledger_edit.high == 27 && volume_changes == 0);
+  reset_input(); mode = MODE_STT; stt_busy = true;
+  press_key(6, 50000); assert(!health_edit.active);
+  press_key(4, 3000000); assert(mode == MODE_IDLE && last_prompt == PROMPT_RECORD_CANCELLED);
   puts("synthetic input routing and long press checks passed");
 }
 `)
@@ -221,6 +271,33 @@ int main(void) {
   fail_commit = 0; assert(!health_record_get(HEALTH_FATHER_GLUCOSE, &latest));
   assert(health_pending_oldest(&hp) && hp.value == 139);
   assert(ledger_pending_count() == LEDGER_PENDING_CAPACITY);
+  // An acknowledged entry still contributes to the durable daily summary.
+  while (ledger_pending_oldest(&pending)) assert(ledger_pending_ack(pending.id));
+  ledger_summary_t summary;
+  assert(ledger_summary_get(&summary) && summary.latest == 999 && summary.totals[0] == 64 * 999 && summary.unknown == 1);
+  summary.complete = true;
+  assert(ledger_summary_apply(&summary));
+  ledger_records_init(); assert(ledger_summary_get(&summary) && summary.complete && summary.totals[0] == 64 * 999);
+  const int64_t day = summary.day;
+  clock_seconds += 86400;
+  assert(ledger_summary_get(&summary) && summary.day == day + 1 && summary.totals[0] == 0 && summary.totals[1] == 64 * 999);
+  summary.totals[0] = 7; fail_commit = 1;
+  assert(!ledger_summary_apply(&summary)); fail_commit = 0;
+  assert(ledger_summary_get(&summary) && summary.totals[0] == 0);
+  ledger_edit_begin(&e); e.ones = true; ledger_edit_rotate(&e, 5); assert(ledger_edit_save(&e));
+  assert(!ledger_summary_apply(&summary));
+  assert(ledger_pending_oldest(&pending) && ledger_pending_ack(pending.id));
+  ledger_records_init(); assert(ledger_summary_get(&summary) && summary.latest == 5 && summary.totals[0] == 5 && summary.totals[1] == 64 * 999);
+  clock_seconds = 0; assert(ledger_summary_get(&summary) && !summary.complete);
+
+  // Load the exact legacy v1 layout, keeping all pending records and requiring cloud backfill.
+  typedef struct { uint32_t version, head, count; ledger_pending_t pending[64]; } legacy_t;
+  legacy_t legacy = {.version = 1, .head = 63, .count = 1};
+  legacy.pending[63] = pending; legacy.pending[63].amount = 42;
+  memcpy(disk[1], &legacy, sizeof legacy); sizes[1] = sizeof legacy;
+  ledger_records_init(); assert(ledger_pending_count() == 1 && ledger_summary_get(&summary) && summary.latest == 42 && !summary.complete);
+  assert(ledger_pending_oldest(&pending) && pending.amount == 42 && ledger_pending_ack(pending.id));
+  ledger_records_init(); assert(ledger_summary_get(&summary) && summary.latest == 42);
   puts("synthetic ledger and measurement storage checks passed");
   test_inputs();
 }

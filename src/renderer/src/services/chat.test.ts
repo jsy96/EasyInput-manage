@@ -86,3 +86,13 @@ describe('voice history pagination', () => {
     expect(await chat.voiceHistory()).toEqual([])
   })
 })
+
+it('keeps text in paginated chat while excluding it from voice exports and downloads', async () => {
+  const { chat, request } = connection()
+  const text = { id: 'text', sender: 'board', name: '开发板', kind: 'text' as const, text: '你好', samples: 0, created: 2, read: true }
+  const voice = { id: 'voice', sender: 'board', name: '开发板', samples: 100, created: 1, read: false }
+  request.mockResolvedValue({ messages: [voice, text], next: null, through: { id: 'text', created: 2 }, total: 2 })
+  expect(await chat.voiceHistory()).toEqual([voice])
+  await expect(chat.download(text)).rejects.toThrow()
+  expect(request).toHaveBeenCalledOnce()
+})

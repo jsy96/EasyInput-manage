@@ -1,6 +1,6 @@
 import {
   AUDIO_BATCH, AUDIO_CHUNK, CHAT_VERSION, CHAT_LIMIT, CHAT_PAGE_SIZE, REALTIME_FRAME_BYTES,
-  decodeRealtimePacket, fromBase64, sortMessages, toBase64, isChatMessage, isChatCursor, compareMessages,
+  decodeRealtimePacket, fromBase64, sortMessages, toBase64, isChatMessage, isChatCursor, compareMessages, isVoiceMessage,
 } from '@shared/chat'
 import type { ChatMessage, RoomState, ChatCursor, ChatPage } from '@shared/chat'
 import { emptyRoom } from '@shared/chat'
@@ -206,7 +206,7 @@ export class ChatConnection {
       before = page.next
     } while (records.length < CHAT_LIMIT)
     if (records.length !== total || new Set(records.map(m => m.id)).size !== records.length) throw new Error('语音历史在读取期间发生清理，请重试')
-    return sortMessages(records)
+    return sortMessages(records).filter(isVoiceMessage)
   }
   async healthHistory(progress?: (count: number) => void): Promise<HealthRecord[]> {
     const records: HealthRecord[] = []
@@ -247,6 +247,7 @@ export class ChatConnection {
     }
   }
   async download(m: ChatMessage): Promise<Uint8Array> {
+    if (!isVoiceMessage(m)) throw new Error('文字消息没有语音文件')
     const out = new Uint8Array(m.samples)
     for (let start = 0; start * AUDIO_CHUNK < m.samples; start += AUDIO_BATCH) {
       const v = await this.request('pullBatch', { id: m.id, index: start, count: AUDIO_BATCH })

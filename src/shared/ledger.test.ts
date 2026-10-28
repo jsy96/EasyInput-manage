@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { isLedgerEntry, isLedgerRecord } from './ledger'
+import { isLedgerEntry, isLedgerRecord, ledgerDay } from './ledger'
 
 const entry = { id: 'a'.repeat(32), amount: 273, recordedAt: null, uptimeMs: 123 }
 describe('ledger records', () => {
@@ -15,4 +15,10 @@ describe('ledger records', () => {
     }
     expect(isLedgerEntry(null)).toBe(false)
   })
+})
+
+it('changes Beijing calendar day exactly at UTC 16:00', () => {
+  const midnight = Date.parse('2026-10-28T16:00:00Z')
+  expect(ledgerDay(midnight) - ledgerDay(midnight - 1)).toBe(1)
+  expect(ledgerDay(midnight + 86399999)).toBe(ledgerDay(midnight))
 })

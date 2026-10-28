@@ -188,8 +188,8 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
   return <article className="panel voice-page">
     <div className="voice-main">
       <div className="panel-heading voice-heading">
-        <div><span className="section-kicker">SHARED VOICE TIMELINE</span><h3>所有声音，一条时间线</h3></div>
-        <div className="voice-heading-stats"><span className={unread ? 'unread-pill' : 'status-chip'}>{unread ? `${unread} 条未读` : '全部已读'}</span><span className="status-chip">{room.total} / 5000 条语音</span></div>
+        <div><span className="section-kicker">SHARED CHAT TIMELINE</span><h3>语音与文字，一条时间线</h3></div>
+        <div className="voice-heading-stats"><span className={unread ? 'unread-pill' : 'status-chip'}>{unread ? `${unread} 条未读` : '全部已读'}</span><span className="status-chip">{room.total} / 5000 条消息</span></div>
       </div>
       <div className="voice-batch-actions">
         <button className="button button-subtle" disabled={!room.connected || busy || !!loading || !room.total} onClick={() => void downloadAll()}><Download size={15} />{batchDownloading ? `正在打包 ${batchProgress} / ${operationTotal} 条` : '下载全部语音 ZIP'}</button>
@@ -198,18 +198,18 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
       {zipBatches.length > 1 && <div className="voice-batch-actions" role="status"><span>每包最多 100 条，共 {zipBatches.length} 包；已完成 {zipPart} 包。</span>{zipPart < zipBatches.length && <button className="button button-subtle" disabled={busy || !!loading || !room.connected} onClick={() => void downloadAll(zipPart)}><Download size={15} />下载第 {zipPart + 1} 包</button>}</div>}
       {board?.voice && <p className="chat-board-state" role="status">{alarmMinute === null || alarmMinute === undefined ? '未设置闹钟' : `闹钟 ${String(Math.floor(alarmMinute / 60)).padStart(2, '0')}:${String(alarmMinute % 60).padStart(2, '0')}`} · {countdownSeconds ? `倒计时 ${Math.ceil(countdownSeconds / 60)} 分钟` : '无倒计时'}{board.voice.pending > 0 ? ` · ${board.voice.sending ? '发送中' : '待发送'} ${board.voice.pending} 条` : ''}{board.voice.storage_error ? ' · 录音存储异常' : ''}</p>}
       <div className="chat-messages" aria-live="polite">
-        {room.next && <button className="button button-subtle full-button" disabled={historyLoading || busy || !room.connected} onClick={() => void loadOlder()}>{historyLoading ? '正在加载历史…' : `加载更早语音 · 已加载 ${messages.length} / ${room.total}`}</button>}
-        {!messages.length && <div className="empty-state"><Mic size={30} /><strong>还没有语音</strong><p>网页或开发板 S5 录下的语音<br />都会进入同一条时间线</p></div>}
+        {room.next && <button className="button button-subtle full-button" disabled={historyLoading || busy || !room.connected} onClick={() => void loadOlder()}>{historyLoading ? '正在加载历史…' : `加载更早消息 · 已加载 ${messages.length} / ${room.total}`}</button>}
+        {!messages.length && <div className="empty-state"><Mic size={30} /><strong>还没有消息</strong><p>网页语音、开发板语音及转写文字<br />都会进入同一条时间线</p></div>}
         {messages.map(m => <div key={m.id} className={`chat-message ${m.sender === room.self?.id ? 'chat-mine' : ''}`}>
-          <div className="chat-message-meta"><strong>{m.sender === 'board' ? '开发板' : m.name}</strong><span>{m.sender === 'board' ? '录音' : '网页'}</span><time>{new Date(m.created).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</time></div>
-          {urls[m.id] ? <audio controls autoPlay preload="metadata" ref={element => { players.current[m.id] = element }} onPlay={() => { stopSequence(); Object.entries(players.current).forEach(([id, player]) => { if (id !== m.id) player?.pause() }); setPlaying(true) }} onPause={() => setPlaying(false)} onEnded={() => setPlaying(false)} src={urls[m.id]} aria-label={`${m.name}的语音留言`} /> : <button className="button button-subtle chat-play" disabled={!room.connected || !!loading || busy} onClick={() => void load(m)}><Volume2 size={16} />{loading === m.id ? '加载语音…' : '播放语音'}<span>{Math.ceil(m.samples / 8000)}″</span></button>}
-          <small className={m.read ? 'is-live' : 'is-muted'}>{m.read ? '开发板已播放' : '开发板未读'}</small>
+          <div className="chat-message-meta"><strong>{m.sender === 'board' ? '开发板' : m.name}</strong><span>{m.kind === 'text' ? '语音转文字' : m.sender === 'board' ? '录音' : '网页'}</span><time>{new Date(m.created).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</time></div>
+          {m.kind === 'text' ? <p style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{m.text}</p> : urls[m.id] ? <audio controls autoPlay preload="metadata" ref={element => { players.current[m.id] = element }} onPlay={() => { stopSequence(); Object.entries(players.current).forEach(([id, player]) => { if (id !== m.id) player?.pause() }); setPlaying(true) }} onPause={() => setPlaying(false)} onEnded={() => setPlaying(false)} src={urls[m.id]} aria-label={`${m.name}的语音留言`} /> : <button className="button button-subtle chat-play" disabled={!room.connected || !!loading || busy} onClick={() => void load(m)}><Volume2 size={16} />{loading === m.id ? '加载语音…' : '播放语音'}<span>{Math.ceil(m.samples / 8000)}″</span></button>}
+          {m.kind !== 'text' && <small className={m.read ? 'is-live' : 'is-muted'}>{m.read ? '开发板已播放' : '开发板未读'}</small>}
         </div>)}
       </div>
       <div className="chat-compose">
         {error && <p className="result-note error" role="alert">{error}</p>}
         {draft && !sending && <div className="chat-draft"><span>有一条语音未发送（{Math.ceil(draft.length / 8000)} 秒）</span><button className="text-button" disabled={!room.connected} onClick={() => void sendVoice(draft)}>重试发送</button><button className="text-button" onClick={() => setDraft(null)}>放弃</button></div>}
-        <div className="chat-record-row">{recording ? <button className="button button-primary recording-button" onClick={() => recorder.current?.stop()}><Square size={15} />结束并发送 · {Math.floor(seconds)} / 20 秒</button> : <button className="button button-primary" disabled={!room.connected || busy || !!draft} onClick={() => void record()}><Mic size={16} />录制语音</button>}<span>{sending ? progress ? `正在发送 ${progress}%` : '正在处理语音…' : room.connected ? '仅支持语音 · 最长 20 秒' : '正在连接语音服务…'}</span></div>
+        <div className="chat-record-row">{recording ? <button className="button button-primary recording-button" onClick={() => recorder.current?.stop()}><Square size={15} />结束并发送 · {Math.floor(seconds)} / 20 秒</button> : <button className="button button-primary" disabled={!room.connected || busy || !!draft} onClick={() => void record()}><Mic size={16} />录制语音</button>}<span>{sending ? progress ? `正在发送 ${progress}%` : '正在处理语音…' : room.connected ? '网页录音最长 20 秒 · 开发板支持语音转文字' : '正在连接语音服务…'}</span></div>
       </div>
     </div>
     <aside className="voice-side">
@@ -235,10 +235,10 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
           <div><dt>S2</dt><dd>播放第一条未读，并重设 S1 回听起点；播放中可按 S1 回听</dd></div>
           <div><dt>S3</dt><dd><Bell size={13} />设置每日闹钟，长按取消</dd></div>
           <div><dt>S4</dt><dd><Timer size={13} />设置倒计时</dd></div>
-          <div><dt>S5</dt><dd>短按开始录音，再短按结束并发送；长按 3 秒取消本次未发送录音。满 20 秒后短按发送</dd></div>
-          <div><dt>S6</dt><dd>记账（1～999 元）：先输入百十位，短按旋钮后输入个位，再短按保存；例如 27 → 短按 → 3 → 短按，保存 273 元</dd></div>
-          <div><dt>S7</dt><dd>记录血压：妈妈高压 → 妈妈低压 → 爸爸高压 → 爸爸低压；先播报上次值。高压 80～220，低压 50～120</dd></div>
-          <div><dt>S8</dt><dd>记录血糖：爸爸 → 妈妈；先播报上次值，范围 3.0～20.0</dd></div>
+          <div><dt>S5</dt><dd>单击录音，再单击发送语音；双击语音转文字，说完静音约 1.5 秒后自动发送文字。长按 3 秒取消；单击等待约 0.4 秒</dd></div>
+          <div><dt>S6</dt><dd>记账（1～999 元）：先输入百十位，短按旋钮后输入个位，再短按保存；例如 27 → 短按 → 3 → 短按，保存 273 元；双击播报最近一笔及今天、昨天、前天总额</dd></div>
+          <div><dt>S7</dt><dd>记录血压：妈妈高压 → 妈妈低压 → 爸爸高压 → 爸爸低压；双击播报四项最近值。高压 80～220，低压 50～120</dd></div>
+          <div><dt>S8</dt><dd>记录血糖：爸爸 → 妈妈；双击播报两人最近值，范围 3.0～20.0</dd></div>
           <div><dt>旋钮</dt><dd>记录时血压每格 ±10，血糖每格 ±1；第一次短按进入精细调整（±1 / ±0.1），第二次短按保存。记账和测量记录中长按 3 秒取消本次记录</dd></div>
         </dl>
       </section>

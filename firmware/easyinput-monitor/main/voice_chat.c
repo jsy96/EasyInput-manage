@@ -21,7 +21,10 @@
 #include "timers.h"
 #include "voice_outbox.h"
 #include "voice_prompts.h"
+#include "xiaozhi_stt.h"
 
+#define DOUBLE_CLICK_US 400000LL
+#define PROMPT_SEQUENCE_CAPACITY 128
 #define CHAT_PROTOCOL 2
 #define CHUNK 768
 #define MAX_AUDIO 160000
@@ -60,6 +63,7 @@ typedef struct {
     int key;
     int delta;
     bool down;
+    int64_t at;
     char *json;
     uint8_t *realtime_data;
     size_t realtime_length;
@@ -89,11 +93,13 @@ typedef enum {
     MODE_COUNTDOWN,
     MODE_SETTING_HEALTH,
     MODE_SETTING_LEDGER,
+    MODE_STT,
 } ui_mode_t;
 
 typedef enum {
     PROMPT_ACTION_NONE,
     PROMPT_ACTION_START_RECORDING,
+    PROMPT_ACTION_START_STT,
     PROMPT_ACTION_SETTINGS_CONFIRM,
 } prompt_action_t;
 
@@ -141,6 +147,7 @@ static int64_t cache_at;
 static int64_t settings_commit_at;
 static bool mark_all_read_confirming;
 static int64_t key_down[9];
+static int64_t input_timestamp;
 static bool key_held[9];
 static bool key_long_handled[9];
 static bool key_consumed[9];
@@ -160,7 +167,14 @@ static int alarm_draft = 12 * 60;
 static int timer_draft = 30;
 static int64_t alarm_fired_at_us;
 static bool volume_announce_pending;
-static int prompt_ids[16];
+static int prompt_ids[PROMPT_SEQUENCE_CAPACITY];
+static int pending_click = -1;
+static int64_t click_deadline;
+static bool second_click;
+static bool text_sent_announce_pending;
+static char summary_request_id[40], text_request_id[40], text_inflight_id[33];
+static unsigned ledger_generation, summary_generation;
+static int64_t summary_retry_at, text_retry_at;
 static int prompt_length;
 static int prompt_position;
 static bool prompt_playing;
@@ -260,6 +274,50 @@ static void sync_ledger(int64_t now)
     if (line) { send_line(line); free(line); }
     cJSON_Delete(frame);
     ledger_retry_at = now + ACK_TIMEOUT_US;
+}
+
+static void send_frame(cJSON *frame)
+{
+    char *line = cJSON_PrintUnformatted(frame);
+    if (line) { send_line(line); free(line); }
+    cJSON_Delete(frame);
+}
+
+static void sync_summary(int64_t now)
+{
+    if (now < summary_retry_at || !network_fresh(now) || ledger_pending_count()) return;
+    cJSON *frame = new_frame("ledger.summary");
+    snprintf(summary_request_id, sizeof(summary_request_id), "summary-%lu", (unsigned long)++sequence);
+    summary_generation = ledger_generation;
+    cJSON_AddStringToObject(frame, "req", summary_request_id);
+    send_frame(frame);
+    summary_retry_at = now + 30000000;
+}
+
+static void sync_text(int64_t now)
+{
+    // A hold already in progress must be allowed to reach cancellation before autosend.
+    if (key_down[4] || now < text_retry_at || !network_fresh(now) || !xiaozhi_stt_pending(NULL)) return;
+    stt_text_t *text = malloc(sizeof(*text));
+    if (!text) return;
+    if (xiaozhi_stt_pending(text)) {
+        cJSON *frame = new_frame("text.put");
+        snprintf(text_request_id, sizeof(text_request_id), "text-%lu", (unsigned long)++sequence);
+        strlcpy(text_inflight_id, text->id, sizeof(text_inflight_id));
+        cJSON_AddStringToObject(frame, "req", text_request_id);
+        cJSON_AddStringToObject(frame, "id", text->id);
+        cJSON_AddStringToObject(frame, "text", text->text);
+        send_frame(frame);
+        text_retry_at = now + ACK_TIMEOUT_US;
+    }
+    free(text);
+}
+
+static bool json_uint(const cJSON *value, uint32_t *out)
+{
+    if (!cJSON_IsNumber(value) || !(value->valuedouble >= 0 && value->valuedouble <= UINT32_MAX)) return false;
+    *out = (uint32_t)value->valuedouble;
+    return value->valuedouble == *out;
 }
 
 static void request(cJSON *value)
@@ -388,7 +446,7 @@ static void stop_prompt(void)
 
 static void append_prompt(int *ids, int *length, int prompt)
 {
-    if (*length < 16) ids[(*length)++] = prompt;
+    if (*length < PROMPT_SEQUENCE_CAPACITY) ids[(*length)++] = prompt;
 }
 
 static void append_number(int *ids, int *length, int value)
@@ -401,7 +459,7 @@ static void append_number(int *ids, int *length, int value)
 static void start_prompt_sequence(const int *ids, int length, prompt_action_t action)
 {
     stop_prompt();
-    prompt_length = length > 16 ? 16 : length;
+    prompt_length = length > PROMPT_SEQUENCE_CAPACITY ? PROMPT_SEQUENCE_CAPACITY : length;
     for (int i = 0; i < prompt_length; i++) prompt_ids[i] = ids[i];
     prompt_position = 0;
     prompt_action = action;
@@ -510,8 +568,8 @@ static void queue_light_modes(const char *const modes[LIGHT_PIXEL_COUNT])
 static void refresh_lights(int64_t now)
 {
     const bool unread = earliest_unread() != NULL;
-    const bool recording = mode == MODE_RECORDING;
-    const bool sending = uploading() || job == JOB_CACHE || voice_outbox_count() > 0;
+    const bool recording = mode == MODE_RECORDING || mode == MODE_STT;
+    const bool sending = uploading() || job == JOB_CACHE || voice_outbox_count() > 0 || xiaozhi_stt_pending(NULL);
     const bool realtime = realtime_active;
     const bool alarm_set = timers_alarm_minute() >= 0;
     const bool alarm_fired = alarm_set && alarm_fired_at_us != 0 &&
@@ -853,12 +911,8 @@ static void begin_health_record(bool blood_pressure)
         (health_kind_t)(HEALTH_FATHER_GLUCOSE + next_glucose++ % 2);
     health_edit_begin(&health_edit, kind);
     mode = MODE_SETTING_HEALTH;
-    int ids[16], length = 0, previous;
+    int ids[PROMPT_SEQUENCE_CAPACITY], length = 0;
     append_prompt(ids, &length, PROMPT_MOTHER_HIGH + kind);
-    if (health_record_get(kind, &previous)) {
-        append_prompt(ids, &length, PROMPT_HEALTH_LAST);
-        append_health_value(ids, &length, kind, previous);
-    } else append_prompt(ids, &length, PROMPT_HEALTH_NO_PREVIOUS);
     append_prompt(ids, &length, PROMPT_HEALTH_INPUT);
     append_health_value(ids, &length, kind, health_edit.value);
     start_prompt_sequence(ids, length, PROMPT_ACTION_NONE);
@@ -870,7 +924,7 @@ static void commit_health_record(void)
     const int value = health_edit.value;
     const bool saved = health_edit_save(&health_edit);
     mode = MODE_IDLE;
-    int ids[16], length = 0;
+    int ids[PROMPT_SEQUENCE_CAPACITY], length = 0;
     if (saved) {
         append_prompt(ids, &length, PROMPT_MOTHER_HIGH + kind);
         append_health_value(ids, &length, kind, value);
@@ -903,8 +957,9 @@ static void confirm_ledger_record(void)
         return;
     }
     const bool saved = ledger_edit_save(&ledger_edit);
+    if (saved) { ledger_generation++; summary_retry_at = 0; summary_request_id[0] = 0; }
     mode = MODE_IDLE;
-    int ids[16], length = 0;
+    int ids[PROMPT_SEQUENCE_CAPACITY], length = 0;
     if (saved) {
         append_number(ids, &length, amount);
         append_prompt(ids, &length, PROMPT_YUAN);
@@ -915,6 +970,15 @@ static void confirm_ledger_record(void)
 
 static void cancel_recording(void)
 {
+    pending_click = -1; second_click = false;
+    if (mode == MODE_STT || xiaozhi_stt_busy() || xiaozhi_stt_pending(NULL) || prompt_action == PROMPT_ACTION_START_STT) {
+        stop_prompt();
+        const bool ok = xiaozhi_stt_cancel();
+        text_request_id[0] = 0;
+        mode = MODE_IDLE;
+        start_prompt(ok ? PROMPT_RECORD_CANCELLED : PROMPT_RECORD_CANCEL_FAILED, PROMPT_ACTION_NONE);
+        return;
+    }
     if (mode != MODE_RECORDING && job != JOB_CACHE && !hold_id[0] &&
         prompt_action != PROMPT_ACTION_START_RECORDING) return;
     stop_prompt();
@@ -939,6 +1003,9 @@ static void cancel_recording(void)
 static void start_realtime(void)
 {
     if (realtime_active) return;
+    if (mode == MODE_STT || xiaozhi_stt_busy() || prompt_action == PROMPT_ACTION_START_STT) {
+        realtime_enabled = false; send_realtime_stop(); return;
+    }
     audio_snapshot_t audio;
     audio_get_snapshot(&audio);
     if (audio.recording || prompt_action == PROMPT_ACTION_START_RECORDING ||
@@ -966,6 +1033,7 @@ static void start_realtime(void)
 
 static void on_short_key(int key)
 {
+    if (mode == MODE_STT || xiaozhi_stt_busy()) return;
     const int64_t now = esp_timer_get_time();
     if (mode == MODE_SETTING_ALARM || mode == MODE_SETTING_TIMER) {
         if (key == 2 || key == 3) {
@@ -1023,6 +1091,71 @@ static void on_short_key(int key)
     }
 }
 
+static void announce_recent_health(bool pressure)
+{
+    int ids[PROMPT_SEQUENCE_CAPACITY], length = 0;
+    const int first = pressure ? 0 : HEALTH_FATHER_GLUCOSE;
+    const int end = pressure ? 4 : HEALTH_RECORD_COUNT;
+    for (int kind = first; kind < end; kind++) {
+        int value;
+        append_prompt(ids, &length, PROMPT_MOTHER_HIGH + kind);
+        if (health_record_get(kind, &value)) append_health_value(ids, &length, kind, value);
+        else append_prompt(ids, &length, PROMPT_HEALTH_NO_PREVIOUS);
+    }
+    start_prompt_sequence(ids, length, PROMPT_ACTION_NONE);
+}
+
+static void append_amount(int *ids, int *length, uint32_t value)
+{
+    if (value <= 999) append_number(ids, length, value);
+    else {
+        append_prompt(ids, length, PROMPT_LARGE_DIGITS);
+        char digits[11]; snprintf(digits, sizeof(digits), "%lu", (unsigned long)value);
+        for (int i = 0; digits[i]; i++) append_prompt(ids, length, PROMPT_DIGIT_0 + digits[i] - '0');
+    }
+    append_prompt(ids, length, PROMPT_YUAN);
+}
+
+static void announce_ledger(void)
+{
+    ledger_summary_t summary = {0};
+    int ids[PROMPT_SEQUENCE_CAPACITY], length = 0;
+    append_prompt(ids, &length, PROMPT_LEDGER_LATEST);
+    if (ledger_summary_get(&summary) && summary.latest) append_amount(ids, &length, summary.latest);
+    else append_prompt(ids, &length, PROMPT_HEALTH_NO_PREVIOUS);
+    if (!summary.complete) append_prompt(ids, &length, PROMPT_LEDGER_INCOMPLETE);
+    else for (int i = 0; i < 3; i++) {
+        append_prompt(ids, &length, PROMPT_LEDGER_TODAY + i);
+        append_amount(ids, &length, summary.totals[i]);
+    }
+    if (summary.unknown) append_prompt(ids, &length, PROMPT_LEDGER_UNDATED);
+    summary_retry_at = 0;
+    start_prompt_sequence(ids, length, PROMPT_ACTION_NONE);
+}
+
+static void on_double_key(int key)
+{
+    if (key == 4) {
+        if (mode == MODE_RECORDING || mode == MODE_RECORD_READY || job == JOB_CACHE || hold_id[0] ||
+            xiaozhi_stt_busy() || xiaozhi_stt_pending(NULL) || realtime_active) return;
+        if (uploading()) { start_prompt(PROMPT_STT_FAILED, PROMPT_ACTION_NONE); return; }
+        stop_message_playback();
+        if (job != JOB_IDLE) finish_job();
+        settings_commit_at = 0;
+        mode = MODE_STT;
+        start_prompt(PROMPT_STT_START, PROMPT_ACTION_START_STT);
+    } else if (key == 5) announce_ledger();
+    else announce_recent_health(key == 6);
+}
+
+static void poll_click(int64_t now)
+{
+    if (pending_click < 0 || now <= click_deadline) return;
+    const int key = pending_click;
+    pending_click = -1;
+    on_short_key(key);
+}
+
 static bool on_long_key(int key);
 
 static int64_t key_long_threshold(int key)
@@ -1033,7 +1166,7 @@ static int64_t key_long_threshold(int key)
 static void on_key(int key, bool down)
 {
     if (key < 0 || key > 8) return;
-    const int64_t now = esp_timer_get_time();
+    const int64_t now = input_timestamp ? input_timestamp : esp_timer_get_time();
     diag_last_key = key;
     diag_last_key_mode = mode;
     if (down && key == 4) diag_s5_events++;
@@ -1042,6 +1175,48 @@ static void on_key(int key, bool down)
         else diag_s6_up_events++;
     }
     if (down && key == 6) diag_s7_events++;
+    // S5-S8 release/press pairs are resolved before any single-click action.
+    // A second press at exactly 400 ms still belongs to the double click.
+    if (down && pending_click >= 0 && (key != pending_click || now > click_deadline)) {
+        if (key == 8 || (key == pending_click && now > click_deadline)) poll_click(click_deadline + 1);
+        else pending_click = -1;
+    }
+    if (key >= 4 && key <= 7) {
+        if (down) {
+            if (key_down[key]) return;
+            second_click = pending_click == key && now <= click_deadline;
+            pending_click = -1;
+            key_consumed[key] = key_held[key] = key_long_handled[key] = false;
+            key_down[key] = now;
+            if (mark_all_read_confirming || mode == MODE_COUNTDOWN || (realtime_active && key == 4) ||
+                ((mode == MODE_RECORDING || job == JOB_CACHE || mode == MODE_STT || xiaozhi_stt_busy()) && key != 4)) {
+                if (mode == MODE_COUNTDOWN) cancel_countdown(false);
+                key_consumed[key] = true;
+                return;
+            }
+            if (key != 4 || (mode != MODE_RECORDING && mode != MODE_RECORD_READY && job != JOB_CACHE &&
+                mode != MODE_STT && !hold_id[0] && prompt_action != PROMPT_ACTION_START_RECORDING &&
+                prompt_action != PROMPT_ACTION_START_STT)) {
+                stop_message_playback(); stop_prompt();
+            }
+            if (key_down[8]) key_consumed[8] = true;
+            health_edit_cancel(&health_edit); ledger_edit_cancel(&ledger_edit);
+            if (mode == MODE_SETTING_HEALTH || mode == MODE_SETTING_LEDGER) mode = MODE_IDLE;
+        } else {
+            if (!key_down[key]) return;
+            bool handled = key_consumed[key] || key_long_handled[key];
+            if (!handled && now - key_down[key] >= key_long_threshold(key)) handled = on_long_key(key);
+            key_down[key] = 0;
+            key_held[key] = key_long_handled[key] = key_consumed[key] = false;
+            if (!handled) {
+                if (second_click) on_double_key(key);
+                else { pending_click = key; click_deadline = now + DOUBLE_CLICK_US; }
+            }
+            second_click = false;
+        }
+        return;
+    }
+    if ((mode == MODE_STT || xiaozhi_stt_busy()) && down) { key_consumed[key] = true; return; }
     if ((health_edit.active || ledger_edit.active) && key == 8) {
         if (down) {
             key_consumed[key] = key_held[key] = key_long_handled[key] = false;
@@ -1053,20 +1228,6 @@ static void on_key(int key, bool down)
             key_held[key] = key_long_handled[key] = key_consumed[key] = false;
             if (!handled) on_short_key(key);
         }
-        return;
-    }
-    // Record editors can be selected while their introductions are speaking.
-    if (down && key >= 5 && key <= 7 && !mark_all_read_confirming &&
-        mode != MODE_RECORDING && job != JOB_CACHE && mode != MODE_COUNTDOWN) {
-        stop_message_playback();
-        stop_prompt();
-        key_consumed[key] = key_held[key] = key_long_handled[key] = false;
-        key_down[key] = now;
-        // A new selection discards the previous unsaved draft.
-        if (key_down[8]) key_consumed[8] = true;
-        health_edit_cancel(&health_edit);
-        ledger_edit_cancel(&ledger_edit);
-        if (mode == MODE_SETTING_HEALTH || mode == MODE_SETTING_LEDGER) mode = MODE_IDLE;
         return;
     }
     if ((health_edit.active || ledger_edit.active) && down) {
@@ -1187,15 +1348,17 @@ static bool on_long_key(int key)
 
 static void on_rotate(int delta)
 {
+    if (pending_click >= 5) poll_click(click_deadline + 1);
+    if (mode == MODE_STT || xiaozhi_stt_busy()) return;
     if (delta == 0) return;
     if (health_edit.active) {
         health_edit_rotate(&health_edit, delta);
-        int ids[16], length = 0;
+        int ids[PROMPT_SEQUENCE_CAPACITY], length = 0;
         append_health_value(ids, &length, health_edit.kind, health_edit.value);
         start_prompt_sequence(ids, length, PROMPT_ACTION_NONE);
     } else if (ledger_edit.active) {
         ledger_edit_rotate(&ledger_edit, delta);
-        int ids[16], length = 0;
+        int ids[PROMPT_SEQUENCE_CAPACITY], length = 0;
         append_number(ids, &length, ledger_edit.ones ? ledger_edit.digit : ledger_edit.high);
         start_prompt_sequence(ids, length, PROMPT_ACTION_NONE);
     } else if (mode == MODE_SETTING_ALARM) {
@@ -1232,7 +1395,7 @@ static void commit_settings(int64_t now)
     if (mode != MODE_SETTING_ALARM && mode != MODE_SETTING_TIMER) return;
     if (settings_commit_at == 0 || now < settings_commit_at) return;
     settings_commit_at = 0;
-    int ids[16], length = 0;
+    int ids[PROMPT_SEQUENCE_CAPACITY], length = 0;
     if (mode == MODE_SETTING_ALARM) {
         const bool saved = timers_set_alarm_minute(alarm_draft);
         mode = MODE_IDLE;
@@ -1254,6 +1417,11 @@ static void commit_settings(int64_t now)
 
 static void handle_timer_events(unsigned timer_events, int64_t now)
 {
+    if ((timer_events & (TIMER_EVENT_ALARM | TIMER_EVENT_DONE)) &&
+        (mode == MODE_STT || xiaozhi_stt_busy())) {
+        (void)xiaozhi_stt_cancel();
+        pending_click = -1;
+    }
     if (timer_events & TIMER_EVENT_ALARM) {
         alarm_fired_at_us = now;
         stop_message_playback();
@@ -1271,7 +1439,7 @@ static void handle_timer_events(unsigned timer_events, int64_t now)
         start_prompt(PROMPT_COUNTDOWN_DONE, PROMPT_ACTION_NONE);
     } else if (timer_events & TIMER_EVENT_MINUTE) {
         if (!prompt_playing && mode == MODE_COUNTDOWN) {
-            int ids[16], length = 0;
+            int ids[PROMPT_SEQUENCE_CAPACITY], length = 0;
             append_prompt(ids, &length, PROMPT_REMAINING);
             append_number(ids, &length, timers_countdown_seconds() / 60);
             append_prompt(ids, &length, PROMPT_MINUTES);
@@ -1288,11 +1456,36 @@ static void receive(cJSON *value)
     const cJSON *op = cJSON_GetObjectItemCaseSensitive(value, "op");
     const cJSON *req = cJSON_GetObjectItemCaseSensitive(value, "req");
     if (!cJSON_IsString(op)) return;
+    if (cJSON_IsString(req) && text_request_id[0] && !strcmp(req->valuestring, text_request_id)) {
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(value, "id");
+        if (!strcmp(op->valuestring, "text.ack") && cJSON_IsString(id) && !strcmp(id->valuestring, text_inflight_id) && xiaozhi_stt_ack(id->valuestring)) {
+            text_request_id[0] = 0;
+            text_sent_announce_pending = true;
+            if (mode == MODE_STT) mode = MODE_IDLE;
+        }
+        return;
+    }
+    if (cJSON_IsString(req) && summary_request_id[0] && !strcmp(req->valuestring, summary_request_id)) {
+        if (!strcmp(op->valuestring, "ledger.summary") && summary_generation == ledger_generation && !ledger_pending_count()) {
+            ledger_summary_t summary = {.complete = true};
+            uint32_t day, latest;
+            const cJSON *totals = cJSON_GetObjectItemCaseSensitive(value, "totals");
+            bool valid = json_uint(cJSON_GetObjectItemCaseSensitive(value, "day"), &day) &&
+                json_uint(cJSON_GetObjectItemCaseSensitive(value, "latest"), &latest) && latest <= 999 &&
+                json_uint(cJSON_GetObjectItemCaseSensitive(value, "unknown"), &summary.unknown) &&
+                cJSON_IsArray(totals) && cJSON_GetArraySize(totals) == 3;
+            for (int i = 0; valid && i < 3; i++) valid = json_uint(cJSON_GetArrayItem(totals, i), &summary.totals[i]);
+            if (valid) { summary.day = day; summary.latest = latest; (void)ledger_summary_apply(&summary); }
+        }
+        summary_request_id[0] = 0;
+        return;
+    }
     if (cJSON_IsString(req) && ledger_request_id[0] && strcmp(req->valuestring, ledger_request_id) == 0) {
         const cJSON *id = cJSON_GetObjectItemCaseSensitive(value, "id");
         if (strcmp(op->valuestring, "ledger.ack") == 0 && cJSON_IsString(id) &&
             strcmp(id->valuestring, ledger_inflight_id) == 0 && ledger_pending_ack(id->valuestring)) {
             ledger_request_id[0] = '\0';
+            summary_retry_at = 0;
             ledger_retry_at = esp_timer_get_time() + 200000;
         }
         return;
@@ -1506,6 +1699,9 @@ static void prompt_task_step(int64_t now)
             prompt_length = 0;
             prompt_action = PROMPT_ACTION_NONE;
             if (action == PROMPT_ACTION_START_RECORDING) start_recording();
+            else if (action == PROMPT_ACTION_START_STT && xiaozhi_stt_start() != ESP_OK) {
+                mode = MODE_IDLE; start_prompt(PROMPT_STT_FAILED, PROMPT_ACTION_NONE);
+            }
             else if (action == PROMPT_ACTION_SETTINGS_CONFIRM) {
                 settings_commit_at = now + SETTINGS_COMMIT_US;
             }
@@ -1533,8 +1729,10 @@ static void task(void *argument)
         }
         if (have_input) {
             diag_stage = 3;
+            input_timestamp = input_event.at;
             if (input_event.delta != 0) on_rotate(input_event.delta);
             else on_key(input_event.key, input_event.down);
+            input_timestamp = 0;
         }
         if (have_control && control_event.json != NULL) {
             diag_stage = 4;
@@ -1545,10 +1743,12 @@ static void task(void *argument)
 
         diag_stage = 5;
         const int64_t now = esp_timer_get_time();
+        const bool inputs_drained = uxQueueMessagesWaiting(input_events) == 0;
+        if (inputs_drained) poll_click(now);
         if (now >= probe_at) probe(now);
         for (int key = 0; key < 9; key++) {
             const int64_t threshold = key_long_threshold(key);
-            if (key_down[key] && !key_held[key] && !key_consumed[key] && now - key_down[key] >= threshold) {
+            if (inputs_drained && key_down[key] && !key_held[key] && !key_consumed[key] && now - key_down[key] >= threshold) {
                 key_held[key] = true;
                 key_long_handled[key] = on_long_key(key);
             }
@@ -1568,6 +1768,26 @@ static void task(void *argument)
         commit_settings(now);
         sync_health(now);
         sync_ledger(now);
+        sync_summary(now);
+        sync_text(now);
+        stt_event_t stt_event;
+        while (xiaozhi_stt_poll(&stt_event)) {
+            if (stt_event.kind == STT_WAIT) {
+                if (mode == MODE_STT) start_prompt(PROMPT_STT_WAIT, PROMPT_ACTION_NONE);
+            }
+            else if (stt_event.kind == STT_DONE) { mode = MODE_IDLE; text_retry_at = 0; }
+            else if (stt_event.kind == STT_CANCELLED) { if (mode == MODE_STT) mode = MODE_IDLE; }
+            else {
+                mode = MODE_IDLE;
+                if (stt_event.kind == STT_ACTIVATE) {
+                    int ids[PROMPT_SEQUENCE_CAPACITY], length = 0;
+                    append_prompt(ids, &length, PROMPT_STT_ACTIVATE);
+                    for (int i = 0; stt_event.code[i]; i++) if (stt_event.code[i] >= '0' && stt_event.code[i] <= '9')
+                        append_prompt(ids, &length, PROMPT_DIGIT_0 + stt_event.code[i] - '0');
+                    start_prompt_sequence(ids, length, PROMPT_ACTION_NONE);
+                } else start_prompt(stt_event.kind == STT_EMPTY ? PROMPT_STT_EMPTY : PROMPT_STT_FAILED, PROMPT_ACTION_NONE);
+            }
+        }
 
         diag_stage = 7;
         audio_snapshot_t audio;
@@ -1583,6 +1803,11 @@ static void task(void *argument)
                 release_audio();
                 mode = MODE_IDLE;
             }
+        }
+        if (text_sent_announce_pending && mode == MODE_IDLE && !xiaozhi_stt_busy() &&
+            !audio.recording && !health_edit.active && !ledger_edit.active && !prompt_length && !audio.speaker_playing) {
+            text_sent_announce_pending = false;
+            start_prompt(PROMPT_TEXT_SENT, PROMPT_ACTION_NONE);
         }
         if (volume_announce_pending && !audio.recording && prompt_length == 0 && !audio.speaker_playing) {
             volume_announce_pending = false;
@@ -1648,7 +1873,7 @@ static void task(void *argument)
         diag_stage = 11;
 
         if (job == JOB_IDLE && network_fresh(now) && !prompt_playing && !health_edit.active && !ledger_edit.active && !realtime_active && mode != MODE_RECORDING &&
-            mode != MODE_PLAYING && mode != MODE_COUNTDOWN) {
+            mode != MODE_PLAYING && mode != MODE_COUNTDOWN && mode != MODE_STT && !xiaozhi_stt_busy()) {
             message_t *receipt = NULL;
             for (int i = 0; i < message_count; i++) if (messages[i].pending_read) { receipt = &messages[i]; break; }
             if (receipt != NULL) mark_read(receipt);
@@ -1746,6 +1971,7 @@ void voice_chat_init(void (*send)(const char *line),
     timers_init();
     health_records_init();
     ledger_records_init();
+    xiaozhi_stt_init();
     snapshot.alarm_minute = -1;
     messages = heap_caps_calloc(MAX_MESSAGES, sizeof(*messages), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (messages == NULL) {
@@ -1788,7 +2014,7 @@ bool voice_chat_receive(const cJSON *value)
 void voice_chat_key(int key, bool pressed)
 {
     if (input_events == NULL) return;
-    const event_t event = {.key = key, .down = pressed};
+    const event_t event = {.key = key, .down = pressed, .at = esp_timer_get_time()};
     if (xQueueSend(input_events, &event, 0) == pdTRUE) xSemaphoreGive(event_ready);
     else {
         portENTER_CRITICAL(&snapshot_lock);
@@ -1800,7 +2026,7 @@ void voice_chat_key(int key, bool pressed)
 void voice_chat_rotate(int delta)
 {
     if (input_events == NULL) return;
-    const event_t event = {.delta = delta};
+    const event_t event = {.delta = delta, .at = esp_timer_get_time()};
     if (xQueueSend(input_events, &event, 0) == pdTRUE) xSemaphoreGive(event_ready);
     else {
         portENTER_CRITICAL(&snapshot_lock);

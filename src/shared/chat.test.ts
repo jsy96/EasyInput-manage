@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   AUDIO_LIMIT, REALTIME_FRAME_BYTES, REALTIME_FRAME_SAMPLES, adjacentMessage,
   decodeMulaw, decodeRealtimePacket, encodeMulaw, encodeRealtimePacket, isRealtimePacket,
-  latestUnreadMessage, sortMessages,
+  latestUnreadMessage, sortMessages, isChatMessage,
 } from './chat'
 import type { ChatMessage } from './chat'
 const message = (id: string, created: number, read = false, sender = 'computer'): ChatMessage => ({ id, sender, name: '电脑', samples: 8000, created, read })
@@ -39,4 +39,10 @@ describe('voice timeline behavior', () => {
     packet[5] = 2
     expect(isRealtimePacket(packet)).toBe(false)
   })
+})
+
+it('validates board text without accepting a fake audio clip', () => {
+  const m = { id: 'text', sender: 'board', name: '开发板', samples: 0, created: 1, read: true, kind: 'text', text: '你好' }
+  expect(isChatMessage(m)).toBe(true)
+  for (const patch of [{ samples: 1 }, { read: false }, { sender: 'browser' }, { text: ' ' }, { text: '字'.repeat(1001) }, { kind: 'html' }]) expect(isChatMessage({ ...m, ...patch })).toBe(false)
 })

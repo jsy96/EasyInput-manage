@@ -28,3 +28,12 @@ void ledger_edit_cancel(ledger_edit_t *edit);
 bool ledger_pending_oldest(ledger_pending_t *record);
 bool ledger_pending_ack(const char *id);
 unsigned ledger_pending_count(void);
+typedef struct {
+    int64_t day;
+    uint32_t totals[3];
+    uint32_t unknown;
+    int latest;
+    bool complete;
+} ledger_summary_t;
+bool ledger_summary_get(ledger_summary_t *summary);
+bool ledger_summary_apply(const ledger_summary_t *summary);

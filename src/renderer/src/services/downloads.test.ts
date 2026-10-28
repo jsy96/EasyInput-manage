@@ -49,3 +49,9 @@ it('partitions all 5000 voices into bounded ZIP batches without duplicates', () 
   expect(batches.flat()).toEqual(messages)
   expect(voiceZipBatches(messages.slice(0, 101)).map(batch => batch.length)).toEqual([100, 1])
 })
+
+it('omits transcription text from ZIP audio batches', () => {
+  const voice = { id: 'voice', sender: 'board', name: '开发板', samples: 100, created: 1, read: false }
+  const text = { ...voice, id: 'text', kind: 'text' as const, text: '你好', samples: 0, read: true }
+  expect(voiceZipBatches([voice, text])).toEqual([[voice]])
+})

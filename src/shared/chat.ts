@@ -11,6 +11,7 @@ export const REALTIME_SAMPLE_RATE = 16_000
 export const REALTIME_FRAME_SAMPLES = 320
 export const REALTIME_HEADER_BYTES = 12
 export const REALTIME_FRAME_BYTES = REALTIME_HEADER_BYTES + REALTIME_FRAME_SAMPLES * 2
+export const CHAT_TEXT_LIMIT = 1000
 export interface ChatMessage {
   id: string
   sender: string
@@ -18,7 +19,10 @@ export interface ChatMessage {
   samples: number
   created: number
   read: boolean
+  kind?: 'voice' | 'text'
+  text?: string
 }
+export function isVoiceMessage(m: ChatMessage): boolean { return m.kind !== 'text' }
 export interface ChatCursor { created: number; id: string }
 export interface ChatPage {
   messages: ChatMessage[]
@@ -36,7 +40,9 @@ export function isChatCursor(value: unknown): value is ChatCursor {
 export function isChatMessage(value: unknown): value is ChatMessage {
   const m = value as ChatMessage | null
   return isChatCursor(m) && typeof m.sender === 'string' && typeof m.name === 'string' &&
-    Number.isInteger(m.samples) && m.samples > 0 && m.samples <= AUDIO_LIMIT && typeof m.read === 'boolean'
+    typeof m.read === 'boolean' && (m.kind === 'text'
+      ? m.samples === 0 && m.sender === 'board' && m.read && typeof m.text === 'string' && m.text.trim().length > 0 && m.text.length <= CHAT_TEXT_LIMIT
+      : (m.kind === undefined || m.kind === 'voice') && Number.isInteger(m.samples) && m.samples > 0 && m.samples <= AUDIO_LIMIT)
 }
 export interface ChatClient { id: string; name: string; online?: boolean }
 export interface RoomState {

@@ -1,11 +1,11 @@
 import {
   AUDIO_CHUNK, AUDIO_LIMIT, AUDIO_STREAM_WINDOW, CHAT_LIMIT, CHAT_PAGE_SIZE, BOARD_INDEX_PAGE_SIZE, CHAT_VERSION,
-  isRealtimePacket, sortMessages, validId, isChatCursor, isChatMessage, compareMessages,
+  isRealtimePacket, sortMessages, validId, isChatCursor, isChatMessage, compareMessages, isVoiceMessage, CHAT_TEXT_LIMIT,
 } from '../../src/shared/chat'
 import type { ChatClient, ChatMessage, ChatCursor, ChatPage } from '../../src/shared/chat'
 import { isHealthMeasurement } from '../../src/shared/health'
 import type { HealthRecord } from '../../src/shared/health'
-import { isLedgerEntry } from '../../src/shared/ledger'
+import { isLedgerEntry, ledgerDay } from '../../src/shared/ledger'
 import type { LedgerRecord } from '../../src/shared/ledger'
 
 type Attachment = { role: 'board' | 'browser'; client?: string; name?: string; last?: number; uptime?: number; healthPending?: number; ledgerPending?: number }
@@ -247,7 +247,7 @@ export class DeviceRoomV2 {
   }
   private async chat(socket: WebSocket, v: Frame, board: boolean, locked = false): Promise<void> {
     if (v.protocol !== CHAT_VERSION) return
-    if (['begin', 'chunk', 'chunks', 'commit', 'read', 'readAll'].includes(String(v.op)) && !locked) {
+    if (['begin', 'chunk', 'chunks', 'commit', 'read', 'readAll', 'text.put', 'ledger.put', 'ledger.summary'].includes(String(v.op)) && !locked) {
       // Expected upload errors must leave the concurrency gate normally, otherwise the runtime resets the object.
       let failed = false, failure: unknown
       await this.state.blockConcurrencyWhile(async () => {
@@ -263,6 +263,32 @@ export class DeviceRoomV2 {
     }
     const sender = board ? 'board' : a.client!
     const id = v.id
+    if (v.op === 'text.put') {
+      if (!board || !validId(id) || typeof v.text !== 'string' || !v.text.trim() || v.text.length > CHAT_TEXT_LIMIT) throw new Error('转写文字格式错误')
+      const items = await this.messages(), existing = items.find(m => m.id === id)
+      if (existing) {
+        if (existing.kind !== 'text' || existing.text !== v.text.trim()) throw new Error('消息 ID 已占用')
+        reply('text.ack', { id }); return
+      }
+      const delivered = await this.state.storage.get<true | 'text'>(`delivered:${id}`)
+      if (delivered === 'text') { reply('text.ack', { id }); return }
+      if (delivered) throw new Error('消息 ID 已占用')
+      let old: ChatMessage | undefined
+      if (items.length >= CHAT_LIMIT) {
+        const i = items.findIndex(m => m.sender === 'board' || m.read)
+        if (i < 0) throw new Error('群内未读消息已满')
+        ;[old] = items.splice(i, 1)
+      }
+      const m: ChatMessage = { id, sender: 'board', name: '开发板', kind: 'text', text: v.text.trim(), samples: 0,
+        created: Math.max(Date.now(), (this.history.at(-1)?.created ?? 0) + 1), read: true }
+      items.push(m)
+      const remove = old ? [`clip:${old.id}`, ...Array.from({ length: Math.ceil(old.samples / AUDIO_CHUNK) }, (_, i) => `audio:${old!.id}:${i}`)] : []
+      await this.saveMessages(items, { [`delivered:${id}`]: 'text' }, remove)
+      if (old) this.broadcast(frame('pruned', { ids: [old.id], ...this.stats() }), true)
+      reply('text.ack', { id })
+      this.broadcast(frame('message', { message: m, added: true, ...this.stats() }), true)
+      return
+    }
     if (v.op === 'ledger.put') {
       if (!board) throw new Error('只有开发板可以写入记账记录')
       if (!isLedgerEntry(v.record)) throw new Error('记账记录格式错误')
@@ -274,8 +300,36 @@ export class DeviceRoomV2 {
         const record: LedgerRecord = { id: input.id, amount: input.amount, recordedAt: input.recordedAt,
           uptimeMs: input.uptimeMs, receivedAt: Date.now(), sequence }
         await tx.put({ [`ledger:${sequence}`]: record, [`ledger-id:${input.id}`]: sequence, 'ledger-count': sequence })
+        if (await tx.get<boolean>('ledger-summary-ready')) {
+          const key = input.recordedAt === null ? 'ledger-unknown' : `ledger-day:${ledgerDay(input.recordedAt)}`
+          await tx.put(key, (await tx.get<number>(key) ?? 0) + (input.recordedAt === null ? 1 : input.amount))
+        }
       })
       reply('ledger.ack', { id: input.id })
+      return
+    }
+    if (v.op === 'ledger.summary' && board) {
+      const count = await this.state.storage.get<number>('ledger-count') ?? 0
+      if (!(await this.state.storage.get<boolean>('ledger-summary-ready'))) {
+        const totals = new Map<string, number>()
+        for (let offset = 1; offset <= count; offset += 100) {
+          const records = await Promise.all(Array.from({ length: Math.min(100, count - offset + 1) }, (_, i) => this.state.storage.get<LedgerRecord>(`ledger:${offset + i}`)))
+          for (const r of records) {
+            if (!r) throw new Error('记账历史暂时不可用')
+            const key = r.recordedAt === null ? 'ledger-unknown' : `ledger-day:${ledgerDay(r.recordedAt)}`
+            totals.set(key, (totals.get(key) ?? 0) + (r.recordedAt === null ? 1 : r.amount))
+          }
+        }
+        // Rebuilding overwrites each bucket, so retries cannot count a record twice.
+        const entries = [...totals]
+        for (let i = 0; i < entries.length; i += 100) await this.state.storage.put(Object.fromEntries(entries.slice(i, i + 100)))
+        await this.state.storage.put('ledger-summary-ready', true)
+      }
+      const day = ledgerDay(Date.now())
+      const totals = await Promise.all([0, 1, 2].map(i => this.state.storage.get<number>(`ledger-day:${day - i}`)))
+      const latest = count ? await this.state.storage.get<LedgerRecord>(`ledger:${count}`) : null
+      reply('ledger.summary', { day, totals: totals.map(n => n ?? 0), latest: latest?.amount ?? 0,
+        unknown: await this.state.storage.get<number>('ledger-unknown') ?? 0 })
       return
     }
     if (v.op === 'ledger.list' && !board) {
@@ -323,18 +377,19 @@ export class DeviceRoomV2 {
       return
     }
     if (v.op === 'index' && board) {
+      const voices = this.history.filter(isVoiceMessage)
       const offset = v.offset ?? 0
       if (!Number.isInteger(offset) || Number(offset) < 0 || Number(offset) > CHAT_LIMIT) throw new Error('语音索引参数错误')
       if (v.count === undefined) {
-        const m = this.history[Number(offset)]
+        const m = voices[Number(offset)]
         reply('index', m ? { offset, id: m.id, created: m.created, samples: m.samples, read: m.read } : { offset, end: true })
       } else {
         if (!Number.isInteger(v.count) || Number(v.count) < 1 || Number(v.count) > BOARD_INDEX_PAGE_SIZE) throw new Error('语音索引分页过大')
         if (Number(offset) === 0 && v.ifRevision === this.revision) { reply('index', { unchanged: true, revision: this.revision }); return }
         if (Number(offset) > 0 && v.revision !== this.revision) { reply('index', { restart: true, revision: this.revision }); return }
-        const items = this.history.slice(Number(offset), Number(offset) + Number(v.count)).map(m => ({ id: m.id, created: m.created, samples: m.samples, read: m.read }))
+        const items = voices.slice(Number(offset), Number(offset) + Number(v.count)).map(m => ({ id: m.id, created: m.created, samples: m.samples, read: m.read }))
         const next = Number(offset) + items.length
-        reply('index', { items, next, end: next >= this.history.length, revision: this.revision })
+        reply('index', { items, next, end: next >= voices.length, revision: this.revision })
       }
       return
     }
@@ -343,7 +398,7 @@ export class DeviceRoomV2 {
       const start = Number(v.index), count = v.op === 'stream' ? Math.min(AUDIO_STREAM_WINDOW, Number(v.count) || AUDIO_STREAM_WINDOW) : Math.min(MAX_BATCH, Number(v.count) || MAX_BATCH)
       if (!Number.isInteger(start) || start < 0 || !Number.isInteger(count) || count < 1) return
       const m = this.history.find(m => m.id === id)
-      if (!m) throw new Error('这条语音不可用')
+      if (!m || !isVoiceMessage(m)) throw new Error('这条语音不可用')
       const end = Math.min(Math.ceil(m.samples / AUDIO_CHUNK), start + count)
       const clip = await this.state.storage.get<ArrayBuffer>(`clip:${id}`)
       if (v.op === 'pullBatch') {
@@ -369,10 +424,14 @@ export class DeviceRoomV2 {
       const items = await this.messages()
       const existing = items.find((m) => m.id === id)
       if (existing) {
-        if (existing.sender !== sender) throw new Error('消息 ID 已占用')
+        if (!isVoiceMessage(existing) || existing.sender !== sender) throw new Error('消息 ID 已占用')
         reply('ack', { id, committed: true }); return
       }
-      if (board && await this.state.storage.get(`delivered:${id}`)) { reply('ack', { id, committed: true }); return }
+      if (board) {
+        const delivered = await this.state.storage.get<true | 'text'>(`delivered:${id}`)
+        if (delivered === 'text') throw new Error('消息 ID 已占用')
+        if (delivered) { reply('ack', { id, committed: true }); return }
+      }
       if (items.length >= CHAT_LIMIT && !items.some((m) => m.sender === 'board' || m.read)) throw new Error('已有 5000 条未读留言，请先播放后再发送')
       const key = `upload:${id}`
       let upload = await this.state.storage.get<Upload>(key)
@@ -422,8 +481,13 @@ export class DeviceRoomV2 {
       if (!validId(id)) return
       const items = await this.messages()
       const existing = items.find(m => m.id === id)
+      if (existing && (!isVoiceMessage(existing) || existing.sender !== sender)) throw new Error('消息 ID 已占用')
       if (existing?.sender === sender) { reply('ack', { id, committed: true }); return }
-      if (board && await this.state.storage.get(`delivered:${id}`)) { reply('ack', { id, committed: true }); return }
+      if (board) {
+        const delivered = await this.state.storage.get<true | 'text'>(`delivered:${id}`)
+        if (delivered === 'text') throw new Error('消息 ID 已占用')
+        if (delivered) { reply('ack', { id, committed: true }); return }
+      }
       const upload = await this.state.storage.get<Upload>(`upload:${id}`)
       if (!upload || upload.sender !== sender || upload.next !== Math.ceil(upload.samples / AUDIO_CHUNK)) throw new Error('语音尚未上传完整')
       let old: ChatMessage | undefined
