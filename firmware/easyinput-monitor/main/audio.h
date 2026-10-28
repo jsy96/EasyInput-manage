@@ -43,4 +43,6 @@ esp_err_t audio_play_voice(const uint8_t *buffer, size_t length);
 esp_err_t audio_play_voice_stream(const uint8_t *buffer, size_t length, size_t available);
 esp_err_t audio_voice_stream_extend(size_t available);
 esp_err_t audio_live_start(audio_microphone_sink_t sink);
+// Stops at an audio-task boundary and delivers the final partial PCM block
+// before detaching the sink. The callback must remain short and nonblocking.
 esp_err_t audio_live_stop(void);

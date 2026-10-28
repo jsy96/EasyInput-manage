@@ -48,6 +48,7 @@ static int16_t mulaw_decode(uint8_t value)
 static SemaphoreHandle_t audio_mutex;
 static audio_snapshot_t state;
 static volatile bool mic_stop_requested;
+static volatile esp_err_t microphone_stop_error;
 static i2s_chan_handle_t microphone_channel;
 static i2s_chan_handle_t speaker_channel;
 static bool microphone_enabled;
@@ -65,6 +66,17 @@ static int64_t tone_drain_until_us;
 static audio_microphone_sink_t live_sink;
 static int16_t live_chunk[LIVE_FRAME_FRAMES];
 static size_t live_chunk_frames;
+
+// Called only with audio_mutex held, after the current I2S block has been
+// delivered. Preserve the final short block before detaching the consumer.
+static void finish_live_capture(void)
+{
+    if (live_sink && live_chunk_frames) {
+        live_sink((const uint8_t *)live_chunk, live_chunk_frames * sizeof(int16_t));
+    }
+    live_sink = NULL;
+    live_chunk_frames = 0;
+}
 
 static esp_err_t safe_audio_pins(bool microphone)
 {
@@ -189,9 +201,11 @@ static void audio_task(void *arg)
             // The audio task owns the microphone teardown: callers request the
             // stop instead of contending with the busy capture loop for the
             // mutex, which starved the voice timeline task after S1.
-            mic_stop_requested = false;
             state.stage = 10;
-            (void)stop_channel(true);
+            finish_live_capture();
+            microphone_stop_error = stop_channel(true);
+            if (microphone_stop_error != ESP_OK) state.microphone_error = microphone_stop_error;
+            mic_stop_requested = false;
         }
         if (state.recording && esp_timer_get_time() >= record_deadline_us) (void)stop_channel(true);
         if (state.microphone_active) {
@@ -339,15 +353,17 @@ esp_err_t audio_set_microphone(bool on)
     for (int attempt = 0; attempt < 20; attempt++) {
         if (!mic_stop_requested) {
             state.stage = 9;
-            return ESP_OK;
+            return microphone_stop_error;
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     // Fallback: the capture task may be wedged; stop from here with a bounded
     // wait so this call can never hang the voice timeline task.
     if (xSemaphoreTake(audio_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return ESP_ERR_TIMEOUT;
-    mic_stop_requested = false;
+    finish_live_capture();
     const esp_err_t result = stop_channel(true);
+    microphone_stop_error = result;
+    mic_stop_requested = false;
     if (result != ESP_OK) state.microphone_error = result;
     xSemaphoreGive(audio_mutex);
     state.stage = 9;
@@ -487,25 +503,39 @@ esp_err_t audio_record_start(uint8_t *buffer, size_t capacity)
 }
 esp_err_t audio_record_stop(void) { return audio_set_microphone(false); }
 
-esp_err_t audio_live_start(audio_microphone_sink_t sink)
+typedef struct { audio_microphone_sink_t sink; } live_context_t;
+
+static esp_err_t start_live_capture(void *arg)
 {
-    if (sink == NULL || !audio_mutex || !state.ready) return ESP_ERR_INVALID_ARG;
+    const live_context_t *context = arg;
+    xSemaphoreTake(audio_mutex, portMAX_DELAY);
+    if (state.recording || live_sink) {
+        xSemaphoreGive(audio_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t result = start_channel(true);
     state.recording = false;
     record_buffer = NULL;
     record_capacity = 0;
-    live_sink = sink;
     live_chunk_frames = 0;
-    const esp_err_t result = audio_set_microphone(true);
-    if (result != ESP_OK) {
-        live_sink = NULL;
-        live_chunk_frames = 0;
+    state.microphone_error = result;
+    state.microphone_active = result == ESP_OK;
+    if (result == ESP_OK) {
+        microphone_started_us = microphone_last_data_us = esp_timer_get_time();
+        live_sink = context->sink;
     }
+    xSemaphoreGive(audio_mutex);
     return result;
+}
+
+esp_err_t audio_live_start(audio_microphone_sink_t sink)
+{
+    if (sink == NULL || !audio_mutex || !state.ready) return ESP_ERR_INVALID_ARG;
+    const live_context_t context = {.sink = sink};
+    return lights_with_shared_power(start_live_capture, (void *)&context);
 }
 
 esp_err_t audio_live_stop(void)
 {
-    live_sink = NULL;
-    live_chunk_frames = 0;
     return audio_set_microphone(false);
 }

@@ -172,6 +172,10 @@ static int pending_click = -1;
 static int64_t click_deadline;
 static bool second_click;
 static bool text_sent_announce_pending;
+static bool stt_s5_pressed;
+static bool stt_cancel_failed;
+static bool stt_cancel_announce_pending;
+static unsigned deferred_timer_events;
 static char summary_request_id[40], text_request_id[40], text_inflight_id[33];
 static unsigned ledger_generation, summary_generation;
 static int64_t summary_retry_at, text_retry_at;
@@ -232,7 +236,7 @@ static cJSON *new_frame(const char *op)
 
 static void sync_health(int64_t now)
 {
-    if (now < health_retry_at || !network_fresh(now)) return;
+    if (xiaozhi_stt_busy() || now < health_retry_at || !network_fresh(now)) return;
     health_pending_t record;
     if (!health_pending_oldest(&record)) return;
     static const char *const kinds[] = {"mother_high", "mother_low", "father_high", "father_low", "father_glucose", "mother_glucose"};
@@ -256,7 +260,7 @@ static void sync_health(int64_t now)
 
 static void sync_ledger(int64_t now)
 {
-    if (now < ledger_retry_at || !network_fresh(now)) return;
+    if (xiaozhi_stt_busy() || now < ledger_retry_at || !network_fresh(now)) return;
     ledger_pending_t record;
     if (!ledger_pending_oldest(&record)) return;
     cJSON *frame = new_frame("ledger.put");
@@ -285,7 +289,7 @@ static void send_frame(cJSON *frame)
 
 static void sync_summary(int64_t now)
 {
-    if (now < summary_retry_at || !network_fresh(now) || ledger_pending_count()) return;
+    if (xiaozhi_stt_busy() || now < summary_retry_at || !network_fresh(now) || ledger_pending_count()) return;
     cJSON *frame = new_frame("ledger.summary");
     snprintf(summary_request_id, sizeof(summary_request_id), "summary-%lu", (unsigned long)++sequence);
     summary_generation = ledger_generation;
@@ -458,6 +462,9 @@ static void append_number(int *ids, int *length, int value)
 
 static void start_prompt_sequence(const int *ids, int length, prompt_action_t action)
 {
+    // The streaming microphone must never transcribe our own speaker prompts.
+    // Terminal STT events are emitted only after microphone capture has stopped.
+    if (xiaozhi_stt_busy()) return;
     stop_prompt();
     prompt_length = length > PROMPT_SEQUENCE_CAPACITY ? PROMPT_SEQUENCE_CAPACITY : length;
     for (int i = 0; i < prompt_length; i++) prompt_ids[i] = ids[i];
@@ -568,7 +575,7 @@ static void queue_light_modes(const char *const modes[LIGHT_PIXEL_COUNT])
 static void refresh_lights(int64_t now)
 {
     const bool unread = earliest_unread() != NULL;
-    const bool recording = mode == MODE_RECORDING || mode == MODE_STT;
+    const bool recording = mode == MODE_RECORDING || mode == MODE_STT || xiaozhi_stt_busy();
     const bool sending = uploading() || job == JOB_CACHE || voice_outbox_count() > 0 || xiaozhi_stt_pending(NULL);
     const bool realtime = realtime_active;
     const bool alarm_set = timers_alarm_minute() >= 0;
@@ -975,8 +982,13 @@ static void cancel_recording(void)
         stop_prompt();
         const bool ok = xiaozhi_stt_cancel();
         text_request_id[0] = 0;
-        mode = MODE_IDLE;
-        start_prompt(ok ? PROMPT_RECORD_CANCELLED : PROMPT_RECORD_CANCEL_FAILED, PROMPT_ACTION_NONE);
+        text_sent_announce_pending = false;
+        stt_cancel_failed = !ok;
+        stt_cancel_announce_pending = xiaozhi_stt_busy();
+        if (!stt_cancel_announce_pending) {
+            mode = MODE_IDLE;
+            start_prompt(ok ? PROMPT_RECORD_CANCELLED : PROMPT_RECORD_CANCEL_FAILED, PROMPT_ACTION_NONE);
+        }
         return;
     }
     if (mode != MODE_RECORDING && job != JOB_CACHE && !hold_id[0] &&
@@ -1142,6 +1154,9 @@ static void on_double_key(int key)
         stop_message_playback();
         if (job != JOB_IDLE) finish_job();
         settings_commit_at = 0;
+        stt_cancel_failed = false;
+        stt_cancel_announce_pending = false;
+        text_sent_announce_pending = false;
         mode = MODE_STT;
         start_prompt(PROMPT_STT_START, PROMPT_ACTION_START_STT);
     } else if (key == 5) announce_ledger();
@@ -1175,6 +1190,36 @@ static void on_key(int key, bool down)
         else diag_s6_up_events++;
     }
     if (down && key == 6) diag_s7_events++;
+    // In continuous STT the release of S5 stops immediately. Keep a separate
+    // press latch so a terminal event between press/release cannot start an
+    // ordinary voice recording, and holding S5 can still cancel instead.
+    if (key == 4 && !down && stt_s5_pressed) {
+        const bool long_handled = key_long_handled[key] ||
+            (key_down[key] && now - key_down[key] >= SETUP_LONG_US && on_long_key(key));
+        stt_s5_pressed = false;
+        key_down[key] = 0;
+        key_held[key] = key_long_handled[key] = key_consumed[key] = false;
+        pending_click = -1; second_click = false;
+        if (!long_handled) {
+            if (xiaozhi_stt_busy()) xiaozhi_stt_stop();
+            else if (prompt_action == PROMPT_ACTION_START_STT) { stop_prompt(); mode = MODE_IDLE; }
+        }
+        return;
+    }
+    if (mode == MODE_STT || xiaozhi_stt_busy() || prompt_action == PROMPT_ACTION_START_STT) {
+        pending_click = -1; second_click = false;
+        if (down) {
+            if (key_down[key]) return;
+            key_down[key] = now;
+            key_held[key] = key_long_handled[key] = false;
+            key_consumed[key] = key != 4;
+            if (key == 4) stt_s5_pressed = true;
+        } else {
+            key_down[key] = 0;
+            key_held[key] = key_long_handled[key] = key_consumed[key] = false;
+        }
+        return;
+    }
     // S5-S8 release/press pairs are resolved before any single-click action.
     // A second press at exactly 400 ms still belongs to the double click.
     if (down && pending_click >= 0 && (key != pending_click || now > click_deadline)) {
@@ -1417,11 +1462,13 @@ static void commit_settings(int64_t now)
 
 static void handle_timer_events(unsigned timer_events, int64_t now)
 {
-    if ((timer_events & (TIMER_EVENT_ALARM | TIMER_EVENT_DONE)) &&
-        (mode == MODE_STT || xiaozhi_stt_busy())) {
-        (void)xiaozhi_stt_cancel();
-        pending_click = -1;
+    if (mode == MODE_STT || xiaozhi_stt_busy()) {
+        // Do not cancel or speak over a continuous transcription session.
+        deferred_timer_events |= timer_events & (TIMER_EVENT_ALARM | TIMER_EVENT_DONE);
+        return;
     }
+    timer_events |= deferred_timer_events;
+    deferred_timer_events = 0;
     if (timer_events & TIMER_EVENT_ALARM) {
         alarm_fired_at_us = now;
         stop_message_playback();
@@ -1461,10 +1508,16 @@ static void receive(cJSON *value)
         if (!strcmp(op->valuestring, "text.ack") && cJSON_IsString(id) && !strcmp(id->valuestring, text_inflight_id) && xiaozhi_stt_ack(id->valuestring)) {
             text_request_id[0] = 0;
             text_sent_announce_pending = true;
-            if (mode == MODE_STT) mode = MODE_IDLE;
+            text_retry_at = 0;
         }
         return;
     }
+    // In-flight record acknowledgements and summary application write NVS.
+    // Defer them while STT is busy so flash operations cannot stall I2S;
+    // retain request IDs and pending records for an idempotent retry on exit.
+    // text.ack above still progresses continuously through the RAM STT queue.
+    if (xiaozhi_stt_busy() && (!strcmp(op->valuestring, "ledger.summary") ||
+        !strcmp(op->valuestring, "ledger.ack") || !strcmp(op->valuestring, "health.ack"))) return;
     if (cJSON_IsString(req) && summary_request_id[0] && !strcmp(req->valuestring, summary_request_id)) {
         if (!strcmp(op->valuestring, "ledger.summary") && summary_generation == ledger_generation && !ledger_pending_count()) {
             ledger_summary_t summary = {.complete = true};
@@ -1555,6 +1608,9 @@ static void receive(cJSON *value)
         return;
     }
     if (!cJSON_IsString(req) || strcmp(req->valuestring, request_id) != 0) return;
+    // Starting STT finishes previous history/playback jobs. A late reply to
+    // such a job must not move the ongoing streaming session back to idle.
+    if (mode == MODE_STT || xiaozhi_stt_busy()) return;
     if (strcmp(op->valuestring, "error") == 0) {
         if (uploading()) upload_failed();
         else if (job == JOB_MARK_ALL_READ) {
@@ -1773,10 +1829,17 @@ static void task(void *argument)
         stt_event_t stt_event;
         while (xiaozhi_stt_poll(&stt_event)) {
             if (stt_event.kind == STT_WAIT) {
-                if (mode == MODE_STT) start_prompt(PROMPT_STT_WAIT, PROMPT_ACTION_NONE);
+                // Keep the session quiet through final-result draining too.
             }
-            else if (stt_event.kind == STT_DONE) { mode = MODE_IDLE; text_retry_at = 0; }
-            else if (stt_event.kind == STT_CANCELLED) { if (mode == MODE_STT) mode = MODE_IDLE; }
+            else if (stt_event.kind == STT_DONE) { text_retry_at = 0; }
+            else if (stt_event.kind == STT_FINISHED) { if (mode == MODE_STT) mode = MODE_IDLE; }
+            else if (stt_event.kind == STT_CANCELLED) {
+                if (mode == MODE_STT) mode = MODE_IDLE;
+                if (stt_cancel_announce_pending) {
+                    stt_cancel_announce_pending = false;
+                    start_prompt(stt_cancel_failed ? PROMPT_RECORD_CANCEL_FAILED : PROMPT_RECORD_CANCELLED, PROMPT_ACTION_NONE);
+                }
+            }
             else {
                 mode = MODE_IDLE;
                 if (stt_event.kind == STT_ACTIVATE) {
@@ -1785,7 +1848,8 @@ static void task(void *argument)
                     for (int i = 0; stt_event.code[i]; i++) if (stt_event.code[i] >= '0' && stt_event.code[i] <= '9')
                         append_prompt(ids, &length, PROMPT_DIGIT_0 + stt_event.code[i] - '0');
                     start_prompt_sequence(ids, length, PROMPT_ACTION_NONE);
-                } else start_prompt(stt_event.kind == STT_EMPTY ? PROMPT_STT_EMPTY : PROMPT_STT_FAILED, PROMPT_ACTION_NONE);
+                } else start_prompt(stt_event.kind == STT_EMPTY ? PROMPT_STT_EMPTY :
+                    stt_event.kind == STT_FULL ? PROMPT_FULL : PROMPT_STT_FAILED, PROMPT_ACTION_NONE);
             }
         }
 
@@ -1804,12 +1868,12 @@ static void task(void *argument)
                 mode = MODE_IDLE;
             }
         }
-        if (text_sent_announce_pending && mode == MODE_IDLE && !xiaozhi_stt_busy() &&
+        if (text_sent_announce_pending && mode == MODE_IDLE && !xiaozhi_stt_busy() && !xiaozhi_stt_pending(NULL) &&
             !audio.recording && !health_edit.active && !ledger_edit.active && !prompt_length && !audio.speaker_playing) {
             text_sent_announce_pending = false;
             start_prompt(PROMPT_TEXT_SENT, PROMPT_ACTION_NONE);
         }
-        if (volume_announce_pending && !audio.recording && prompt_length == 0 && !audio.speaker_playing) {
+        if (volume_announce_pending && !xiaozhi_stt_busy() && mode != MODE_STT && !audio.recording && prompt_length == 0 && !audio.speaker_playing) {
             volume_announce_pending = false;
             announce_volume();
         }

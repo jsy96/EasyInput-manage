@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "audio.h"
+#include "stt_stream.h"
 #include "cJSON.h"
 #include "esp_app_desc.h"
 #include "esp_chip_info.h"
@@ -24,24 +25,32 @@
 #include "freertos/task.h"
 #include "nvs.h"
 
-#define PCM_BYTES (16000 * 2 * 20)
+// This is a jitter/connection-setup buffer, not a session duration limit.
+#define PCM_BYTES (1024 * 1024)
+#define STT_JSON_BYTES 16384
+#define TEXT_QUEUE_CAPACITY 128
+#define TEXT_BATCH_MAX ((STT_JSON_BYTES + 999) / 1000)
 #define OTA_URL "https://api.tenclass.net/xiaozhi/ota/"
 #define JSON_BYTES 16384
 static const char *TAG = "xiaozhi_stt";
-static SemaphoreHandle_t guard;
+static SemaphoreHandle_t guard, microphone_guard;
 static QueueHandle_t notifications, incoming;
 static TaskHandle_t worker;
-static bool busy, cancelled, storage_ready, capturing;
+static bool busy, cancelled, storage_ready, capturing, stop_requested, stop_intent, cancel_storage_failed;
+static bool transport_failed, capacity_failed, pending_durable, identity_ready, cancel_preparing;
 static uint8_t *pcm;
-static size_t pcm_length;
+static stt_stream_t stream;
 static portMUX_TYPE capture_lock = portMUX_INITIALIZER_UNLOCKED;
 static stt_text_t pending;
+static stt_text_t *text_queue;
+static size_t text_head, text_count;
 static char device[18], client[37];
-// Callback assembly is bounded, and owned exclusively by the WebSocket task.
-static char ws_json[4096];
+// Owned by the WebSocket task. Never put a 16 KiB assembly copy on its stack.
+static char ws_json[STT_JSON_BYTES];
 static size_t ws_used, ws_expected, ws_frame_start;
-static bool ws_accepting;
-typedef struct { char json[4096]; } incoming_t;
+static bool ws_accepting, ws_binary;
+typedef struct { char json[STT_JSON_BYTES]; } incoming_t;
+typedef struct { size_t offset, length; } text_slice_t;
 
 static bool is_cancelled(void)
 {
@@ -50,20 +59,83 @@ static bool is_cancelled(void)
     xSemaphoreGive(guard);
     return value;
 }
+static bool is_stopping(void)
+{
+    xSemaphoreTake(guard, portMAX_DELAY);
+    const bool value = stop_requested;
+    xSemaphoreGive(guard);
+    return value;
+}
+static bool microphone_healthy(const audio_snapshot_t *audio)
+{
+    // Stop intent precedes microphone teardown; stop_requested is published only
+    // after tail flush. The network loop must not mistake this interval for failure.
+    xSemaphoreTake(guard, portMAX_DELAY);
+    const bool closing = stop_intent || cancelled;
+    xSemaphoreGive(guard);
+    portENTER_CRITICAL(&capture_lock);
+    const bool active = capturing;
+    portEXIT_CRITICAL(&capture_lock);
+    return closing || !active || (audio->microphone_active && audio->microphone_error == ESP_OK);
+}
 static void notify(stt_event_kind_t kind, const char *code)
 {
     stt_event_t event = {.kind = kind};
     if (code) strlcpy(event.code, code, sizeof(event.code));
-    (void)xQueueSend(notifications, &event, 0);
+    if (xQueueSend(notifications, &event, 0) != pdTRUE && kind != STT_DONE && kind != STT_WAIT) {
+        // Progress is coalescible; a terminal state must never be lost behind it.
+        xQueueReset(notifications);
+        (void)xQueueSend(notifications, &event, 0);
+    }
+}
+static void stream_error(void)
+{
+    portENTER_CRITICAL(&capture_lock);
+    transport_failed = true;
+    portEXIT_CRITICAL(&capture_lock);
+}
+static void capacity_error(void)
+{
+    portENTER_CRITICAL(&capture_lock);
+    capacity_failed = true;
+    transport_failed = true;
+    portEXIT_CRITICAL(&capture_lock);
+}
+static bool capacity_exhausted(void)
+{
+    portENTER_CRITICAL(&capture_lock);
+    const bool value = capacity_failed || stream.overflow;
+    portEXIT_CRITICAL(&capture_lock);
+    return value;
+}
+static bool stream_failed(void)
+{
+    portENTER_CRITICAL(&capture_lock);
+    const bool value = transport_failed || stream.overflow;
+    portEXIT_CRITICAL(&capture_lock);
+    return value;
 }
 static void sink(const uint8_t *data, size_t length)
 {
+    // audio_mutex is held by the caller. Only copy; never encode or take guard here.
     portENTER_CRITICAL(&capture_lock);
-    if (capturing && length <= PCM_BYTES - pcm_length) {
-        memcpy(pcm + pcm_length, data, length);
-        pcm_length += length;
-    }
+    if (capturing && !stt_stream_write(&stream, data, length)) transport_failed = true;
     portEXIT_CRITICAL(&capture_lock);
+}
+static bool stop_capture(void)
+{
+    xSemaphoreTake(microphone_guard, portMAX_DELAY);
+    portENTER_CRITICAL(&capture_lock);
+    const bool active = capturing;
+    portEXIT_CRITICAL(&capture_lock);
+    // audio_live_stop flushes the last partial 20 ms block while sink is still active.
+    const bool ok = !active || audio_live_stop() == ESP_OK;
+    portENTER_CRITICAL(&capture_lock);
+    capturing = false;
+    if (!ok) transport_failed = true;
+    portEXIT_CRITICAL(&capture_lock);
+    xSemaphoreGive(microphone_guard);
+    return ok;
 }
 static bool persist_text(const stt_text_t *text)
 {
@@ -72,6 +144,21 @@ static bool persist_text(const stt_text_t *text)
     const esp_err_t result = text ? nvs_set_blob(h, "pending", text, sizeof(*text)) : nvs_erase_key(h, "pending");
     const bool ok = (result == ESP_OK || (!text && result == ESP_ERR_NVS_NOT_FOUND)) && nvs_commit(h) == ESP_OK;
     nvs_close(h);
+    return ok;
+}
+static bool capture_running(void)
+{
+    portENTER_CRITICAL(&capture_lock);
+    const bool value = capturing;
+    portEXIT_CRITICAL(&capture_lock);
+    return value;
+}
+static bool persist_pending_head(void)
+{
+    xSemaphoreTake(guard, portMAX_DELAY);
+    const bool ok = cancelled || !pending.id[0] || pending_durable || persist_text(&pending);
+    if (ok && !cancelled && pending.id[0]) pending_durable = true;
+    xSemaphoreGive(guard);
     return ok;
 }
 static bool identity(void)
@@ -152,20 +239,26 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg;
     (void)base;
+    if (id == WEBSOCKET_EVENT_ERROR || id == WEBSOCKET_EVENT_DISCONNECTED) { stream_error(); return; }
     if (id != WEBSOCKET_EVENT_DATA) return;
     const esp_websocket_event_data_t *e = data;
-    // Control frames may be interleaved with a fragmented text message.
     if (e->op_code >= 8) return;
+    // Server TTS is deliberately never played or saved, including fragmented binary frames.
+    if (e->op_code == 2) { ws_binary = true; return; }
+    if (e->op_code == 0 && ws_binary && !ws_accepting) return;
     if (e->payload_offset == 0) {
         if (e->op_code == 1) {
             ws_used = ws_expected = 0;
             ws_accepting = true;
+            ws_binary = false;
         } else if (e->op_code != 0 || !ws_accepting || ws_used != ws_expected) {
             ws_accepting = false;
+            stream_error();
             return;
         }
         if (e->payload_len < 0 || (size_t)e->payload_len >= sizeof(ws_json) - ws_used) {
             ws_accepting = false;
+            capacity_error();
             return;
         }
         ws_frame_start = ws_used;
@@ -176,15 +269,14 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         e->payload_offset < 0 || (size_t)e->payload_offset != ws_used - ws_frame_start ||
         e->data_len < 0 || (size_t)e->data_len > ws_expected - ws_used) {
         ws_accepting = false;
+        stream_error();
         return;
     }
     if (e->data_len) memcpy(ws_json + ws_used, e->data_ptr, e->data_len);
     ws_used += e->data_len;
     if (ws_used == ws_expected && e->fin) {
         ws_json[ws_used] = 0;
-        incoming_t event;
-        strlcpy(event.json, ws_json, sizeof(event.json));
-        (void)xQueueSend(incoming, &event, 0);
+        if (xQueueSend(incoming, (const incoming_t *)ws_json, 0) != pdTRUE) capacity_error();
         ws_accepting = false;
     }
 }
@@ -213,7 +305,34 @@ static cJSON *listen_frame(const char *session, const char *state)
 {
     cJSON *j = cJSON_CreateObject();
     cJSON_AddStringToObject(j, "session_id", session); cJSON_AddStringToObject(j, "type", "listen");
-    cJSON_AddStringToObject(j, "state", state); cJSON_AddStringToObject(j, "mode", "manual"); return j;
+    cJSON_AddStringToObject(j, "state", state);
+    if (!strcmp(state, "start")) cJSON_AddStringToObject(j, "mode", "realtime");
+    return j;
+}
+static bool utf8_next(const unsigned char **cursor, uint32_t *value)
+{
+    const unsigned char *p = *cursor;
+    uint32_t c = *p++;
+    unsigned continuation = 0;
+    uint32_t minimum = 0;
+    if (c >= 0xf0 && c <= 0xf4) { c &= 7; continuation = 3; minimum = 0x10000; }
+    else if (c >= 0xe0 && c <= 0xef) { c &= 15; continuation = 2; minimum = 0x800; }
+    else if (c >= 0xc2 && c <= 0xdf) { c &= 31; continuation = 1; minimum = 0x80; }
+    else if (c >= 0x80 || c == 0) return false;
+    for (unsigned i = 0; i < continuation; i++) {
+        if ((*p & 0xc0) != 0x80) return false;
+        c = (c << 6) | (*p++ & 63);
+    }
+    if (c < minimum || c > 0x10ffff || (c >= 0xd800 && c <= 0xdfff)) return false;
+    if (c < 32 && c != 9 && c != 10 && c != 13) return false;
+    *cursor = p;
+    *value = c;
+    return true;
+}
+static bool unicode_space(uint32_t c)
+{
+    return c == 9 || c == 10 || c == 13 || c == 32 || c == 0xa0 || c == 0x1680 ||
+        (c >= 0x2000 && c <= 0x200a) || c == 0x2028 || c == 0x2029 || c == 0x202f || c == 0x205f || c == 0x3000 || c == 0xfeff;
 }
 // Match the gateway limit in UTF-16 units; reject whitespace-only and malformed UTF-8.
 static bool valid_text(const char *text)
@@ -223,41 +342,109 @@ static bool valid_text(const char *text)
     unsigned units = 0;
     bool content = false;
     while (*p) {
-        uint32_t c = *p++;
-        unsigned continuation = 0;
-        uint32_t minimum = 0;
-        if (c >= 0xf0 && c <= 0xf4) { c &= 7; continuation = 3; minimum = 0x10000; }
-        else if (c >= 0xe0 && c <= 0xef) { c &= 15; continuation = 2; minimum = 0x800; }
-        else if (c >= 0xc2 && c <= 0xdf) { c &= 31; continuation = 1; minimum = 0x80; }
-        else if (c >= 0x80) return false;
-        for (unsigned i = 0; i < continuation; i++) {
-            if ((*p & 0xc0) != 0x80) return false;
-            c = (c << 6) | (*p++ & 63);
-        }
-        if (c < minimum || c > 0x10ffff || (c >= 0xd800 && c <= 0xdfff)) return false;
-        if (c < 32 && c != 9 && c != 10 && c != 13) return false;
+        uint32_t c;
+        if (!utf8_next(&p, &c)) return false;
         units += c > 0xffff ? 2 : 1;
         if (units > 1000) return false;
-        const bool space = c == 9 || c == 10 || c == 13 || c == 32 || c == 0xa0 || c == 0x1680 ||
-            (c >= 0x2000 && c <= 0x200a) || c == 0x2028 || c == 0x2029 || c == 0x202f || c == 0x205f || c == 0x3000 || c == 0xfeff;
-        if (!space) content = true;
+        if (!unicode_space(c)) content = true;
     }
     return content;
 }
+// Preflight the entire server utterance before enqueueing anything. No UTF-8 truncation.
+static int text_slices(const char *text, text_slice_t slices[TEXT_BATCH_MAX])
+{
+    if (!text || strlen(text) >= STT_JSON_BYTES) return -1;
+    const unsigned char *start = (const unsigned char *)text, *p = start, *piece = start;
+    unsigned units = 0;
+    bool content = false;
+    int count = 0;
+    while (*p) {
+        const unsigned char *before = p;
+        uint32_t c;
+        if (!utf8_next(&p, &c)) return -1;
+        const unsigned width = c > 0xffff ? 2 : 1;
+        if (units + width > 1000 || (size_t)(p - piece) >= STT_TEXT_BYTES) {
+            if (content) {
+                if (count == TEXT_BATCH_MAX) return -1;
+                slices[count++] = (text_slice_t){.offset = piece - start, .length = before - piece};
+            }
+            piece = before; units = 0; content = false;
+        }
+        units += width;
+        if (!unicode_space(c)) content = true;
+    }
+    if (content) {
+        if (count == TEXT_BATCH_MAX) return -1;
+        slices[count++] = (text_slice_t){.offset = piece - start, .length = p - piece};
+    }
+    return count;
+}
+static bool enqueue_text(const char *value)
+{
+    text_slice_t slices[TEXT_BATCH_MAX];
+    const int count = text_slices(value, slices);
+    if (count < 0) return false;
+    if (count == 0) return true;
+    stt_text_t *text = malloc(sizeof(*text));
+    if (!text) return false;
+    xSemaphoreTake(guard, portMAX_DELAY);
+    const bool room = (size_t)count <= TEXT_QUEUE_CAPACITY - text_count + (pending.id[0] ? 0 : 1);
+    if (!room) capacity_error();
+    bool ok = !cancelled && room;
+    for (int i = 0; ok && i < count; i++) {
+        memset(text, 0, sizeof(*text));
+        uint32_t r[4]; esp_fill_random(r, sizeof(r));
+        snprintf(text->id, sizeof(text->id), "%08lx%08lx%08lx%08lx", (unsigned long)r[0], (unsigned long)r[1], (unsigned long)r[2], (unsigned long)r[3]);
+        memcpy(text->text, value + slices[i].offset, slices[i].length);
+        if (!pending.id[0]) {
+            // Flash writes may pause the non-IRAM microphone task. Keep live
+            // transcripts in RAM; make the outstanding head durable after capture.
+            const bool live = capture_running();
+            ok = live || persist_text(text);
+            if (ok) { pending = *text; pending_durable = !live; }
+        } else {
+            text_queue[(text_head + text_count) % TEXT_QUEUE_CAPACITY] = *text;
+            text_count++;
+        }
+    }
+    xSemaphoreGive(guard);
+    free(text);
+    if (ok) notify(STT_DONE, NULL);
+    return ok;
+}
 
-static bool transcribe(cJSON *provisioning, stt_text_t *text)
+static bool receive_message(const cJSON *json, bool *had_text)
+{
+    *had_text = false;
+    if (!json) return false;
+    const cJSON *type = cJSON_GetObjectItemCaseSensitive(json, "type");
+    if (cJSON_IsString(type) && !strcmp(type->valuestring, "stt")) {
+        const cJSON *value = cJSON_GetObjectItemCaseSensitive(json, "text");
+        if (!cJSON_IsString(value)) return false;
+        text_slice_t slices[TEXT_BATCH_MAX];
+        const int count = text_slices(value->valuestring, slices);
+        if (count < 0 || !enqueue_text(value->valuestring)) return false;
+        *had_text = count > 0;
+    } else if (cJSON_IsString(type) && (!strcmp(type->valuestring, "error") || !strcmp(type->valuestring, "goodbye"))) {
+        return false;
+    }
+    // TTS/LLM events never change microphone, session or listening state.
+    return true;
+}
+
+static stt_event_kind_t transcribe(cJSON *provisioning)
 {
     const cJSON *config = cJSON_GetObjectItemCaseSensitive(provisioning, "websocket");
     const cJSON *url = cJSON_GetObjectItemCaseSensitive(config, "url"), *token = cJSON_GetObjectItemCaseSensitive(config, "token");
     const cJSON *version = cJSON_GetObjectItemCaseSensitive(config, "version");
     int protocol = cJSON_IsNumber(version) ? version->valueint : 1;
     if (!cJSON_IsString(url) || strncmp(url->valuestring,"wss://",6) || protocol < 1 || protocol > 3) {
-        ESP_LOGW(TAG,"Provisioning has no supported secure WebSocket transport"); return false;
+        ESP_LOGW(TAG,"Provisioning has no supported secure WebSocket transport"); return STT_FAILED;
     }
     esp_websocket_client_config_t cfg = {.uri=url->valuestring,.crt_bundle_attach=esp_crt_bundle_attach,
         .disable_auto_reconnect=true,.network_timeout_ms=5000,.buffer_size=2048,.task_stack=8192};
     esp_websocket_client_handle_t ws = esp_websocket_client_init(&cfg);
-    if (!ws) return false;
+    if (!ws) return STT_FAILED;
     char pv[4]; snprintf(pv,sizeof(pv),"%d",protocol);
     esp_websocket_client_append_header(ws,"Protocol-Version",pv);
     esp_websocket_client_append_header(ws,"Device-Id",device);
@@ -266,11 +453,11 @@ static bool transcribe(cJSON *provisioning, stt_text_t *text)
         char authorization[2010]; snprintf(authorization,sizeof(authorization),"%s%s",strchr(token->valuestring,' ') ? "" : "Bearer ",token->valuestring);
         esp_websocket_client_append_header(ws,"Authorization",authorization);
     }
-    xQueueReset(incoming); ws_used=ws_expected=ws_frame_start=0; ws_accepting=false;
+    xQueueReset(incoming); ws_used=ws_expected=ws_frame_start=0; ws_accepting=false; ws_binary=false;
     esp_websocket_register_events(ws, WEBSOCKET_EVENT_ANY, ws_event, NULL);
     bool ok = esp_websocket_client_start(ws) == ESP_OK;
     const int64_t deadline=esp_timer_get_time()+12000000;
-    while(ok && !is_cancelled() && !esp_websocket_client_is_connected(ws) && esp_timer_get_time()<deadline) vTaskDelay(pdMS_TO_TICKS(50));
+    while(ok && !is_cancelled() && !stream_failed() && !esp_websocket_client_is_connected(ws) && esp_timer_get_time()<deadline) vTaskDelay(pdMS_TO_TICKS(50));
     cJSON *hello=cJSON_CreateObject();
     cJSON_AddStringToObject(hello,"type","hello"); cJSON_AddNumberToObject(hello,"version",protocol);
     cJSON_AddStringToObject(hello,"transport","websocket");
@@ -292,147 +479,244 @@ static bool transcribe(cJSON *provisioning, stt_text_t *text)
     if(ok) ok=esp_opus_enc_open(&enc,sizeof(enc),&encoder)==ESP_AUDIO_ERR_OK;
     if(ok) ok=esp_opus_enc_get_frame_size(encoder,&input_size,&output_size)==ESP_AUDIO_ERR_OK && input_size==1920 && output_size>0 && output_size<=4000;
     if(ok) { encoded=malloc(output_size+16); ok=encoded && send_json(ws,listen_frame(session,"start")); }
-    for(size_t offset=0;ok && !is_cancelled() && offset<pcm_length;offset+=input_size) {
-        uint8_t last[1920]; uint8_t *input=pcm+offset;
-        if(pcm_length-offset<(size_t)input_size) { memset(last,0,sizeof(last)); memcpy(last,input,pcm_length-offset); input=last; }
-        const int header=protocol==2?16:protocol==3?4:0;
-        esp_audio_enc_in_frame_t in={.buffer=input,.len=input_size};
-        esp_audio_enc_out_frame_t out={.buffer=encoded+header,.len=output_size};
-        ok=esp_opus_enc_process(encoder,&in,&out)==ESP_AUDIO_ERR_OK && out.encoded_bytes > 0 && out.encoded_bytes <= (unsigned)output_size;
-        if(!ok) break;
-        memset(encoded,0,header);
-        if(protocol==2) {
-            encoded[1]=2; const uint32_t timestamp=offset/32, size=out.encoded_bytes;
-            for(int i=0;i<4;i++) { encoded[8+i]=(timestamp>>(24-i*8))&255; encoded[12+i]=(size>>(24-i*8))&255; }
-        } else if(protocol==3) { encoded[2]=out.encoded_bytes>>8; encoded[3]=out.encoded_bytes&255; }
-        const int bytes=header+out.encoded_bytes;
-        ok=esp_websocket_client_send_bin(ws,(char *)encoded,bytes,pdMS_TO_TICKS(3000))==bytes;
-        // Respect the platform's realtime audio pacing even though capture is buffered.
-        vTaskDelay(pdMS_TO_TICKS(60));
+    incoming_t *event = heap_caps_malloc(sizeof(*event), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t input[1920];
+    uint64_t sent_bytes = 0;
+    unsigned encoded_frames = 0;
+    bool stop_sent = false, got_text = false, heard = false;
+    int64_t stopped_at = 0, audio_check_at = 0;
+    ok = ok && event;
+    while (ok && !is_cancelled() && !stream_failed()) {
+        const int64_t now = esp_timer_get_time();
+        // Drain JSON between every audio packet, so STT and network errors never wait
+        // for an utterance-length upload. TTS/assistant text is intentionally ignored.
+        for (int i = 0; i < 8 && xQueueReceive(incoming, event, 0) == pdTRUE; i++) {
+            cJSON *json = cJSON_Parse(event->json);
+            bool had_text = false;
+            ok = receive_message(json, &had_text);
+            if (ok && had_text) {
+                got_text = true;
+            }
+            cJSON_Delete(json);
+            if (!ok) break;
+        }
+        if (!ok) break;
+        if (!esp_websocket_client_is_connected(ws)) { ok = false; break; }
+        const bool stopping = is_stopping();
+        portENTER_CRITICAL(&capture_lock);
+        const size_t available = stream.size;
+        const size_t length = (available >= sizeof(input) || stopping) ? stt_stream_peek(&stream, input, sizeof(input)) : 0;
+        portEXIT_CRITICAL(&capture_lock);
+        if (length) {
+            if (length < sizeof(input)) memset(input + length, 0, sizeof(input) - length);
+            const int header = protocol == 2 ? 16 : protocol == 3 ? 4 : 0;
+            esp_audio_enc_in_frame_t in = {.buffer = input, .len = sizeof(input)};
+            esp_audio_enc_out_frame_t out = {.buffer = encoded + header, .len = output_size};
+            ok = esp_opus_enc_process(encoder, &in, &out) == ESP_AUDIO_ERR_OK && out.encoded_bytes > 0 && out.encoded_bytes <= (unsigned)output_size;
+            if (!ok) break;
+            memset(encoded, 0, header);
+            if (protocol == 2) {
+                encoded[1] = 2;
+                const uint32_t timestamp = (uint32_t)(sent_bytes / 32), size = out.encoded_bytes;
+                for (int i = 0; i < 4; i++) { encoded[8+i] = (timestamp >> (24-i*8)) & 255; encoded[12+i] = (size >> (24-i*8)) & 255; }
+            } else if (protocol == 3) { encoded[2] = out.encoded_bytes >> 8; encoded[3] = out.encoded_bytes & 255; }
+            const int bytes = header + out.encoded_bytes;
+            ok = esp_websocket_client_send_bin(ws, (char *)encoded, bytes, pdMS_TO_TICKS(3000)) == bytes;
+            if (ok) {
+                portENTER_CRITICAL(&capture_lock);
+                ok = stt_stream_consume(&stream, length);
+                portEXIT_CRITICAL(&capture_lock);
+                sent_bytes += length;
+                encoded_frames++;
+            }
+            // Microphone pacing supplies the live rate. Do not add a 60 ms delay
+            // after synchronous encoding/network work, which would build a backlog.
+        } else if (stopping && !stop_sent) {
+            ok = send_json(ws, listen_frame(session, "stop"));
+            stop_sent = true; stopped_at = now;
+        } else if (stop_sent) {
+            // The cloud exposes no transcript-end ACK: an early STT may belong to
+            // a previous utterance. Receive the entire 20 s drain window, including
+            // later STT events, rather than closing on the first result or TTS stop.
+            if (now - stopped_at >= 20000000) break;
+        }
+        if (!stopping && now >= audio_check_at) {
+            audio_snapshot_t audio; audio_get_snapshot(&audio);
+            if (audio.vad) heard = true;
+            if (!microphone_healthy(&audio)) { ok = false; break; }
+            audio_check_at = now + 200000;
+        }
+        if (!length) vTaskDelay(pdMS_TO_TICKS(10));
     }
-    if(encoder) esp_opus_enc_close(encoder);
-    free(encoded);
-    if(ok && !is_cancelled()) ok=send_json(ws,listen_frame(session,"stop"));
-    reply=ok && !is_cancelled()?wait_type("stt",20000):NULL;
-    const cJSON *value=cJSON_GetObjectItemCaseSensitive(reply,"text");
-    ok=cJSON_IsString(value) && valid_text(value->valuestring);
-    if(ok) strlcpy(text->text,value->valuestring,sizeof(text->text));
-    cJSON_Delete(reply);
-    if(session[0] && esp_websocket_client_is_connected(ws)) {
-        cJSON *abort=cJSON_CreateObject(); cJSON_AddStringToObject(abort,"type","abort"); cJSON_AddStringToObject(abort,"session_id",session);
-        (void)send_json(ws,abort);
+    // Stop failed/cancelled capture before slow WebSocket teardown; normal stop
+    // already closed and flushed it. Nothing recorded after failure can be sent.
+    (void)stop_capture();
+    if (encoder) esp_opus_enc_close(encoder);
+    free(encoded); free(event);
+    const bool failed = !ok || stream_failed();
+    const bool full = capacity_exhausted();
+    ESP_LOGI(TAG, "Realtime upload ended: frames=%u bytes=%llu clean=%d", encoded_frames, (unsigned long long)sent_bytes, !failed);
+    // No abort/relisten on individual STT events: keep one realtime listen session.
+    // abort is only sent on cancellation/cleanup, after audio transmission has ended.
+    if (session[0] && esp_websocket_client_is_connected(ws)) {
+        cJSON *abort = cJSON_CreateObject(); cJSON_AddStringToObject(abort, "type", "abort"); cJSON_AddStringToObject(abort, "session_id", session);
+        (void)send_json(ws, abort);
     }
-    esp_websocket_client_stop(ws); esp_websocket_client_destroy(ws); return ok;
+    esp_websocket_client_stop(ws); esp_websocket_client_destroy(ws);
+    if (is_cancelled()) return STT_CANCELLED;
+    if (full) return STT_FULL;
+    if (failed) return STT_FAILED;
+    if (!got_text) return heard ? STT_FAILED : STT_EMPTY;
+    return STT_FINISHED;
 }
 static void run(void *arg)
 {
     (void)arg;
-    for(;;) {
-        ulTaskNotifyTake(pdTRUE,portMAX_DELAY);
-        stt_event_kind_t outcome=STT_FAILED;
-        char activation[17]={0};
-        const int64_t start=esp_timer_get_time(); int64_t last_voice=start; bool heard=false;
-        while(!is_cancelled() && esp_timer_get_time()-start<20000000) {
-            audio_snapshot_t a; audio_get_snapshot(&a);
-            // The audio VAD already includes a 300 ms hold, leaving 1.2 s here.
-            if(a.vad) { heard=true; last_voice=esp_timer_get_time(); }
-            if(heard && esp_timer_get_time()-last_voice>=1200000) break;
-            if(!heard && esp_timer_get_time()-start>=5000000) break;
-            vTaskDelay(pdMS_TO_TICKS(20));
-        }
-        portENTER_CRITICAL(&capture_lock); capturing=false; portEXIT_CRITICAL(&capture_lock);
-        const bool stopped = audio_live_stop() == ESP_OK;
-        if(!stopped) outcome=STT_FAILED;
-        else if(!heard) outcome=STT_EMPTY;
-        else if(!is_cancelled()) {
-            notify(STT_WAIT,NULL);
-            cJSON *provisioning=identity()?provision():NULL;
-            const cJSON *act=cJSON_GetObjectItemCaseSensitive(provisioning,"activation");
-            const cJSON *code=cJSON_GetObjectItemCaseSensitive(act,"code");
-            if(cJSON_IsString(code) && code->valuestring[0]) {
-                strlcpy(activation,code->valuestring,sizeof(activation));
-                ESP_LOGI(TAG,"Bind at xiaozhi.me using activation code: %s",activation);
-                int status;
-                cJSON *r = http_post(OTA_URL "activate", "{}", &status);
-                cJSON_Delete(r);
-                if (status == 200 && !is_cancelled()) {
-                    cJSON_Delete(provisioning);
-                    provisioning = provision();
-                    act = cJSON_GetObjectItemCaseSensitive(provisioning, "activation");
-                    code = cJSON_GetObjectItemCaseSensitive(act, "code");
-                    if (!cJSON_IsString(code) || !code->valuestring[0]) activation[0] = 0;
-                }
-                outcome = STT_ACTIVATE;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        stt_event_kind_t outcome = STT_FAILED;
+        char activation[17] = {0};
+        cJSON *provisioning = !is_cancelled() && identity_ready ? provision() : NULL;
+        const cJSON *act = cJSON_GetObjectItemCaseSensitive(provisioning, "activation");
+        const cJSON *code = cJSON_GetObjectItemCaseSensitive(act, "code");
+        if (cJSON_IsString(code) && code->valuestring[0]) {
+            strlcpy(activation, code->valuestring, sizeof(activation));
+            ESP_LOGI(TAG, "Bind at xiaozhi.me using activation code: %s", activation);
+            int status;
+            cJSON *r = http_post(OTA_URL "activate", "{}", &status);
+            cJSON_Delete(r);
+            if (status == 200 && !is_cancelled()) {
+                cJSON_Delete(provisioning); provisioning = provision();
+                act = cJSON_GetObjectItemCaseSensitive(provisioning, "activation");
+                code = cJSON_GetObjectItemCaseSensitive(act, "code");
+                if (!cJSON_IsString(code) || !code->valuestring[0]) activation[0] = 0;
             }
-            if (provisioning && !activation[0]) {
-                stt_text_t *text=calloc(1,sizeof(*text));
-                if(text && transcribe(provisioning,text) && !is_cancelled()) {
-                    uint32_t r[4]; esp_fill_random(r,sizeof(r));
-                    snprintf(text->id,sizeof(text->id),"%08lx%08lx%08lx%08lx",(unsigned long)r[0],(unsigned long)r[1],(unsigned long)r[2],(unsigned long)r[3]);
-                    xSemaphoreTake(guard,portMAX_DELAY);
-                    if(!cancelled && persist_text(text)) { pending=*text; outcome=STT_DONE; }
-                    xSemaphoreGive(guard);
-                }
-                free(text);
-            }
-            cJSON_Delete(provisioning);
+            outcome = STT_ACTIVATE;
         }
-        xSemaphoreTake(guard,portMAX_DELAY);
-        if(cancelled) outcome=STT_CANCELLED;
-        busy=false;
-        notify(outcome,activation);
-        xSemaphoreGive(guard);
+        if (provisioning && !activation[0] && !is_cancelled() && !stream_failed()) outcome = transcribe(provisioning);
+        cJSON_Delete(provisioning);
+        if (!stop_capture() && outcome != STT_CANCELLED) outcome = STT_FAILED;
+        if (!persist_pending_head()) outcome = STT_FAILED;
+        portENTER_CRITICAL(&capture_lock);
+        const uint64_t accepted = stream.accepted, consumed = stream.consumed;
+        const bool overflow = stream.overflow;
+        portEXIT_CRITICAL(&capture_lock);
+        ESP_LOGI(TAG, "Realtime session ended: captured=%llu sent=%llu overflow=%d", (unsigned long long)accepted, (unsigned long long)consumed, overflow);
+        if (capacity_exhausted()) outcome = STT_FULL;
+        // Atomically publish terminal state after the public cancel call has
+        // finished both microphone teardown and its persistence operation.
+        for (;;) {
+            xSemaphoreTake(guard, portMAX_DELAY);
+            if (cancel_preparing) { xSemaphoreGive(guard); vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+            if (cancelled) outcome = cancel_storage_failed ? STT_FAILED : STT_CANCELLED;
+            busy = false;
+            notify(outcome, activation);
+            xSemaphoreGive(guard);
+            break;
+        }
     }
 }
 void xiaozhi_stt_init(void)
 {
-    guard=xSemaphoreCreateMutex(); notifications=xQueueCreate(4,sizeof(stt_event_t)); incoming=xQueueCreateWithCaps(4,sizeof(incoming_t),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
-    pcm=heap_caps_malloc(PCM_BYTES,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
-    if(!guard || !notifications || !incoming || !pcm) return;
+    guard = xSemaphoreCreateMutex(); microphone_guard = xSemaphoreCreateMutex();
+    notifications = xQueueCreate(8, sizeof(stt_event_t));
+    incoming = xQueueCreateWithCaps(8, sizeof(incoming_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    pcm = heap_caps_malloc(PCM_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    text_queue = heap_caps_calloc(TEXT_QUEUE_CAPACITY, sizeof(*text_queue), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!guard || !microphone_guard || !notifications || !incoming || !pcm || !text_queue) return;
+    stt_stream_init(&stream, pcm, PCM_BYTES);
     nvs_handle_t h;
-    if(nvs_open("stt",NVS_READWRITE,&h)==ESP_OK) {
-        size_t n=sizeof(pending); esp_err_t e=nvs_get_blob(h,"pending",&pending,&n);
-        storage_ready=e==ESP_ERR_NVS_NOT_FOUND || (e==ESP_OK && n==sizeof(pending) && strnlen(pending.id,sizeof(pending.id))==32 && strnlen(pending.text,sizeof(pending.text))<sizeof(pending.text) && valid_text(pending.text));
+    if (nvs_open("stt", NVS_READWRITE, &h) == ESP_OK) {
+        size_t n = sizeof(pending); esp_err_t e = nvs_get_blob(h, "pending", &pending, &n);
+        storage_ready = e == ESP_ERR_NVS_NOT_FOUND || (e == ESP_OK && n == sizeof(pending) && strnlen(pending.id, sizeof(pending.id)) == 32 && strnlen(pending.text, sizeof(pending.text)) < sizeof(pending.text) && valid_text(pending.text));
         nvs_close(h);
     }
-    if(xTaskCreate(run,"xiaozhi_stt",16384,NULL,4,&worker)!=pdPASS) worker=NULL;
+    pending_durable = storage_ready && pending.id[0];
+    // UUID creation/NVS commits happen before any session starts sampling.
+    identity_ready = identity();
+    if (xTaskCreate(run, "xiaozhi_stt", 16384, NULL, 4, &worker) != pdPASS) worker = NULL;
 }
 esp_err_t xiaozhi_stt_start(void)
 {
-    if(!guard || !worker || !storage_ready) return ESP_ERR_INVALID_STATE;
-    xSemaphoreTake(guard,portMAX_DELAY);
-    if(busy || pending.id[0]) { xSemaphoreGive(guard); return ESP_ERR_INVALID_STATE; }
-    xQueueReset(notifications); cancelled=false; busy=true;
-    portENTER_CRITICAL(&capture_lock); pcm_length=0; capturing=true; portEXIT_CRITICAL(&capture_lock);
-    const esp_err_t result=audio_live_start(sink);
-    if(result==ESP_OK) xTaskNotifyGive(worker);
-    else { busy=false; portENTER_CRITICAL(&capture_lock); capturing=false; portEXIT_CRITICAL(&capture_lock); }
-    xSemaphoreGive(guard); return result;
+    if (!guard || !worker || !storage_ready || !identity_ready) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(microphone_guard, portMAX_DELAY);
+    xSemaphoreTake(guard, portMAX_DELAY);
+    if (busy || pending.id[0] || text_count) { xSemaphoreGive(guard); xSemaphoreGive(microphone_guard); return ESP_ERR_INVALID_STATE; }
+    xQueueReset(notifications);
+    cancelled = stop_requested = stop_intent = cancel_storage_failed = cancel_preparing = false;
+    busy = true;
+    xSemaphoreGive(guard);
+    portENTER_CRITICAL(&capture_lock);
+    stt_stream_init(&stream, pcm, PCM_BYTES);
+    transport_failed = capacity_failed = false; capturing = true;
+    portEXIT_CRITICAL(&capture_lock);
+    const esp_err_t result = audio_live_start(sink);
+    if (result == ESP_OK) xTaskNotifyGive(worker);
+    else {
+        portENTER_CRITICAL(&capture_lock); capturing = false; portEXIT_CRITICAL(&capture_lock);
+        xSemaphoreTake(guard, portMAX_DELAY); busy = false; xSemaphoreGive(guard);
+    }
+    xSemaphoreGive(microphone_guard);
+    return result;
+}
+void xiaozhi_stt_stop(void)
+{
+    if (!guard || !microphone_guard) return;
+    xSemaphoreTake(guard, portMAX_DELAY);
+    const bool active = busy && !cancelled && !stop_intent;
+    if (active) stop_intent = true;
+    xSemaphoreGive(guard);
+    if (!active) return;
+    (void)stop_capture();
+    if (!persist_pending_head()) stream_error();
+    xSemaphoreTake(guard, portMAX_DELAY);
+    stop_requested = true;
+    xSemaphoreGive(guard);
+    notify(STT_WAIT, NULL);
 }
 bool xiaozhi_stt_busy(void)
 {
-    if(!guard) return false;
-    xSemaphoreTake(guard,portMAX_DELAY); bool value=busy; xSemaphoreGive(guard); return value;
+    if (!guard) return false;
+    xSemaphoreTake(guard, portMAX_DELAY); bool value = busy; xSemaphoreGive(guard); return value;
 }
-bool xiaozhi_stt_poll(stt_event_t *event) { return notifications && xQueueReceive(notifications,event,0)==pdTRUE; }
+bool xiaozhi_stt_poll(stt_event_t *event) { return notifications && xQueueReceive(notifications, event, 0) == pdTRUE; }
 bool xiaozhi_stt_pending(stt_text_t *text)
 {
-    if(!guard) return false;
-    xSemaphoreTake(guard,portMAX_DELAY); bool value=storage_ready && pending.id[0]; if(value && text) *text=pending; xSemaphoreGive(guard); return value;
+    if (!guard) return false;
+    xSemaphoreTake(guard, portMAX_DELAY);
+    const bool value = storage_ready && pending.id[0];
+    if (value && text) *text = pending;
+    xSemaphoreGive(guard); return value;
 }
 bool xiaozhi_stt_ack(const char *id)
 {
-    if(!guard) return false;
-    xSemaphoreTake(guard,portMAX_DELAY);
-    bool ok=storage_ready && pending.id[0] && !strcmp(id,pending.id) && persist_text(NULL);
-    if(ok) memset(&pending,0,sizeof(pending));
+    if (!guard || !id) return false;
+    xSemaphoreTake(guard, portMAX_DELAY);
+    bool ok = storage_ready && pending.id[0] && !strcmp(id, pending.id);
+    if (ok) {
+        const stt_text_t *next = text_count ? &text_queue[text_head] : NULL;
+        const bool live = capture_running();
+        // During live capture avoid Flash entirely. Once stopped, publish the next
+        // durable head atomically before advancing RAM; failed ACK persistence retries.
+        ok = live || persist_text(next);
+        if (ok && next) { pending = *next; pending_durable = !live; text_head = (text_head + 1) % TEXT_QUEUE_CAPACITY; text_count--; }
+        else if (ok) { memset(&pending, 0, sizeof(pending)); pending_durable = false; }
+    }
     xSemaphoreGive(guard); return ok;
 }
 bool xiaozhi_stt_cancel(void)
 {
-    if(!guard) return false;
-    xSemaphoreTake(guard,portMAX_DELAY);
-    cancelled=true; bool ok=!pending.id[0] || persist_text(NULL);
-    if(ok) memset(&pending,0,sizeof(pending));
-    xSemaphoreGive(guard); return ok;
+    if (!guard || !microphone_guard) return false;
+    xSemaphoreTake(guard, portMAX_DELAY);
+    cancelled = cancel_preparing = true;
+    xSemaphoreGive(guard);
+    // Finish microphone teardown before erasing NVS, which can stall the CPU.
+    const bool stopped = stop_capture();
+    xSemaphoreTake(guard, portMAX_DELAY);
+    const bool ok = !pending_durable || persist_text(NULL);
+    cancel_storage_failed = !ok || !stopped;
+    if (ok) { memset(&pending, 0, sizeof(pending)); pending_durable = false; text_head = text_count = 0; }
+    cancel_preparing = false;
+    xSemaphoreGive(guard);
+    return ok && stopped;
 }

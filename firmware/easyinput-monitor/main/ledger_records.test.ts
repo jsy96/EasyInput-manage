@@ -18,6 +18,8 @@ it('runs the actual ledger and measurement C code against isolated synthetic sto
       const end = voice.indexOf(`} ${name};`) + `} ${name};`.length
       return voice.slice(voice.lastIndexOf('typedef enum {', end), end)
     }).join('\n')
+    const timerEvents = readFileSync(join(source, 'timers.h'), 'utf8').match(/typedef enum \{[\s\S]*?\} timer_event_t;/)?.[0]
+    if (!timerEvents) throw new Error('Missing timer event enum')
     writeFileSync(join(root, 'input.inc'), `
 #include "voice_prompts.h"
 #define LONG_US 1200000
@@ -25,6 +27,7 @@ it('runs the actual ledger and measurement C code against isolated synthetic sto
 #define DOUBLE_CLICK_US 400000LL
 #define PROMPT_SEQUENCE_CAPACITY 128
 ${enums}
+${timerEvents}
 static job_t job;
 static ui_mode_t mode;
 static prompt_action_t prompt_action;
@@ -39,9 +42,12 @@ static unsigned next_pressure, next_glucose, diag_s5_events, diag_s6_down_events
 static unsigned ledger_generation;
 static int64_t summary_retry_at, click_deadline, input_timestamp;
 static int pending_click = -1;
-static bool second_click, stt_busy, stt_pending;
+static bool second_click, stt_busy, stt_pending, stt_s5_pressed, stt_cancel_failed, stt_cancel_announce_pending, text_sent_announce_pending;
+static int stt_stops;
+static unsigned deferred_timer_events;
 static char summary_request_id[40], text_request_id[40];
 static bool xiaozhi_stt_busy(void) { return stt_busy; }
+static void xiaozhi_stt_stop(void) { stt_stops++; }
 static bool xiaozhi_stt_pending(void *t) { (void)t; return stt_pending; }
 static bool xiaozhi_stt_cancel(void) { stt_pending = false; return true; }
 static int diag_last_key, stopped, released, uploads, setup_calls, volume_changes, stop_error, discard_error;
@@ -65,6 +71,8 @@ static void cancel_countdown(bool p) { (void)p; }
 static bool network_fresh(int64_t t) { (void)t; return true; }
 static void mark_all_unread_read(void) {}
 static bool timers_set_alarm_minute(int n) { (void)n; return true; }
+static int timers_countdown_seconds(void) { return 60; }
+static int audio_play_beep(uint16_t ms, bool strong) { (void)ms; (void)strong; return 0; }
 static void network_setup_begin(void) { setup_calls++; }
 typedef struct { unsigned volume; bool recording; } audio_snapshot_t;
 static void audio_get_snapshot(audio_snapshot_t *a) { *a = (audio_snapshot_t){.volume = 20}; }
@@ -75,10 +83,12 @@ static void announce_volume(void) {}
 static bool uploading(void) { return job == JOB_UP_BEGIN || job == JOB_UP_CHUNK || job == JOB_UP_COMMIT; }
 static bool on_long_key(int key);
 ${['begin_recording_with_prompt', 'append_health_value', 'begin_health_record', 'commit_health_record', 'begin_ledger_record',
-      'confirm_ledger_record', 'cancel_recording', 'on_short_key', 'announce_recent_health', 'append_amount', 'announce_ledger', 'on_double_key', 'poll_click', 'key_long_threshold', 'on_key', 'on_long_key', 'on_rotate'].map(extractFunction).join('\n')}
+      'confirm_ledger_record', 'cancel_recording', 'on_short_key', 'announce_recent_health', 'append_amount', 'announce_ledger', 'on_double_key', 'poll_click', 'key_long_threshold', 'on_key', 'on_long_key', 'on_rotate', 'handle_timer_events'].map(extractFunction).join('\n')}
 static void reset_input(void) {
   mode = MODE_IDLE; job = JOB_IDLE; stop_prompt();
   pending_click = -1; second_click = stt_busy = stt_pending = false;
+  stt_s5_pressed = stt_cancel_failed = stt_cancel_announce_pending = text_sent_announce_pending = false; stt_stops = 0;
+  deferred_timer_events = 0;
   health_edit_cancel(&health_edit); ledger_edit_cancel(&ledger_edit);
   memset(key_down, 0, sizeof key_down); memset(key_held, 0, sizeof key_held);
   memset(key_long_handled, 0, sizeof key_long_handled); memset(key_consumed, 0, sizeof key_consumed);
@@ -167,7 +177,35 @@ static void test_inputs(void) {
   on_rotate(27); assert(ledger_edit.active && ledger_edit.high == 27 && volume_changes == 0);
   reset_input(); mode = MODE_STT; stt_busy = true;
   press_key(6, 50000); assert(!health_edit.active);
-  press_key(4, 3000000); assert(mode == MODE_IDLE && last_prompt == PROMPT_RECORD_CANCELLED);
+  press_key(4, 50000);
+  assert(mode == MODE_STT && stt_stops == 1 && pending_click == -1 && prompt_action == PROMPT_ACTION_NONE);
+  // Cancellation waits for the worker's terminal event; do not speak while
+  // the streaming microphone/network worker is still busy.
+  press_key(4, 3000000); assert(mode == MODE_STT && !prompt_playing && stt_stops == 1);
+  // The initial prompt can be stopped before the microphone ever starts.
+  reset_input(); mode = MODE_STT; prompt_action = PROMPT_ACTION_START_STT;
+  press_key(4, 50000); assert(mode == MODE_IDLE && stt_stops == 0 && prompt_action == PROMPT_ACTION_NONE);
+  // A worker completion between down/up must not turn the release into an
+  // ordinary recording or an unrelated measurement edit.
+  reset_input(); mode = MODE_STT; stt_busy = true;
+  on_key(4, true); monotonic_us += 50000; mode = MODE_IDLE; stt_busy = false;
+  on_key(4, false); poll_click(monotonic_us + DOUBLE_CLICK_US + 1);
+  assert(prompt_action == PROMPT_ACTION_NONE && stt_stops == 0 && pending_click == -1);
+  reset_input(); mode = MODE_STT; stt_busy = true;
+  on_key(6, true); monotonic_us += 50000; mode = MODE_IDLE; stt_busy = false;
+  on_key(6, false); poll_click(monotonic_us + DOUBLE_CLICK_US + 1);
+  assert(!health_edit.active && pending_click == -1);
+  reset_input(); mode = MODE_STT; stt_busy = true;
+  on_key(8, true); monotonic_us += 3000000; mode = MODE_IDLE; stt_busy = false;
+  on_key(8, false); assert(setup_calls == 0 && prompt_action == PROMPT_ACTION_NONE);
+  // A due alarm is announced after the streaming session rather than
+  // cancelling the session and transcribing the device's own alarm prompt.
+  reset_input(); mode = MODE_STT; stt_busy = true;
+  handle_timer_events(TIMER_EVENT_ALARM, monotonic_us);
+  assert(deferred_timer_events == TIMER_EVENT_ALARM && !prompt_playing && mode == MODE_STT && stt_busy);
+  stt_busy = false; mode = MODE_IDLE;
+  handle_timer_events(TIMER_EVENT_NONE, monotonic_us);
+  assert(!deferred_timer_events && prompt_playing && last_prompt == PROMPT_ALARM_DUE);
   puts("synthetic input routing and long press checks passed");
 }
 `)
