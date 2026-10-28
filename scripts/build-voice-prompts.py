@@ -43,6 +43,17 @@ TEXTS.extend(COUNTDOWN_TEXTS)
 TEXTS.append("是否所有未读语音标记为已读？")
 TEXTS.append("全部未读语音已标记为已读")
 TEXTS.append("批量标记失败，请重试")
+TEXTS.append("当前音量百分之")
+VOLUME_TEXTS = [
+    "十。", "二十。", "三十。", "四十。", "五十。",
+    "六十。", "七十。", "八十。", "九十。", "一百。",
+]
+VOLUME_FIRST_INDEX = len(TEXTS)
+TEXTS.extend(VOLUME_TEXTS)
+PROMPT_VOICE_OVERRIDES = {
+    index: ("zh-CN-XiaoxiaoNeural", "+20%")
+    for index in range(VOLUME_FIRST_INDEX, len(TEXTS))
+}
 
 
 def load_existing(path: Path) -> list[bytes]:
@@ -59,10 +70,12 @@ def load_existing(path: Path) -> list[bytes]:
     return chunks
 
 
-def synthesize(tts_script: Path, text: str, output: Path) -> None:
+def synthesize(
+    tts_script: Path, text: str, output: Path, voice: str, rate: str
+) -> None:
     command = [
         "python3", str(tts_script), "--text", text, "--output", str(output),
-        "--voice", "yunjian", "--rate=+35%", "--overwrite", "--timeout", "90",
+        "--voice", voice, f"--rate={rate}", "--overwrite", "--timeout", "180",
     ]
     for attempt in range(2):
         try:
@@ -92,35 +105,66 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parents[1] / "firmware/easyinput-monitor/main/assets/prompts.bin")
     parser.add_argument("--reuse-existing", action="store_true", help="Keep entries already present and append missing prompts")
     parser.add_argument("--refresh-first", type=int, default=0, metavar="N", help="With --reuse-existing, regenerate the first N entries")
+    parser.add_argument("--refresh-from", type=int, default=0, metavar="INDEX", help="With --reuse-existing, regenerate entries from INDEX through the end")
+    parser.add_argument("--work-dir", type=Path, help="Reuse a directory for generated prompts instead of discarding partial work")
     args = parser.parse_args()
     if not args.tts_script.is_file():
         raise SystemExit(f"TTS script not found: {args.tts_script}")
     chunks = load_existing(args.output) if args.reuse_existing and args.output.is_file() else []
     if len(chunks) > len(TEXTS):
         raise SystemExit("Existing prompt pack contains more entries than this script defines")
+    if args.refresh_first and args.refresh_from:
+        raise SystemExit("--refresh-first and --refresh-from are mutually exclusive")
     if args.refresh_first:
         if not args.reuse_existing:
             raise SystemExit("--refresh-first requires --reuse-existing")
         if args.refresh_first < 1 or args.refresh_first > len(chunks):
             raise SystemExit("--refresh-first must be within the existing prompt count")
         start_index, end_index = 0, args.refresh_first
+    elif args.refresh_from:
+        if not args.reuse_existing:
+            raise SystemExit("--refresh-from requires --reuse-existing")
+        if args.refresh_from < 1 or args.refresh_from >= len(TEXTS):
+            raise SystemExit("--refresh-from must reference an entry before the end")
+        if args.refresh_from >= len(chunks):
+            raise SystemExit("--refresh-from must be within the existing prompt count")
+        start_index, end_index = args.refresh_from, len(TEXTS)
     else:
         start_index, end_index = len(chunks), len(TEXTS)
-    with tempfile.TemporaryDirectory(prefix="easyinput-prompts-") as temp:
-        root = Path(temp)
+    temporary_directory = None
+    if args.work_dir is not None:
+        root = args.work_dir.expanduser()
+        root.mkdir(parents=True, exist_ok=True)
+    else:
+        temporary_directory = tempfile.TemporaryDirectory(prefix="easyinput-prompts-")
+        root = Path(temporary_directory.name)
+    try:
         for index in range(start_index, end_index):
             text = TEXTS[index]
             mp3 = root / f"{index:02d}.mp3"
             ulaw = root / f"{index:02d}.ulaw"
-            synthesize(args.tts_script, text, mp3)
+            text_file = root / f"{index:02d}.txt"
+            if ulaw.is_file() and ulaw.stat().st_size and text_file.is_file() and text_file.read_text() == text:
+                continue
+            voice, rate = PROMPT_VOICE_OVERRIDES.get(index, ("yunjian", "+35%"))
+            synthesize(args.tts_script, text, mp3, voice, rate)
             to_ulaw(mp3, ulaw)
             data = ulaw.read_bytes()
             if not data:
                 raise SystemExit(f"Empty prompt: {text}")
+            text_file.write_text(text)
+            time.sleep(15)
+        for index in range(start_index, end_index):
+            data = (root / f"{index:02d}.ulaw").read_bytes()
+            if not data:
+                raise SystemExit(f"Empty prompt: {TEXTS[index]}")
             if index < len(chunks):
                 chunks[index] = data
             else:
                 chunks.append(data)
+    finally:
+        if temporary_directory is not None:
+            temporary_directory.cleanup()
     header_size = struct.calcsize("<IHH")
     entry_size = struct.calcsize("<HII")
     offset = header_size + entry_size * len(chunks)

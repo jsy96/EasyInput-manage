@@ -141,6 +141,7 @@ static int network_via;
 static int alarm_draft = 12 * 60;
 static int timer_draft = 30;
 static int64_t alarm_fired_at_us;
+static bool volume_announce_pending;
 static int prompt_ids[16];
 static int prompt_length;
 static int prompt_position;
@@ -357,6 +358,16 @@ static void announce_alarm_draft(void)
 static void announce_timer_draft(void)
 {
     start_prompt(PROMPT_TIMER_MINUTE_1 + timer_draft - 1, PROMPT_ACTION_SETTINGS_CONFIRM);
+}
+
+static void announce_volume(void)
+{
+    audio_snapshot_t audio;
+    audio_get_snapshot(&audio);
+    int level = ((int)audio.volume + 5) / 10;
+    if (level < 1) level = 1;
+    if (level > 10) level = 10;
+    start_prompt(PROMPT_VOLUME_10 + level - 1, PROMPT_ACTION_NONE);
 }
 
 static void select_next_unread(void)
@@ -947,6 +958,20 @@ static void on_rotate(int delta)
         if (timer_draft > 60) timer_draft = 60;
         settings_commit_at = 0;
         announce_timer_draft();
+    } else {
+        audio_snapshot_t audio;
+        audio_get_snapshot(&audio);
+        int level = (int)audio.volume / 10 + delta;
+        if (level < 1) level = 1;
+        if (level > 10) level = 10;
+        if (audio_set_volume((uint8_t)(level * 10)) != ESP_OK) return;
+        if (audio.recording) {
+            volume_announce_pending = true;
+            return;
+        }
+        stop_message_playback();
+        volume_announce_pending = false;
+        announce_volume();
     }
 }
 
@@ -1282,7 +1307,11 @@ static void task(void *argument)
                 mode = MODE_IDLE;
             }
         }
-        if (job == JOB_CACHE && now >= cache_at && !prompt_playing && !audio.speaker_playing) {
+        if (volume_announce_pending && !audio.recording && prompt_length == 0 && !audio.speaker_playing) {
+            volume_announce_pending = false;
+            announce_volume();
+        }
+        if (!volume_announce_pending && job == JOB_CACHE && now >= cache_at && !prompt_playing && !audio.speaker_playing) {
             if (voice_outbox_save(active_id, audio_data, audio_size) == ESP_OK) {
                 release_audio();
                 finish_job();
