@@ -41,6 +41,8 @@ COUNTDOWN_TEXTS = [f"{chinese_number(minute)}分钟" for minute in range(1, 61)]
 TEXTS.extend(ALARM_TEXTS)
 TEXTS.extend(COUNTDOWN_TEXTS)
 TEXTS.append("是否所有未读语音标记为已读？")
+TEXTS.append("全部未读语音已标记为已读")
+TEXTS.append("批量标记失败，请重试")
 
 
 def load_existing(path: Path) -> list[bytes]:

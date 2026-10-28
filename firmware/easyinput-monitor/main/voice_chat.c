@@ -913,7 +913,7 @@ static bool on_long_key(int key)
         } else if (mark_all_read_confirming) {
             stop_prompt();
             mark_all_read_confirming = false;
-            start_prompt(PROMPT_OFFLINE, PROMPT_ACTION_NONE);
+            start_prompt(PROMPT_MARK_ALL_READ_FAILED, PROMPT_ACTION_NONE);
         }
         return true;
     } else if (key == 2) {
@@ -1068,7 +1068,7 @@ static void receive(cJSON *value)
             finish_job();
             mode = MODE_IDLE;
             mark_all_read_confirming = false;
-            start_prompt(PROMPT_OFFLINE, PROMPT_ACTION_NONE);
+            start_prompt(PROMPT_MARK_ALL_READ_FAILED, PROMPT_ACTION_NONE);
         }
         else {
             release_audio();
@@ -1158,6 +1158,7 @@ static void receive(cJSON *value)
         finish_job();
         mode = MODE_IDLE;
         mark_all_read_confirming = false;
+        start_prompt(PROMPT_MARK_ALL_READ_SUCCESS, PROMPT_ACTION_NONE);
     }
 }
 
@@ -1326,7 +1327,7 @@ static void task(void *argument)
                 finish_job();
                 mode = MODE_IDLE;
                 mark_all_read_confirming = false;
-                start_prompt(PROMPT_OFFLINE, PROMPT_ACTION_NONE);
+                start_prompt(PROMPT_MARK_ALL_READ_FAILED, PROMPT_ACTION_NONE);
             }
             else if (job == JOB_PLAYING && !stream_complete) {
                 (void)audio_stop_speaker();

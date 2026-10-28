@@ -231,7 +231,7 @@ Protocol-2 status optionally adds:
 
 Every slow blink uses 0.5 seconds on followed by 2 seconds off; the countdown flash is 0.15 seconds on every second.
 
-Holding S1 for three seconds asks whether to mark all unread voice messages read. Holding S2 for another three seconds sends the board-only chat operation `readAll`; the room marks every unread timeline item read, preserves history and stored audio, broadcasts the updated items, and replies `{"op":"ack","count":<changed>}`. Releasing S2 before three seconds or pressing another key cancels the confirmation.
+Holding S1 for three seconds asks whether to mark all unread voice messages read. Holding S2 for another three seconds sends the board-only chat operation `readAll`; the room marks every unread timeline item read, preserves history and stored audio, broadcasts the updated items, and replies `{"op":"ack","count":<changed>}`. The board announces success after the acknowledgement, and failure after an error or 12-second timeout. Releasing S2 before three seconds or pressing another key cancels the confirmation.
 
 Firmware 0.2.3 initializes SNTP with `ntp.aliyun.com` and starts it when DHCP supplies the station IPv4 address. The cloud WebSocket task remains closed until system time is at or after 2025-01-01 UTC. This prevents a cold-boot clock from rejecting current TLS certificates as not yet valid. Once connected, the board sends a lightweight protocol-2 status with an advancing `uptime_ms` every three seconds; the server uses it for presence, while full telemetry remains a separate frame.
 
