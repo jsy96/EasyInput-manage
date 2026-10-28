@@ -38,11 +38,12 @@ export class VoiceSequencePlayer {
     if (this.context) void this.context.close().catch(() => undefined)
     this.context = null
   }
-  async play<T>(items: T[], load: (item: T) => Promise<Uint8Array>, changed: (item: T, index: number) => void): Promise<void> {
+  async play<T>(items: T[] | Promise<T[]>, load: (item: T) => Promise<Uint8Array>, changed: (item: T, index: number) => void): Promise<void> {
     this.stop()
     const generation = this.generation, context = this.context = new AudioContext()
     try {
       await context.resume()
+      items = await items
       for (let index = 0; index < items.length; index++) {
         if (generation !== this.generation) return
         changed(items[index], index)

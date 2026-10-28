@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { DeviceRoomV2 } from './device-room'
-import { CHAT_VERSION, REALTIME_FRAME_SAMPLES, encodeRealtimePacket } from '../../src/shared/chat'
+import { CHAT_VERSION, CHAT_LIMIT, CHAT_PAGE_SIZE, REALTIME_FRAME_SAMPLES, encodeRealtimePacket } from '../../src/shared/chat'
 class Socket {
   readyState = 1
   attachment: unknown
@@ -21,7 +21,11 @@ class Store {
     else for (const [name, item] of Object.entries(key)) this.values.set(name, structuredClone(item))
   })
   delete = vi.fn(async (keys: string | string[]) => { for (const key of Array.isArray(keys) ? keys : [keys]) this.values.delete(key) })
-  list = vi.fn(async ({ prefix }: { prefix: string }) => new Map([...this.values].filter(([k]) => k.startsWith(prefix))))
+  list = vi.fn(async ({ prefix, limit = 10000, startAfter }: { prefix: string; limit?: number; startAfter?: string }) => new Map([...this.values].filter(([k]) => k.startsWith(prefix) && (!startAfter || k > startAfter)).sort(([a], [b]) => a.localeCompare(b)).slice(0, limit)))
+  transaction = vi.fn(async <T>(fn: (tx: Store) => Promise<T>): Promise<T> => {
+    const previous = structuredClone(this.values)
+    try { return await fn(this) } catch (e) { this.values = previous; throw e }
+  })
   setAlarm = vi.fn(async () => {})
 }
 let store: Store, sockets: Socket[], room: DeviceRoomV2
@@ -42,6 +46,146 @@ beforeEach(() => {
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks() })
 describe('shared voice room', () => {
   const measurement = { id: 'a'.repeat(32), kind: 'father_glucose', value: 75, measuredAt: null, uptimeMs: 12345 }
+  const synthetic = (n: number, read = false) => ({ id: `synthetic-${String(n).padStart(5, '0')}`, sender: 'client', name: 'Synthetic test', samples: 900, created: 1000 + n, read })
+  function seed(count: number, read = false): void {
+    store.values.set('voice-revision', 0)
+    for (let i = 0; i < count; i++) { const m = synthetic(i, read); store.values.set(`voice-message:${m.id}`, m) }
+  }
+  it('migrates legacy metadata atomically without losing existing audio or unrelated data', async () => {
+    store.values.set('messages', [synthetic(0)])
+    store.values.set('audio:synthetic-00000:0', btoa('a'.repeat(768)))
+    store.values.set('audio:synthetic-00000:1', btoa('b'.repeat(132)))
+    store.values.set('health-count', 12)
+    store.values.set('delivered:old', true)
+    const browser = socket()
+    await chat(browser, 'list')
+    expect(browser.frames.at(-1)).toMatchObject({ messages: [synthetic(0)], total: 1, next: null })
+    expect(store.values.has('messages')).toBe(false)
+    await chat(browser, 'pullBatch', { id: synthetic(0).id, index: 0, count: 2 })
+    expect((browser.frames.at(-1)?.chunks as { data: string }[]).map(c => atob(c.data).length)).toEqual([768, 132])
+    expect(store.values.get('health-count')).toBe(12)
+    expect(store.values.get('delivered:old')).toBe(true)
+  })
+  it('loads 5000 stored messages in bounded storage pages and exports all with stable cursors', async () => {
+    seed(CHAT_LIMIT)
+    const browser = socket()
+    let before: unknown, through: unknown, ids: string[] = []
+    do {
+      await chat(browser, 'list', { ...(before ? { before } : {}), ...(through ? { through } : {}) })
+      const page = browser.frames.at(-1)!
+      expect(page.total).toBe(CHAT_LIMIT)
+      const messages = page.messages as { id: string }[]
+      expect(messages.length).toBeLessThanOrEqual(CHAT_PAGE_SIZE)
+      expect(JSON.stringify(page).length).toBeLessThan(131072)
+      ids.push(...messages.map(m => m.id))
+      before = page.next; through = page.through
+    } while (before)
+    expect(new Set(ids).size).toBe(CHAT_LIMIT)
+    expect(store.list.mock.calls.filter(([options]) => options.prefix === 'voice-message:')).toHaveLength(6)
+    expect(store.put).not.toHaveBeenCalled()
+  })
+  it('sends only the newest 50 messages in the browser snapshot with whole-room totals', async () => {
+    seed(5000)
+    vi.stubGlobal('WebSocketPair', class { 0 = new Socket(); 1 = new Socket() })
+    vi.stubGlobal('Response', class { constructor(_body: unknown, _init: unknown) {} })
+    await room.fetch(new Request('https://room.internal/ws?role=browser&client=synthetic-browser', { headers: { Upgrade: 'websocket' } }))
+    const snapshot = sockets.at(-1)!.frames[0]
+    expect(snapshot).toMatchObject({ total: 5000, unread: 5000, messages: expect.any(Array), next: { id: synthetic(4950).id } })
+    expect(snapshot.messages).toHaveLength(50)
+  })
+  it('retains 5000 and evicts the oldest eligible item while preserving unread browser messages', async () => {
+    seed(5000)
+    store.values.set(`voice-message:${synthetic(1).id}`, synthetic(1, true))
+    const browser = socket()
+    await upload(browser, 'new-retained-voice')
+    expect(browser.frames.filter(f => f.op === 'message').at(-1)).toMatchObject({ total: 5000, added: true })
+    expect(store.values.has(`voice-message:${synthetic(0).id}`)).toBe(true)
+    expect(store.values.has(`voice-message:${synthetic(1).id}`)).toBe(false)
+    expect([...store.values.keys()].filter(k => k.startsWith('voice-message:'))).toHaveLength(5000)
+  })
+  it('rejects a new upload when all 5000 browser messages are unread', async () => {
+    seed(5000)
+    const browser = socket()
+    await chat(browser, 'begin', { id: 'one-too-many', samples: 900 })
+    expect(browser.frames.at(-1)).toMatchObject({ op: 'error', message: expect.stringContaining('5000') })
+    expect(store.values.has('upload:one-too-many')).toBe(false)
+  })
+  it('serves eight-item board pages, skips unchanged indexes and restarts on concurrent changes', async () => {
+    seed(10)
+    const board = socket('board'), browser = socket()
+    await chat(board, 'index', { offset: 0, count: 8 })
+    expect(board.frames.at(-1)).toMatchObject({ next: 8, end: false, revision: 0 })
+    expect(board.frames.at(-1)?.items).toHaveLength(8)
+    expect(JSON.stringify(board.frames.at(-1)).length).toBeLessThan(2048)
+    await chat(board, 'index', { offset: 8, count: 8, revision: 0 })
+    expect(board.frames.at(-1)).toMatchObject({ next: 10, end: true })
+    await chat(board, 'index', { offset: 0, count: 8, ifRevision: 0 })
+    expect(board.frames.at(-1)).toMatchObject({ unchanged: true })
+    await upload(browser, 'concurrent-new-voice')
+    await chat(board, 'index', { offset: 8, count: 8, revision: 0 })
+    expect(board.frames.at(-1)).toMatchObject({ restart: true, revision: 1 })
+  })
+  it('stores committed audio in one binary value and serves it after a room restart', async () => {
+    const browser = socket()
+    await upload(browser, 'binary-voice')
+    expect(store.values.get('clip:binary-voice')).toBeInstanceOf(ArrayBuffer)
+    expect([...store.values.keys()].filter(k => k.startsWith('audio:binary-voice:'))).toEqual([])
+    room = new DeviceRoomV2({ storage: store, getWebSockets: () => sockets, blockConcurrencyWhile: async (fn: () => Promise<unknown>) => fn() } as unknown as DurableObjectState)
+    await chat(browser, 'pullBatch', { id: 'binary-voice', index: 0, count: 2 })
+    expect((browser.frames.at(-1)?.chunks as { data: string }[]).map(c => atob(c.data).length)).toEqual([768, 132])
+  })
+  it('excludes new messages from an export that fixed its upper cursor', async () => {
+    seed(52)
+    const browser = socket()
+    await chat(browser, 'list')
+    const first = browser.frames.at(-1)!
+    await upload(browser, 'arrived-during-export')
+    await chat(browser, 'list', { before: first.next, through: first.through })
+    expect(browser.frames.at(-1)).toMatchObject({ total: 52, messages: [synthetic(0), synthetic(1)], next: null, through: first.through })
+  })
+  it('rolls back a failed metadata migration and succeeds without losing the legacy array', async () => {
+    store.values.set('messages', [synthetic(0)])
+    store.put.mockRejectedValueOnce(new Error('Synthetic storage failure'))
+    const browser = socket()
+    await expect(chat(browser, 'list')).rejects.toThrow('Synthetic storage failure')
+    expect(store.values.get('messages')).toEqual([synthetic(0)])
+    expect(store.values.has('voice-revision')).toBe(false)
+    await chat(browser, 'list')
+    expect(browser.frames.at(-1)?.messages).toEqual([synthetic(0)])
+  })
+  it('preserves the retained history and upload when the binary commit cannot be stored', async () => {
+    seed(5000, true)
+    const browser = socket()
+    await chat(browser, 'begin', { id: 'failed-commit', samples: 1 })
+    await chat(browser, 'chunk', { id: 'failed-commit', index: 0, data: btoa('a') })
+    store.transaction.mockImplementationOnce(async () => { throw new Error('Synthetic commit failure') })
+    await chat(browser, 'commit', { id: 'failed-commit' })
+    expect(browser.frames.at(-1)).toMatchObject({ op: 'error' })
+    expect(store.values.has(`voice-message:${synthetic(0).id}`)).toBe(true)
+    expect(store.values.has('upload:failed-commit')).toBe(true)
+    expect(store.values.has('clip:failed-commit')).toBe(false)
+    await chat(browser, 'commit', { id: 'failed-commit' })
+    expect(browser.frames.filter(f => f.op === 'message').at(-1)).toMatchObject({ total: 5000 })
+  })
+  it('preserves committed audio if an old incomplete-upload marker is encountered by cleanup', async () => {
+    const browser = socket()
+    await upload(browser, 'committed-voice')
+    store.values.set('upload:committed-voice', { id: 'committed-voice', samples: 900, sender: 'client', created: 1, updated: 1 })
+    await room.alarm()
+    expect(store.values.has('clip:committed-voice')).toBe(true)
+    expect(store.values.has('upload:committed-voice')).toBe(false)
+  })
+  it('commits and reads the maximum 20-second clip with the exact final remainder', async () => {
+    const browser = socket(), samples = 160000
+    const chunks = Array.from({ length: Math.ceil(samples / 768) }, (_, index) => ({ index, data: btoa(String.fromCharCode(128 + index % 64).repeat(Math.min(768, samples - index * 768))) }))
+    await chat(browser, 'begin', { id: 'max-duration', samples })
+    for (let i = 0; i < chunks.length; i += 16) await chat(browser, 'chunks', { id: 'max-duration', chunks: chunks.slice(i, i + 16) })
+    await chat(browser, 'commit', { id: 'max-duration' })
+    expect((store.values.get('clip:max-duration') as ArrayBuffer).byteLength).toBe(samples)
+    await chat(browser, 'pullBatch', { id: 'max-duration', index: 208, count: 16 })
+    expect(browser.frames.at(-1)).toMatchObject({ complete: true, next: 209, chunks: [{ index: 208, data: chunks[208].data }] })
+    expect(atob(chunks[208].data)).toHaveLength(256)
+  })
   it('persists each measurement once after a lost acknowledgement and across room restarts', async () => {
     const board = socket('board'), browser = socket()
     await chat(board, 'health.put', { record: measurement })
@@ -136,10 +280,10 @@ describe('shared voice room', () => {
     const browser = socket(), board = socket('board')
     await upload(browser, 'read-one'); await upload(browser, 'unread-two')
     await chat(board, 'read', { id: 'read-one' })
-    const messages = store.values.get('messages') as { id: string; read: boolean }[]
+    const messages = [...store.values.entries()].filter(([key]) => key.startsWith('voice-message:')).map(([, value]) => value) as { id: string; read: boolean }[]
     expect(messages).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'read-one', read: true }), expect.objectContaining({ id: 'unread-two', read: false })]))
-    expect(store.values.has('audio:read-one:0')).toBe(true)
-    expect(store.values.has('audio:unread-two:0')).toBe(true)
+    expect(store.values.has('clip:read-one')).toBe(true)
+    expect(store.values.has('clip:unread-two')).toBe(true)
     await chat(board, 'index', { offset: 1 })
     expect(board.frames.at(-1)).toMatchObject({ op: 'index', id: 'unread-two', read: false })
   })
@@ -148,13 +292,13 @@ describe('shared voice room', () => {
     await upload(browser, 'bulk-read-one'); await upload(browser, 'bulk-read-two')
     await chat(board, 'read', { id: 'bulk-read-one' })
     await chat(board, 'readAll')
-    const messages = store.values.get('messages') as { id: string; read: boolean }[]
+    const messages = [...store.values.entries()].filter(([key]) => key.startsWith('voice-message:')).map(([, value]) => value) as { id: string; read: boolean }[]
     expect(messages).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: 'bulk-read-one', read: true }),
       expect.objectContaining({ id: 'bulk-read-two', read: true }),
     ]))
-    expect(store.values.has('audio:bulk-read-one:0')).toBe(true)
-    expect(store.values.has('audio:bulk-read-two:0')).toBe(true)
+    expect(store.values.has('clip:bulk-read-one')).toBe(true)
+    expect(store.values.has('clip:bulk-read-two')).toBe(true)
     expect(board.frames.at(-1)).toMatchObject({ op: 'ack', count: 1 })
   })
   it('uses fresh telemetry for presence and prefers direct Wi-Fi over a Bluetooth gateway', async () => {
@@ -183,18 +327,18 @@ describe('shared voice room', () => {
     const first = socket(), later = socket('browser','sixth'), board = socket('board')
     await upload(board, 'reply')
     await chat(board, 'commit', { id: 'reply' })
-    expect((store.values.get('messages') as unknown[])).toHaveLength(1)
+    expect(([...store.values.keys()].filter(key => key.startsWith('voice-message:')))).toHaveLength(1)
     expect(first.frames.find(f => f.op === 'message')).toMatchObject({ message: { sender: 'board' } })
     expect(later.frames.find(f => f.op === 'message')).toMatchObject({ message: { sender: 'board' } })
   })
   it('remembers a committed board recording after history eviction and a lost acknowledgement', async () => {
     const board = socket('board'), browser = socket()
     await upload(board, 'persisted-reply')
-    store.values.set('messages', [])
+    await room.fetch(new Request('https://room.internal/admin/clear', { method: 'POST', headers: { 'X-EasyInput-Clear': '1' } }))
     await chat(board, 'begin', { id: 'persisted-reply', samples: 900 })
     expect(board.frames.at(-1)).toMatchObject({ op: 'ack', committed: true })
     await chat(board, 'commit', { id: 'persisted-reply' })
-    expect(store.values.get('messages')).toEqual([])
+    expect([...store.values.keys()].filter(key => key.startsWith('voice-message:'))).toEqual([])
     expect(browser.frames.filter(f => f.op === 'message')).toHaveLength(1)
   })
   it('confirms the actual cloud transport for a board network announcement', async () => {

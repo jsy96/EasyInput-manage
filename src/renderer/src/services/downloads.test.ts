@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { healthCsv, voiceZip } from './downloads'
+import { healthCsv, voiceZip, voiceZipBatches } from './downloads'
 import type { HealthRecord } from '@shared/health'
 
 describe('history downloads', () => {
@@ -29,4 +29,13 @@ describe('history downloads', () => {
     expect(view.getUint32(central + 42, true)).toBe(0)
     expect(view.getUint32(central + 46 + nameSize + 42, true)).toBe(30 + nameSize + 9)
   })
+})
+
+it('partitions all 5000 voices into bounded ZIP batches without duplicates', () => {
+  const messages = Array.from({ length: 5000 }, (_, i) => ({ id: `synthetic-${i}`, sender: 'board', name: 'Synthetic test', samples: 160000, created: i + 1, read: false }))
+  const batches = voiceZipBatches(messages)
+  expect(batches).toHaveLength(50)
+  expect(batches.every(batch => batch.length === 100)).toBe(true)
+  expect(batches.flat()).toEqual(messages)
+  expect(voiceZipBatches(messages.slice(0, 101)).map(batch => batch.length)).toEqual([100, 1])
 })

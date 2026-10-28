@@ -19,7 +19,7 @@ EasyInput Studio 是 EasyInput V2.0 开发板的浏览器 PWA。网页和开发�
 - S5 开始录音，S6 发送；发送失败自动重试，成功后语音提示。
 - 网页“打开实时监听 / 关闭实时监听”直接控制板载采集，使用 20 ms PCM16 流，实时内容不写入历史；S7/S8 不控制采集。
 - S7 循环记录妈妈高压、妈妈低压、爸爸高压、爸爸低压；S8 循环记录爸爸血糖、妈妈血糖。先播报上次值，旋钮粗调/短按细调，停止旋转 2 秒保存，长按旋钮 3 秒取消。最近值与每次成功保存的历史先保存在板端，断电保留；联网后自动补传，设备页可下载全部已同步历史 CSV。离线最多暂存 64 条，满时提示保存失败，不覆盖旧记录。
-- 网页可将当前保留的全部语音打包下载为 ZIP，也可按从早到晚的顺序连续播放并随时停止。
+- 云端最多保留 5000 条语音，每条最长 20 秒。网页首屏加载最新 50 条，可继续加载更早历史；全部语音按每包最多 100 条分批下载 ZIP，也可从早到晚连续播放并随时停止。
 - 网页只保留“语音”和“设备”两页。设备页负责在线状态、Wi-Fi/语音服务配置和固件升级。
 
 完整按键和灯效约定见 [VOICE_CHAT.md](docs/VOICE_CHAT.md)。
@@ -55,10 +55,10 @@ npm run typecheck
 ```sh
 cd firmware/easyinput-monitor
 idf.py build
-python3 ../../scripts/export-firmware.py --version 0.4.12
+python3 ../../scripts/export-firmware.py --version 0.4.13
 ```
 
-固件包写入 `release/firmware/0.4.12-v2-monitor/`。`build/`、`release/`、`node_modules/`、生成的 `sdkconfig` 和 `managed_components/` 不提交 Git。
+固件包写入 `release/firmware/0.4.13-v2-monitor/`。`build/`、`release/`、`node_modules/`、生成的 `sdkconfig` 和 `managed_components/` 不提交 Git。
 
 中文提示音由 [scripts/build-voice-prompts.py](scripts/build-voice-prompts.py) 使用 `edge-tts-chinese` 的云健男声生成，再转换为 8 kHz 单声道 μ-law 并打包为 `firmware/easyinput-monitor/main/assets/prompts.bin`。
 

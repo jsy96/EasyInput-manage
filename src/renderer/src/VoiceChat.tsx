@@ -6,7 +6,7 @@ import type { BoardLights, BoardStatus } from '@shared/protocol'
 import type { ChatConnection } from './services/chat'
 import { LiveVoicePlayer } from './services/live-audio'
 import { VoiceRecorder, VoiceSequencePlayer, voiceWav } from './services/voice'
-import { downloadFile, voiceZip } from './services/downloads'
+import { downloadFile, voiceZip, voiceZipBatches } from './services/downloads'
 const BOARD_LIGHTS = [
   { label: '灯 1', hint: '未读慢闪 · 批量已读确认常亮' },
   { label: '灯 2', hint: '闹钟到点常亮 1 分钟' },
@@ -19,6 +19,9 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
   const [sending, setSending] = useState(false), [progress, setProgress] = useState(0), [error, setError] = useState('')
   const [draft, setDraft] = useState<Uint8Array | null>(null)
   const [playing, setPlaying] = useState(false)
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const [zipBatches, setZipBatches] = useState<ChatMessage[][]>([]), [zipPart, setZipPart] = useState(0)
+  const [operationTotal, setOperationTotal] = useState(0)
   const [batchDownloading, setBatchDownloading] = useState(false), [batchProgress, setBatchProgress] = useState(0)
   const [sequencePlaying, setSequencePlaying] = useState(false), [sequenceProgress, setSequenceProgress] = useState(0)
   const sequencePlayer = useRef<VoiceSequencePlayer | null>(null)
@@ -30,7 +33,7 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
   const recorder = useRef<VoiceRecorder | null>(null), alive = useRef(true), urlsRef = useRef<Record<string, string>>({})
   const livePlayer = useRef<LiveVoicePlayer | null>(null)
   const messages = sortMessages(room.messages)
-  const unread = room.messages.filter((message) => !message.read).length
+  const unread = room.unread
   const alarmMinute = board?.voice?.alarm_minute
   const countdownSeconds = board?.voice?.countdown_seconds ?? 0
   useEffect(() => { busyChanged(recording || sending || !!loading || playing || batchDownloading || sequencePlaying); return () => busyChanged(false) }, [recording, sending, loading, playing, batchDownloading, sequencePlaying, busyChanged])
@@ -48,13 +51,20 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
   useEffect(() => {
     const ids = new Set(room.messages.map(m => m.id))
     for (const id of audioCache.current.keys()) if (!ids.has(id)) audioCache.current.delete(id)
+    for (const [id, url] of Object.entries(urlsRef.current)) if (!ids.has(id)) {
+      URL.revokeObjectURL(url); delete urlsRef.current[id]; delete players.current[id]
+    }
+    setUrls({ ...urlsRef.current })
   }, [room.messages])
   async function audioBytes(message: ChatMessage): Promise<Uint8Array> {
     const cached = audioCache.current.get(message.id)
     if (cached) return cached
     if (!connection) throw new Error('语音服务未连接')
     const bytes = await connection.download(message)
-    if (alive.current) audioCache.current.set(message.id, bytes)
+    if (alive.current) {
+      audioCache.current.set(message.id, bytes)
+      while (audioCache.current.size > 10) audioCache.current.delete(audioCache.current.keys().next().value!)
+    }
     return bytes
   }
   function stopSequence(): void {
@@ -63,31 +73,53 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
     setSequencePlaying(false); setSequenceProgress(0)
   }
   async function playAll(): Promise<void> {
-    const snapshot = [...messages], run = ++sequenceRun.current
-    if (!snapshot.length) return
+    if (!connection || !room.total) return
+    const run = ++sequenceRun.current
     Object.values(players.current).forEach(player => player?.pause())
-    setSequencePlaying(true); setError('')
+    setSequencePlaying(true); setSequenceProgress(0); setOperationTotal(room.total); setError('')
     const player = sequencePlayer.current ??= new VoiceSequencePlayer()
+    const snapshot = connection.voiceHistory().then(items => {
+      if (!alive.current || run !== sequenceRun.current) return []
+      setOperationTotal(items.length)
+      return items
+    })
+    // The player resumes audio synchronously from this click, before history requests finish.
     try { await player.play(snapshot, audioBytes, (_message, index) => { if (alive.current) setSequenceProgress(index + 1) }) }
     catch (e) { if (alive.current && run === sequenceRun.current) setError(e instanceof Error ? e.message : '连续播放失败') }
     finally { if (alive.current && run === sequenceRun.current) { setSequencePlaying(false); setSequenceProgress(0) } }
   }
-  async function downloadAll(): Promise<void> {
-    const snapshot = [...messages]
-    if (!snapshot.length || batchDownloading) return
+  async function downloadAll(part?: number): Promise<void> {
+    if (!connection || !room.total || batchDownloading) return
     setBatchDownloading(true); setBatchProgress(0); setError('')
     try {
+      const batches = part === undefined ? voiceZipBatches(await connection.voiceHistory()) : zipBatches
+      if (!alive.current) return
+      if (!batches.length) throw new Error('没有可下载的语音')
+      const selected = part ?? 0, snapshot = batches[selected]
+      setZipBatches(batches); setZipPart(selected); setOperationTotal(snapshot.length)
       const files: Array<{ name: string; blob: Blob }> = []
       for (const [index, m] of snapshot.entries()) {
-        const bytes = await audioBytes(m)
+        // Downloads retain audio for this ZIP only; sequential playback has a separate bounded cache.
+        const bytes = await connection.download(m)
         if (!alive.current) return
-        files.push({ name: `${String(index + 1).padStart(3, '0')}_${new Date(m.created).toISOString().replaceAll(':', '-')}_${m.sender === 'board' ? '开发板' : '网页'}_${m.id}.wav`, blob: voiceWav(bytes) })
+        const ordinal = batches.slice(0, selected).reduce((n, batch) => n + batch.length, 0) + index + 1
+        files.push({ name: `${String(ordinal).padStart(4, '0')}_${new Date(m.created).toISOString().replaceAll(':', '-')}_${m.sender === 'board' ? '开发板' : '网页'}_${m.id}.wav`, blob: voiceWav(bytes) })
         setBatchProgress(index + 1)
       }
       const zip = await voiceZip(files)
-      if (alive.current) downloadFile(zip, `全部语音-${new Date().toISOString().slice(0, 10)}.zip`)
-    } catch (e) { if (alive.current) setError(e instanceof Error ? e.message : '语音打包失败，请重试') }
+      if (alive.current) {
+        downloadFile(zip, `全部语音-${new Date().toISOString().slice(0, 10)}-${String(selected + 1).padStart(2, '0')}-共${batches.length}包.zip`)
+        setZipPart(selected + 1)
+      }
+    } catch (e) { if (alive.current) setError(e instanceof Error ? e.message : '语音打包失败，请重试当前包') }
     finally { if (alive.current) setBatchDownloading(false) }
+  }
+  async function loadOlder(): Promise<void> {
+    if (!connection || historyLoading) return
+    setHistoryLoading(true); setError('')
+    try { await connection.loadOlder() }
+    catch (e) { if (alive.current) setError(e instanceof Error ? e.message : '历史语音加载失败') }
+    finally { if (alive.current) setHistoryLoading(false) }
   }
   useEffect(() => {
     if (!connection) return
@@ -127,6 +159,11 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
     try {
       const bytes = await audioBytes(m)
       if (!alive.current) return
+      while (Object.keys(urlsRef.current).length >= 5) {
+        const oldest = Object.keys(urlsRef.current)[0]
+        players.current[oldest]?.pause(); delete players.current[oldest]
+        URL.revokeObjectURL(urlsRef.current[oldest]); delete urlsRef.current[oldest]
+      }
       const url = URL.createObjectURL(voiceWav(bytes)); urlsRef.current[m.id] = url; setUrls({ ...urlsRef.current })
     } catch (e) { setError(e instanceof Error ? e.message : '语音加载失败') }
     finally { if (alive.current) setLoading('') }
@@ -152,14 +189,16 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
     <div className="voice-main">
       <div className="panel-heading voice-heading">
         <div><span className="section-kicker">SHARED VOICE TIMELINE</span><h3>所有声音，一条时间线</h3></div>
-        <div className="voice-heading-stats"><span className={unread ? 'unread-pill' : 'status-chip'}>{unread ? `${unread} 条未读` : '全部已读'}</span><span className="status-chip">{room.messages.length} 条语音</span></div>
+        <div className="voice-heading-stats"><span className={unread ? 'unread-pill' : 'status-chip'}>{unread ? `${unread} 条未读` : '全部已读'}</span><span className="status-chip">{room.total} / 5000 条语音</span></div>
       </div>
       <div className="voice-batch-actions">
-        <button className="button button-subtle" disabled={!room.connected || busy || !!loading || !messages.length} onClick={() => void downloadAll()}><Download size={15} />{batchDownloading ? `正在打包 ${batchProgress} 条` : '下载全部语音 ZIP'}</button>
-        <button className="button button-subtle" disabled={!sequencePlaying && (!room.connected || busy || !!loading || !messages.length || room.realtimeEnabled)} onClick={() => sequencePlaying ? stopSequence() : void playAll()}>{sequencePlaying ? <Square size={15} /> : <Play size={15} />}{sequencePlaying ? `停止播放 · 第 ${sequenceProgress} 条` : '顺序播放全部'}</button>
+        <button className="button button-subtle" disabled={!room.connected || busy || !!loading || !room.total} onClick={() => void downloadAll()}><Download size={15} />{batchDownloading ? `正在打包 ${batchProgress} / ${operationTotal} 条` : '下载全部语音 ZIP'}</button>
+        <button className="button button-subtle" disabled={!sequencePlaying && (!room.connected || busy || !!loading || !room.total || room.realtimeEnabled)} onClick={() => sequencePlaying ? stopSequence() : void playAll()}>{sequencePlaying ? <Square size={15} /> : <Play size={15} />}{sequencePlaying ? `停止播放 · ${sequenceProgress} / ${operationTotal}` : '顺序播放全部'}</button>
       </div>
+      {zipBatches.length > 1 && <div className="voice-batch-actions" role="status"><span>每包最多 100 条，共 {zipBatches.length} 包；已完成 {zipPart} 包。</span>{zipPart < zipBatches.length && <button className="button button-subtle" disabled={busy || !!loading || !room.connected} onClick={() => void downloadAll(zipPart)}><Download size={15} />下载第 {zipPart + 1} 包</button>}</div>}
       {board?.voice && <p className="chat-board-state" role="status">{alarmMinute === null || alarmMinute === undefined ? '未设置闹钟' : `闹钟 ${String(Math.floor(alarmMinute / 60)).padStart(2, '0')}:${String(alarmMinute % 60).padStart(2, '0')}`} · {countdownSeconds ? `倒计时 ${Math.ceil(countdownSeconds / 60)} 分钟` : '无倒计时'}{board.voice.pending > 0 ? ` · ${board.voice.sending ? '发送中' : '待发送'} ${board.voice.pending} 条` : ''}{board.voice.storage_error ? ' · 录音存储异常' : ''}</p>}
       <div className="chat-messages" aria-live="polite">
+        {room.next && <button className="button button-subtle full-button" disabled={historyLoading || busy || !room.connected} onClick={() => void loadOlder()}>{historyLoading ? '正在加载历史…' : `加载更早语音 · 已加载 ${messages.length} / ${room.total}`}</button>}
         {!messages.length && <div className="empty-state"><Mic size={30} /><strong>还没有语音</strong><p>网页或开发板 S5 录下的语音<br />都会进入同一条时间线</p></div>}
         {messages.map(m => <div key={m.id} className={`chat-message ${m.sender === room.self?.id ? 'chat-mine' : ''}`}>
           <div className="chat-message-meta"><strong>{m.sender === 'board' ? '开发板' : m.name}</strong><span>{m.sender === 'board' ? '录音' : '网页'}</span><time>{new Date(m.created).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</time></div>

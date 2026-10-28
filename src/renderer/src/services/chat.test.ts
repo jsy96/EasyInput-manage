@@ -29,3 +29,33 @@ describe('measurement history download', () => {
     }
   })
 })
+
+describe('voice history pagination', () => {
+  const message = (n: number) => ({ id: `synthetic-${n}`, sender: 'board', name: 'Synthetic test', samples: 1, created: n + 1, read: false })
+  it('fetches every page oldest to newest without mixing in newly arriving messages', async () => {
+    const { chat, request } = connection()
+    request.mockResolvedValueOnce({ messages: [message(2), message(3)], next: { id: 'synthetic-2', created: 3 }, through: { id: 'synthetic-3', created: 4 }, total: 4 })
+      .mockResolvedValueOnce({ messages: [message(0), message(1)], next: null, through: { id: 'synthetic-3', created: 4 }, total: 4 })
+    expect(await chat.voiceHistory()).toEqual([0, 1, 2, 3].map(message))
+    expect(request.mock.calls[1]).toEqual(['list', { before: { id: 'synthetic-2', created: 3 }, through: { id: 'synthetic-3', created: 4 } }])
+  })
+  it('merges older pages while keeping fresher read status already received', async () => {
+    const { chat, request } = connection()
+    chat.state = { ...chat.state, messages: [{ ...message(1), read: true }, message(2)], next: { id: 'synthetic-2', created: 3 }, total: 3 }
+    request.mockResolvedValue({ messages: [message(0), message(1)], next: null, through: { id: 'synthetic-2', created: 3 }, total: 3 })
+    await chat.loadOlder()
+    expect(chat.state.messages.map(m => m.id)).toEqual([0, 1, 2].map(n => message(n).id))
+    expect(chat.state.messages[1].read).toBe(true)
+    expect(chat.state.next).toBeNull()
+  })
+  it('detects retention changes during export instead of returning a partial history', async () => {
+    const { chat, request } = connection()
+    request.mockResolvedValue({ messages: [message(0)], next: null, through: { id: 'synthetic-0', created: 1 }, total: 2 })
+    await expect(chat.voiceHistory()).rejects.toThrow('清理')
+  })
+  it('returns an empty voice history', async () => {
+    const { chat, request } = connection()
+    request.mockResolvedValue({ messages: [], next: null, through: null, total: 0 })
+    expect(await chat.voiceHistory()).toEqual([])
+  })
+})

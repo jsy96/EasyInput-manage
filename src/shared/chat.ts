@@ -4,7 +4,9 @@ export const AUDIO_LIMIT = AUDIO_RATE * 20
 export const AUDIO_CHUNK = 768
 export const AUDIO_BATCH = 16
 export const AUDIO_STREAM_WINDOW = 24
-export const CHAT_LIMIT = 100
+export const CHAT_LIMIT = 5000
+export const CHAT_PAGE_SIZE = 50
+export const BOARD_INDEX_PAGE_SIZE = 8
 export const REALTIME_SAMPLE_RATE = 16_000
 export const REALTIME_FRAME_SAMPLES = 320
 export const REALTIME_HEADER_BYTES = 12
@@ -17,6 +19,25 @@ export interface ChatMessage {
   created: number
   read: boolean
 }
+export interface ChatCursor { created: number; id: string }
+export interface ChatPage {
+  messages: ChatMessage[]
+  next: ChatCursor | null
+  through: ChatCursor | null
+  total: number
+}
+export function compareMessages(a: ChatCursor, b: ChatCursor): number {
+  return a.created - b.created || a.id.localeCompare(b.id)
+}
+export function isChatCursor(value: unknown): value is ChatCursor {
+  const c = value as ChatCursor | null
+  return !!c && Number.isSafeInteger(c.created) && c.created > 0 && validId(c.id)
+}
+export function isChatMessage(value: unknown): value is ChatMessage {
+  const m = value as ChatMessage | null
+  return isChatCursor(m) && typeof m.sender === 'string' && typeof m.name === 'string' &&
+    Number.isInteger(m.samples) && m.samples > 0 && m.samples <= AUDIO_LIMIT && typeof m.read === 'boolean'
+}
 export interface ChatClient { id: string; name: string; online?: boolean }
 export interface RoomState {
   online: boolean
@@ -24,18 +45,21 @@ export interface RoomState {
   connected: boolean
   clients: ChatClient[]
   messages: ChatMessage[]
+  total: number
+  unread: number
+  next: ChatCursor | null
   self: ChatClient | null
   realtimeEnabled: boolean
   realtimeActive: boolean
   healthPending: number | null
 }
 export const emptyRoom: RoomState = {
-  online: false, via: null, connected: false, clients: [], messages: [], self: null,
+  online: false, via: null, connected: false, clients: [], messages: [], total: 0, unread: 0, next: null, self: null,
   realtimeEnabled: false, realtimeActive: false,
   healthPending: null,
 }
 export function sortMessages(messages: ChatMessage[]): ChatMessage[] {
-  return [...messages].sort((a, b) => a.created - b.created || a.id.localeCompare(b.id))
+  return [...messages].sort(compareMessages)
 }
 export function latestUnreadMessage(messages: ChatMessage[]): ChatMessage | undefined {
   const sorted = sortMessages(messages)

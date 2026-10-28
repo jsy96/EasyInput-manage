@@ -1,8 +1,8 @@
 import {
-  AUDIO_BATCH, AUDIO_CHUNK, CHAT_VERSION, REALTIME_FRAME_BYTES,
-  decodeRealtimePacket, fromBase64, sortMessages, toBase64,
+  AUDIO_BATCH, AUDIO_CHUNK, CHAT_VERSION, CHAT_LIMIT, CHAT_PAGE_SIZE, REALTIME_FRAME_BYTES,
+  decodeRealtimePacket, fromBase64, sortMessages, toBase64, isChatMessage, isChatCursor, compareMessages,
 } from '@shared/chat'
-import type { ChatMessage, RoomState } from '@shared/chat'
+import type { ChatMessage, RoomState, ChatCursor, ChatPage } from '@shared/chat'
 import { emptyRoom } from '@shared/chat'
 import { isHealthRecord } from '@shared/health'
 import type { HealthRecord } from '@shared/health'
@@ -21,7 +21,7 @@ export function clientIdentity(): { id: string; name: string } {
 }
 export class ChatConnection {
   state: RoomState = { ...emptyRoom }
-  gateway = 'wss://easy.leige.online'
+  gateway = import.meta.env.VITE_CHAT_GATEWAY || 'wss://easy.leige.online'
   device = 'easyinput-v2'
   private socket: WebSocket | null = null
   private timer: ReturnType<typeof setTimeout> | null = null
@@ -32,6 +32,9 @@ export class ChatConnection {
   private pending = new Map<string, { resolve: (f: Frame) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>()
   private realtimeListeners = new Set<(event: RealtimeEvent) => void>()
   private uploadBusy = false
+  private historyLoading = false
+  private generation = 0
+  private pruned = new Set<string>()
   readonly identity = clientIdentity()
   constructor(private readonly callbacks: {
     state(s: RoomState): void
@@ -70,27 +73,40 @@ export class ChatConnection {
       if (v.type === 'bridge') { void this.callbacks.bridge(v.payload as Frame).catch(e => this.callbacks.notice(e instanceof Error ? e.message : '蓝牙网关发送失败')); return }
       if (v.type !== 'chat') { this.callbacks.telemetry(`${event.data}\n`); return }
       if (v.op === 'pong') this.lastPong = Date.now()
-      if (v.op === 'snapshot') this.update({
+      if (v.op === 'snapshot') {
+        this.generation++
+        this.pruned.clear()
+        this.update({
         connected: true,
         online: Boolean(v.online),
         via: v.via as RoomState['via'],
         messages: sortMessages(v.messages as ChatMessage[]),
+        total: Number(v.total ?? (v.messages as ChatMessage[]).length),
+        unread: Number(v.unread ?? (v.messages as ChatMessage[]).filter(m => !m.read).length),
+        next: isChatCursor(v.next) ? v.next : null,
         clients: v.clients as RoomState['clients'],
         self: v.self as RoomState['self'],
         realtimeEnabled: v.realtimeEnabled === true,
         realtimeActive: v.realtimeActive === true,
         healthPending: typeof v.healthPending === 'number' ? v.healthPending : null,
       })
+      }
       if (v.op === 'presence') this.update({ online: Boolean(v.online), via: v.via as RoomState['via'], clients: v.clients as RoomState['clients'], healthPending: typeof v.healthPending === 'number' ? v.healthPending : null })
       if (v.op === 'settings') this.update({ realtimeEnabled: v.realtime_enabled === true })
       if (v.op === 'realtime.start') { this.update({ realtimeActive: true }); this.emitRealtime({ type: 'start' }) }
       if (v.op === 'realtime.chunk' && typeof v.data === 'string') this.emitRealtime({ type: 'chunk', data: v.data })
       if (v.op === 'realtime.stop') { this.update({ realtimeActive: false }); this.emitRealtime({ type: 'stop' }) }
-      if (v.op === 'message') {
-        const m = v.message as ChatMessage
-        this.update({ messages: sortMessages([...this.state.messages.filter(x => x.id !== m.id), m]).slice(-100) })
+      if (v.op === 'message' && isChatMessage(v.message)) {
+        const m = v.message
+        const loaded = this.state.messages.some(x => x.id === m.id)
+        const messages = loaded || v.added === true ? sortMessages([...this.state.messages.filter(x => x.id !== m.id), m]).slice(-CHAT_LIMIT) : this.state.messages
+        this.update({ messages, total: Number(v.total ?? this.state.total), unread: Number(v.unread ?? this.state.unread) })
       }
-      if (v.op === 'pruned') this.update({ messages: this.state.messages.filter(m => !(v.ids as string[]).includes(m.id)) })
+      if (v.op === 'readAll') this.update({ messages: this.state.messages.map(m => ({ ...m, read: true })), unread: 0 })
+      if (v.op === 'pruned' && Array.isArray(v.ids)) {
+        for (const id of v.ids as string[]) this.pruned.add(id)
+        this.update({ messages: this.state.messages.filter(m => !this.pruned.has(m.id)), total: Number(v.total ?? this.state.total), unread: Number(v.unread ?? this.state.unread) })
+      }
       if (typeof v.req === 'string') {
         const pending = this.pending.get(v.req)
         if (pending) { clearTimeout(pending.timer); this.pending.delete(v.req); if (v.op === 'error') pending.reject(new Error(String(v.message))); else pending.resolve(v) }
@@ -98,6 +114,7 @@ export class ChatConnection {
     }
     socket.onclose = () => {
       if (this.socket !== socket) return
+      this.generation++
       this.socket = null; if (this.heartbeat) clearInterval(this.heartbeat); this.heartbeat = null
       this.update({ connected: false, online: false, via: null, healthPending: null })
       for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error('群聊连接中断，请重新发送')) } this.pending.clear()
@@ -146,6 +163,47 @@ export class ChatConnection {
   }
   async setRealtimeEnabled(enabled: boolean): Promise<void> {
     await this.request('realtime.set', { enabled })
+  }
+  private async historyPage(before?: ChatCursor, through?: ChatCursor): Promise<ChatPage> {
+    const page = await this.request('list', { ...(before ? { before } : {}), ...(through ? { through } : {}) })
+    if (!Array.isArray(page.messages) || page.messages.length > CHAT_PAGE_SIZE || !page.messages.every(isChatMessage) ||
+      !Number.isInteger(page.total) || Number(page.total) < page.messages.length || Number(page.total) > CHAT_LIMIT ||
+      (page.next !== null && !isChatCursor(page.next)) || (page.through !== null && !isChatCursor(page.through))) throw new Error('语音历史响应异常')
+    const messages = page.messages as ChatMessage[], next = page.next as ChatCursor | null, upper = page.through as ChatCursor | null
+    if ((through && (!upper || compareMessages(upper, through) !== 0)) ||
+      messages.some((m, i) => (i > 0 && compareMessages(messages[i - 1], m) >= 0) || (before && compareMessages(m, before) >= 0) || (upper && compareMessages(m, upper) > 0)) ||
+      (next && (!messages.length || compareMessages(next, messages[0]) !== 0 || (before && compareMessages(next, before) >= 0)))) throw new Error('语音历史分页未能继续')
+    return { messages, next, through: upper, total: Number(page.total) }
+  }
+  async loadOlder(): Promise<void> {
+    if (this.historyLoading || !this.state.next) return
+    this.historyLoading = true
+    const generation = this.generation
+    try {
+      const page = await this.historyPage(this.state.next)
+      if (generation !== this.generation) throw new Error('语音服务已重新连接，请重新加载历史')
+      const messages = new Map(page.messages.filter(m => !this.pruned.has(m.id)).map(m => [m.id, m]))
+      // Fresh broadcasts win over metadata downloaded just before a read acknowledgement.
+      for (const m of this.state.messages) messages.set(m.id, m)
+      this.update({ messages: sortMessages([...messages.values()]), next: page.next })
+    } finally { this.historyLoading = false }
+  }
+  async voiceHistory(progress?: (count: number, total: number) => void): Promise<ChatMessage[]> {
+    const generation = this.generation, records: ChatMessage[] = []
+    let before: ChatCursor | undefined, through: ChatCursor | undefined, total: number | undefined
+    do {
+      const page = await this.historyPage(before, through)
+      if (generation !== this.generation) throw new Error('语音服务已重新连接，请重新获取历史')
+      through ??= page.through ?? undefined
+      total ??= page.total
+      if (page.messages.some(m => this.pruned.has(m.id))) throw new Error('语音历史在读取期间发生清理，请重试')
+      records.push(...page.messages)
+      progress?.(records.length, total)
+      if (!page.next) break
+      before = page.next
+    } while (records.length < CHAT_LIMIT)
+    if (records.length !== total || new Set(records.map(m => m.id)).size !== records.length) throw new Error('语音历史在读取期间发生清理，请重试')
+    return sortMessages(records)
   }
   async healthHistory(progress?: (count: number) => void): Promise<HealthRecord[]> {
     const records: HealthRecord[] = []

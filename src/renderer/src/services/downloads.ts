@@ -1,3 +1,4 @@
+import type { ChatMessage } from '@shared/chat'
 import type { HealthRecord } from '@shared/health'
 
 export function healthCsv(records: HealthRecord[]): string {
@@ -42,4 +43,11 @@ export function downloadFile(blob: Blob, name: string): void {
   const url = URL.createObjectURL(blob), a = document.createElement('a')
   a.href = url; a.download = name; a.click()
   window.setTimeout(() => URL.revokeObjectURL(url), 60_000)
+}
+
+export const VOICE_ZIP_BATCH_SIZE = 100
+export function voiceZipBatches(messages: ChatMessage[]): ChatMessage[][] {
+  const batches: ChatMessage[][] = []
+  for (let i = 0; i < messages.length; i += VOICE_ZIP_BATCH_SIZE) batches.push(messages.slice(i, i + VOICE_ZIP_BATCH_SIZE))
+  return batches
 }

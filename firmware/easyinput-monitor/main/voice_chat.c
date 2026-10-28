@@ -26,7 +26,8 @@
 #define MAX_AUDIO 160000
 #define STREAM_WINDOW 24
 #define PREBUFFER 9216
-#define MAX_MESSAGES 100
+#define MAX_MESSAGES 5000
+#define INDEX_PAGE_SIZE 8
 #define LONG_US 1200000
 #define SETUP_LONG_US 3000000
 #define SETTINGS_COMMIT_US 3000000
@@ -103,7 +104,7 @@ static void (*send_line)(const char *);
 static bool (*send_binary_line)(const uint8_t *data, size_t length);
 static bool (*send_immediate_line)(const char *line);
 static bool (*cloud_online)(void);
-static message_t messages[MAX_MESSAGES];
+static message_t *messages;
 static int message_count;
 static job_t job;
 static ui_mode_t mode;
@@ -114,6 +115,8 @@ static uint8_t *audio_data;
 static size_t audio_size;
 static unsigned chunk_index;
 static int index_offset;
+static int64_t index_revision = -1;
+static int64_t synced_revision = -1;
 static bool outbox_ready;
 static bool realtime_enabled;
 static bool realtime_active;
@@ -276,20 +279,6 @@ static message_t *find_message(const char *id)
     return NULL;
 }
 
-static void sort_messages(void)
-{
-    for (int i = 1; i < message_count; i++) {
-        message_t current = messages[i];
-        int j = i - 1;
-        while (j >= 0 && (messages[j].created > current.created ||
-               (messages[j].created == current.created && strcmp(messages[j].id, current.id) > 0))) {
-            messages[j + 1] = messages[j];
-            j--;
-        }
-        messages[j + 1] = current;
-    }
-}
-
 static void add_item(cJSON *value)
 {
     const cJSON *id = cJSON_GetObjectItemCaseSensitive(value, "id");
@@ -299,11 +288,22 @@ static void add_item(cJSON *value)
         created->valuedouble < 1 || !cJSON_IsNumber(samples) || samples->valuedouble < 1 ||
         samples->valuedouble > MAX_AUDIO) return;
     message_t *message = find_message(id->valuestring);
-    if (message == NULL && message_count < MAX_MESSAGES) message = &messages[message_count++];
     if (message == NULL) {
-        memmove(&messages[0], &messages[1], sizeof(messages[0]) * (MAX_MESSAGES - 1));
-        message = &messages[MAX_MESSAGES - 1];
-        message_count = MAX_MESSAGES;
+        if (message_count >= MAX_MESSAGES) {
+            // A retained message can arrive before the following index sync removes the evicted ID.
+            memmove(&messages[0], &messages[1], sizeof(messages[0]) * (MAX_MESSAGES - 1));
+            message_count--;
+        }
+        int left = 0, right = message_count;
+        while (left < right) {
+            const int mid = left + (right - left) / 2;
+            if (messages[mid].created < (int64_t)created->valuedouble ||
+                (messages[mid].created == (int64_t)created->valuedouble && strcmp(messages[mid].id, id->valuestring) < 0)) left = mid + 1;
+            else right = mid;
+        }
+        memmove(&messages[left + 1], &messages[left], sizeof(messages[0]) * (message_count - left));
+        message = &messages[left];
+        message_count++;
     }
     memset(message, 0, sizeof(*message));
     strlcpy(message->id, id->valuestring, sizeof(message->id));
@@ -311,7 +311,6 @@ static void add_item(cJSON *value)
     message->samples = (size_t)samples->valuedouble;
     message->read = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(value, "read"));
     message->seen = true;
-    sort_messages();
 }
 
 static message_t *earliest_unread(void)
@@ -531,6 +530,9 @@ static void request_index(void)
 {
     cJSON *value = new_frame("index");
     cJSON_AddNumberToObject(value, "offset", index_offset);
+    cJSON_AddNumberToObject(value, "count", INDEX_PAGE_SIZE);
+    if (index_offset > 0) cJSON_AddNumberToObject(value, "revision", (double)index_revision);
+    else if (synced_revision >= 0) cJSON_AddNumberToObject(value, "ifRevision", (double)synced_revision);
     request(value);
 }
 
@@ -1247,17 +1249,42 @@ static void receive(cJSON *value)
         return;
     }
     if (job == JOB_INDEX && strcmp(op->valuestring, "index") == 0) {
-        if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(value, "end"))) {
-            for (int i = message_count - 1; i >= 0; i--) {
-                if (!messages[i].seen) {
-                    memmove(&messages[i], &messages[i + 1], sizeof(messages[0]) * (message_count - i - 1));
-                    message_count--;
-                }
+        if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(value, "unchanged"))) {
+            finish_job();
+            return;
+        }
+        if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(value, "restart"))) {
+            synced_revision = -1;
+            finish_job();
+            sync_at = esp_timer_get_time() + RETRY_US;
+            return;
+        }
+        const cJSON *items = cJSON_GetObjectItemCaseSensitive(value, "items");
+        const cJSON *revision = cJSON_GetObjectItemCaseSensitive(value, "revision");
+        if (cJSON_IsArray(items)) {
+            const cJSON *next = cJSON_GetObjectItemCaseSensitive(value, "next");
+            const int count = cJSON_GetArraySize(items);
+            if (!cJSON_IsNumber(next) || !cJSON_IsNumber(revision) || revision->valuedouble < 0 ||
+                count > INDEX_PAGE_SIZE || next->valueint != index_offset + count || next->valueint > MAX_MESSAGES ||
+                (index_offset > 0 && (int64_t)revision->valuedouble != index_revision) ||
+                (!count && !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(value, "end")))) {
+                synced_revision = -1;
+                finish_job();
+                return;
             }
+            index_revision = (int64_t)revision->valuedouble;
+            for (int i = 0; i < count; i++) add_item(cJSON_GetArrayItem(items, i));
+            index_offset = next->valueint;
+        }
+        if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(value, "end"))) {
+            int kept = 0;
+            for (int i = 0; i < message_count; i++) if (messages[i].seen) messages[kept++] = messages[i];
+            message_count = kept;
+            synced_revision = cJSON_IsArray(items) ? index_revision : -1;
             finish_job();
         } else {
-            add_item(value);
-            index_offset++;
+            // Compatibility with the previous gateway's one-item index response.
+            if (!cJSON_IsArray(items)) { add_item(value); index_offset++; }
             request_index();
         }
     } else if ((job == JOB_DOWNLOAD || job == JOB_PLAYING) && strcmp(op->valuestring, "audio") == 0) {
@@ -1499,6 +1526,7 @@ static void task(void *argument)
             else if (now >= sync_at) {
                 for (int i = 0; i < message_count; i++) messages[i].seen = false;
                 index_offset = 0;
+                index_revision = -1;
                 job = JOB_INDEX;
                 request_index();
             } else if (voice_outbox_count() && now >= retry_at) {
@@ -1588,6 +1616,11 @@ void voice_chat_init(void (*send)(const char *line),
     timers_init();
     health_records_init();
     snapshot.alarm_minute = -1;
+    messages = heap_caps_calloc(MAX_MESSAGES, sizeof(*messages), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (messages == NULL) {
+        ESP_LOGE(TAG, "Unable to allocate voice history index in PSRAM");
+        return;
+    }
     events = xQueueCreate(64, sizeof(event_t));
     input_events = xQueueCreate(INPUT_QUEUE_DEPTH, sizeof(event_t));
     realtime_events = xQueueCreateWithCaps(REALTIME_QUEUE_DEPTH, sizeof(event_t),
