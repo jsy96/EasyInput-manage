@@ -133,8 +133,8 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
       <section className="key-map">
         <div className="side-title"><span><Keyboard size={17} />开发板按键</span></div>
         <dl>
-          <div><dt>S1</dt><dd>按时间选择下一条未读；已读跳过，无长按功能</dd></div>
-          <div><dt>S2</dt><dd>播放当前语音；再按重播，其他键停止</dd></div>
+          <div><dt>S1</dt><dd>播放前一条历史语音，连续按继续往前；长按进入批量已读确认</dd></div>
+          <div><dt>S2</dt><dd>播放第一条未读，并重设 S1 回听起点；播放中可按 S1 回听</dd></div>
           <div><dt>S3</dt><dd><Bell size={13} />设置每日闹钟，长按取消</dd></div>
           <div><dt>S4</dt><dd><Timer size={13} />设置倒计时</dd></div>
           <div><dt>S5 / S6</dt><dd>录音 / 发送</dd></div>

@@ -283,13 +283,10 @@ static message_t *earliest_unread(void)
     return NULL;
 }
 
-static message_t *next_unread_after(message_t *current)
+static message_t *previous_message_before(message_t *current)
 {
-    if (current == NULL) return earliest_unread();
-    int index = -1;
-    for (int i = 0; i < message_count; i++) if (&messages[i] == current) { index = i; break; }
-    if (index < 0) return earliest_unread();
-    for (int i = index + 1; i < message_count; i++) if (!messages[i].read) return &messages[i];
+    if (current == NULL) return message_count > 0 ? &messages[message_count - 1] : NULL;
+    for (int i = 1; i < message_count; i++) if (&messages[i] == current) return &messages[i - 1];
     return NULL;
 }
 
@@ -369,25 +366,6 @@ static void announce_volume(void)
     if (level < 1) level = 1;
     if (level > 10) level = 10;
     start_prompt(PROMPT_VOLUME_10 + level - 1, PROMPT_ACTION_NONE);
-}
-
-static void select_next_unread(void)
-{
-    stop_prompt();
-    message_t *first = earliest_unread();
-    if (first == NULL) {
-        set_cursor(NULL);
-        start_prompt(PROMPT_NO_MESSAGES, PROMPT_ACTION_NONE);
-        return;
-    }
-    message_t *current = find_message(cursor_id);
-    message_t *next = first;
-    if (current != NULL && !current->read) {
-        next = next_unread_after(current);
-        if (next == NULL) next = current;
-    }
-    set_cursor(next);
-    start_prompt(PROMPT_NEXT, PROMPT_ACTION_NONE);
 }
 
 static void stop_message_playback(void)
@@ -590,12 +568,23 @@ static void play_message(message_t *message)
     audio_data = heap_caps_malloc(message->samples, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (audio_data == NULL) return;
     audio_size = message->samples;
+    set_cursor(message);
     strlcpy(active_id, message->id, sizeof(active_id));
     chunk_index = 0;
     stream_started = stream_complete = false;
     mode = MODE_PLAYING;
     job = JOB_DOWNLOAD;
     request_stream();
+}
+
+static void play_previous_message(void)
+{
+    stop_prompt();
+    message_t *current = find_message(cursor_id);
+    if (current == NULL) current = earliest_unread();
+    message_t *previous = previous_message_before(current);
+    // At the oldest message, keep the cursor without wrapping or replaying it.
+    if (previous != NULL || message_count == 0) play_message(previous);
 }
 
 static void begin_alarm_setting(void)
@@ -798,15 +787,11 @@ static void on_short_key(int key)
     }
     switch (key) {
         case 0:
-            select_next_unread();
+            play_previous_message();
             break;
-        case 1: {
-            stop_prompt();
-            message_t *message = find_message(cursor_id);
-            if (message == NULL || message->read) { message = earliest_unread(); set_cursor(message); }
-            play_message(message);
+        case 1:
+            play_message(earliest_unread());
             break;
-        }
         case 2:
             begin_alarm_setting();
             break;
@@ -903,7 +888,7 @@ static void on_key(int key, bool down)
         }
         if ((job == JOB_DOWNLOAD || job == JOB_PLAYING) && mode == MODE_PLAYING) {
             stop_message_playback();
-            key_consumed[key] = key != 1;
+            key_consumed[key] = key != 0 && key != 1;
         }
         if (prompt_playing && key != 0 && key != 1) {
             const bool recording_control = key == 5 &&
@@ -1197,7 +1182,6 @@ static void receive(cJSON *value)
         if (message != NULL) {
             message->read = true;
             message->pending_read = false;
-            set_cursor(NULL);
         }
         finish_job();
         mode = MODE_IDLE;
