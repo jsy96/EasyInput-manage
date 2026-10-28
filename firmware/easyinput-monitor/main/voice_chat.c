@@ -24,6 +24,7 @@
 #define CHUNK 768
 #define MAX_AUDIO 160000
 #define STREAM_WINDOW 8
+#define PREBUFFER 4096
 #define MAX_MESSAGES 100
 #define LONG_US 1200000
 #define SETUP_LONG_US 3000000
@@ -527,6 +528,31 @@ static void request_stream(void)
     cJSON_AddNumberToObject(value, "index", chunk_index);
     cJSON_AddNumberToObject(value, "count", STREAM_WINDOW);
     request(value);
+}
+
+static size_t received_audio_bytes(void)
+{
+    const size_t buffered = chunk_index * CHUNK;
+    return buffered < audio_size ? buffered : audio_size;
+}
+
+static bool advance_stream_playback(void)
+{
+    const size_t available = received_audio_bytes();
+    if (stream_started) return audio_voice_stream_extend(available) == ESP_OK;
+    if (available < PREBUFFER && available < audio_size) return true;
+    if (audio_play_voice_stream(audio_data, audio_size, available) != ESP_OK) return false;
+    stream_started = true;
+    job = JOB_PLAYING;
+    return true;
+}
+
+static void fail_stream_playback(void)
+{
+    (void)audio_stop_speaker();
+    release_audio();
+    finish_job();
+    mode = MODE_IDLE;
 }
 
 static void mark_read(message_t *message)
@@ -1127,25 +1153,26 @@ static void receive(cJSON *value)
                                   strlen(data->valuestring)) != 0 || length != expected) return;
         memcpy(audio_data + chunk_index * CHUNK, decoded, length);
         chunk_index++;
+        if (!advance_stream_playback()) {
+            fail_stream_playback();
+            return;
+        }
     } else if ((job == JOB_DOWNLOAD || job == JOB_PLAYING) && strcmp(op->valuestring, "streamAck") == 0) {
         const cJSON *next = cJSON_GetObjectItemCaseSensitive(value, "next");
         stream_complete = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(value, "complete"));
+        if (!advance_stream_playback()) {
+            fail_stream_playback();
+            return;
+        }
         if (stream_complete) {
             const unsigned expected_chunks = (audio_size + CHUNK - 1) / CHUNK;
-            if (chunk_index < expected_chunks || (!stream_started &&
-                audio_play_voice(audio_data, audio_size) != ESP_OK)) {
-                release_audio();
-                finish_job();
-                mode = MODE_IDLE;
+            if (chunk_index < expected_chunks) {
+                fail_stream_playback();
                 return;
             }
-            stream_started = true;
-            job = JOB_PLAYING;
             request_line[0] = '\0';
         } else if (!cJSON_IsNumber(next) || next->valueint != (int)chunk_index) {
-            release_audio();
-            finish_job();
-            mode = MODE_IDLE;
+            fail_stream_playback();
         } else {
             request_stream();
         }

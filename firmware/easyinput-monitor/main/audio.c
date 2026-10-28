@@ -274,10 +274,15 @@ static void audio_task(void *arg)
                 tone_frame += frames;
                 if (tone_frame == tone_target_frames) tone_drain_until_us = esp_timer_get_time() + TONE_DRAIN_US;
             }
-        } else if (state.speaker_playing && esp_timer_get_time() >= tone_drain_until_us) {
+        } else if (state.speaker_playing && voice_buffer != NULL &&
+                   voice_frame >= voice_length * 2 && esp_timer_get_time() >= tone_drain_until_us) {
             const esp_err_t result = stop_channel(false);
             if (result != ESP_OK) state.speaker_error = result;
-            else if (voice_buffer != NULL && voice_frame == voice_length * 2) state.voice_completed = true;
+            else state.voice_completed = true;
+        } else if (state.speaker_playing && voice_buffer == NULL &&
+                   esp_timer_get_time() >= tone_drain_until_us) {
+            const esp_err_t result = stop_channel(false);
+            if (result != ESP_OK) state.speaker_error = result;
         }
         xSemaphoreGive(audio_mutex);
         // DMA blocks active I/O. An extra tick would starve 16 ms audio blocks.

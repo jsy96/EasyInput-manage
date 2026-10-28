@@ -1,4 +1,9 @@
 import { AUDIO_LIMIT, AUDIO_RATE, decodeMulaw, encodeMulaw } from '@shared/chat'
+
+export function captureSampleLimit(sampleRate: number): number {
+  if (!Number.isFinite(sampleRate) || sampleRate <= 0) throw new Error('Invalid audio sample rate')
+  return Math.floor(sampleRate * AUDIO_LIMIT / AUDIO_RATE)
+}
 export function resample(samples: Float32Array, rate: number): Uint8Array {
   const length = Math.min(AUDIO_LIMIT, Math.floor(samples.length * AUDIO_RATE / rate))
   const out = new Uint8Array(length)
@@ -39,7 +44,8 @@ export class VoiceRecorder {
       if (this.stopped) { this.dispose(); return }
       const context = this.context = new AudioContext()
       const source = context.createMediaStreamSource(this.stream)
-      const code = `class Capture extends AudioWorkletProcessor { constructor(){super();this.frames=0;this.done=false;} process(inputs){const a=inputs[0]?.[0];if(a&&!this.done){const n=Math.min(a.length,${AUDIO_LIMIT}-this.frames);this.port.postMessage(a.slice(0,n));this.frames+=n;if(this.frames>=${AUDIO_LIMIT}){this.done=true;this.port.postMessage('done');}}return !this.done;}} registerProcessor('voice-capture',Capture);`
+      const sampleLimit = captureSampleLimit(context.sampleRate)
+      const code = `class Capture extends AudioWorkletProcessor { constructor(){super();this.frames=0;this.done=false;} process(inputs){const a=inputs[0]?.[0];if(a&&!this.done){const n=Math.min(a.length,${sampleLimit}-this.frames);this.port.postMessage(a.slice(0,n));this.frames+=n;if(this.frames>=${sampleLimit}){this.done=true;this.port.postMessage('done');}}return !this.done;}} registerProcessor('voice-capture',Capture);`
       this.url = URL.createObjectURL(new Blob([code], { type: 'application/javascript' }))
       await context.audioWorklet.addModule(this.url)
       if (this.stopped) { this.dispose(); return }
