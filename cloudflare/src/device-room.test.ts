@@ -59,19 +59,23 @@ describe('shared voice room', () => {
     await chat(two, 'ping')
     expect(two.frames.at(-1)).toMatchObject({ op: 'presence', online: false, via: null })
   })
-  it('accepts batched browser uploads and serves batched downloads', async () => {
+  it('accepts batched browser uploads and serves twenty-four-chunk board windows', async () => {
     const browser = socket(), board = socket('board')
-    await chat(browser, 'begin', { id: 'batch-audio', samples: 900 })
-    await chat(browser, 'chunks', { id: 'batch-audio', chunks: [
-      { index: 0, data: btoa('a'.repeat(768)) },
-      { index: 1, data: btoa('b'.repeat(132)) },
-    ] })
+    const chunks = Array.from({ length: 25 }, (_, index) => ({
+      index,
+      data: btoa((index === 24 ? 'z' : 'a').repeat(index === 24 ? 1 : 768)),
+    }))
+    await chat(browser, 'begin', { id: 'batch-audio', samples: 768 * 24 + 1 })
+    await chat(browser, 'chunks', { id: 'batch-audio', chunks })
     await chat(browser, 'commit', { id: 'batch-audio' })
-    await chat(browser, 'pullBatch', { id: 'batch-audio', index: 0, count: 16 })
-    expect(browser.frames.filter(f => f.op === 'chunks').at(-1)).toMatchObject({ next: 2, complete: true })
-    await room.webSocketMessage(board as unknown as WebSocket, JSON.stringify({ type: 'chat', protocol: CHAT_VERSION, op: 'stream', req: 'stream-1', id: 'batch-audio', index: 0, count: 8 }))
-    expect(board.frames.filter(f => f.op === 'audio')).toHaveLength(2)
-    expect(board.frames.filter(f => f.op === 'streamAck').at(-1)).toMatchObject({ next: 2, complete: true })
+    await chat(browser, 'pullBatch', { id: 'batch-audio', index: 0, count: 32 })
+    expect(browser.frames.filter(f => f.op === 'chunks').at(-1)).toMatchObject({ next: 25, complete: true })
+    await room.webSocketMessage(board as unknown as WebSocket, JSON.stringify({ type: 'chat', protocol: CHAT_VERSION, op: 'stream', req: 'stream-1', id: 'batch-audio', index: 0, count: 24 }))
+    expect(board.frames.filter(f => f.op === 'audio')).toHaveLength(24)
+    expect(board.frames.filter(f => f.op === 'streamAck').at(-1)).toMatchObject({ next: 24, complete: false })
+    await room.webSocketMessage(board as unknown as WebSocket, JSON.stringify({ type: 'chat', protocol: CHAT_VERSION, op: 'stream', req: 'stream-2', id: 'batch-audio', index: 24, count: 24 }))
+    expect(board.frames.filter(f => f.op === 'audio')).toHaveLength(25)
+    expect(board.frames.filter(f => f.op === 'streamAck').at(-1)).toMatchObject({ next: 25, complete: true })
   })
   it('marks a played item read without deleting shared timeline audio', async () => {
     const browser = socket(), board = socket('board')

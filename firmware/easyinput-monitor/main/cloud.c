@@ -178,8 +178,8 @@ static void cloud_message(const char *payload, size_t length)
     const bool chat = command && cJSON_IsString(type) && strcmp(type->valuestring, "chat") == 0 &&
         cJSON_IsNumber(protocol) && protocol->valueint == CHAT_PROTOCOL;
     if (chat) {
-        // Audio windows can contain eight chunks followed by an acknowledgement.
-        // Keep them out of the eight-entry USB/BLE command queue.
+        // Audio windows can contain twenty-four chunks followed by an acknowledgement;
+        // keep chat frames out of the small USB/BLE command queue.
         (void)voice_chat_receive(command);
     } else if (allowed) {
         extern bool cloud_monitor_queue_command(const char *line);

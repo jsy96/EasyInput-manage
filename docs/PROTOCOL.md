@@ -180,7 +180,7 @@ The board syncs metadata one item at a time with `op: index, offset`. A response
 
 A browser Bluetooth gateway sends `{ "type": "gateway", "payload": <actual board frame> }`. The server sends `{ "type": "bridge", "payload": <board-bound frame> }` only to the chosen gateway. BLE disconnection emits `op: gateway.off`. Status frames must continue advancing `uptime_ms`; pings from a browser cannot keep a disconnected board online. Browser `op: ping` / `pong` checks only cloud connectivity. The room alarm updates expired presence while browsers are idle.
 
-Persistent voice data is 8 kHz mono G.711 mu-law, with at most 160,000 bytes (20 seconds) per message. Browser uploads use `chunks` batches, browser downloads use `pullBatch`, and the board uses `stream` windows followed by `streamAck`. The board starts playback after a small prebuffer and extends the active audio buffer while receiving the remaining chunks.
+Persistent voice data is 8 kHz mono G.711 mu-law, with at most 160,000 bytes (20 seconds) per message. Browser uploads use `chunks` batches, browser downloads use `pullBatch`, and the board uses `stream` windows followed by `streamAck`. The board uses up to twenty-four 768-byte chunks per stream window and starts playback after buffering 9,216 bytes (about 1,152 ms), or after the complete shorter message, while continuing to extend the active audio buffer.
 
 Realtime listening uses transient frames:
 
