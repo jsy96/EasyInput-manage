@@ -102,3 +102,15 @@ esp_err_t voice_outbox_ack(const voice_outbox_item_t *item)
     if (rc == ESP_OK) { pending[item->slot] = false; headers[item->slot].state = state; }
     return rc;
 }
+
+esp_err_t voice_outbox_discard(const char *id)
+{
+    if (!id || !id[0]) return ESP_ERR_INVALID_ARG;
+    for (int slot = 0; slot < VOICE_OUTBOX_CAPACITY; slot++) {
+        if (!pending[slot] || strcmp(headers[slot].id, id) != 0) continue;
+        voice_outbox_item_t item = {.slot = slot, .sequence = headers[slot].sequence};
+        memcpy(item.id, headers[slot].id, sizeof(item.id));
+        return voice_outbox_ack(&item);
+    }
+    return ESP_ERR_NOT_FOUND;
+}

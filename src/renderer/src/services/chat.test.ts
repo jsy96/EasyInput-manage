@@ -7,6 +7,33 @@ function connection() {
   return { chat, request }
 }
 const record = { id: 'a'.repeat(32), kind: 'mother_low', value: 70, measuredAt: null, uptimeMs: 300, receivedAt: 1793145600000, sequence: 1 }
+describe('ledger history download', () => {
+  const entry = { id: 'a'.repeat(32), amount: 273, recordedAt: null, uptimeMs: 1, receivedAt: 1793145600000, sequence: 1 }
+  it('uses a fixed upper bound and downloads all records', async () => {
+    const { chat, request } = connection(), progress = vi.fn()
+    request.mockResolvedValueOnce({ records: [entry], next: 1, through: 2 })
+      .mockResolvedValueOnce({ records: [{ ...entry, id: 'b'.repeat(32), sequence: 2 }], next: 2, through: 2 })
+    expect(await chat.ledgerHistory(progress)).toHaveLength(2)
+    expect(request.mock.calls).toEqual([['ledger.list', { after: 0 }], ['ledger.list', { after: 1, through: 2 }]])
+    expect(progress.mock.calls).toEqual([[1], [2]])
+  })
+  it('accepts empty history and rejects invalid amounts, missing rows and stalled pagination', async () => {
+    const { chat, request } = connection()
+    request.mockResolvedValueOnce({ records: [], next: 0, through: 0 })
+    expect(await chat.ledgerHistory()).toEqual([])
+    for (const page of [{ records: [{ ...entry, amount: 0 }], next: 1, through: 1 }, { records: [], next: 1, through: 2 }, { records: [], next: 0, through: 2 }]) {
+      request.mockResolvedValueOnce(page)
+      await expect(chat.ledgerHistory()).rejects.toThrow()
+    }
+  })
+  it('rejects duplicate records across pages and changes to the export upper bound', async () => {
+    for (const second of [{ records: [{ ...entry, sequence: 2 }], next: 2, through: 2 }, { records: [], next: 1, through: 3 }]) {
+      const { chat, request } = connection()
+      request.mockResolvedValueOnce({ records: [entry], next: 1, through: 2 }).mockResolvedValueOnce(second)
+      await expect(chat.ledgerHistory()).rejects.toThrow()
+    }
+  })
+})
 describe('measurement history download', () => {
   it('downloads all pages using a fixed export upper bound', async () => {
     const { chat, request } = connection()

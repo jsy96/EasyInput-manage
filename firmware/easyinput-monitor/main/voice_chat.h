@@ -9,6 +9,7 @@
 typedef struct {
     unsigned pending;
     unsigned health_pending;
+    unsigned ledger_pending;
     bool sending;
     bool storage_error;
     int alarm_minute;

@@ -52,11 +52,13 @@ export interface RoomState {
   realtimeEnabled: boolean
   realtimeActive: boolean
   healthPending: number | null
+  ledgerPending: number | null
 }
 export const emptyRoom: RoomState = {
   online: false, via: null, connected: false, clients: [], messages: [], total: 0, unread: 0, next: null, self: null,
   realtimeEnabled: false, realtimeActive: false,
   healthPending: null,
+  ledgerPending: null,
 }
 export function sortMessages(messages: ChatMessage[]): ChatMessage[] {
   return [...messages].sort(compareMessages)

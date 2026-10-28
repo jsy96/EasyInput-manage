@@ -746,6 +746,7 @@ static void emit_status(void)
     cJSON *voice = cJSON_AddObjectToObject(root, "voice");
     cJSON_AddNumberToObject(voice, "pending", voice_state.pending);
     cJSON_AddNumberToObject(voice, "health_pending", voice_state.health_pending);
+    cJSON_AddNumberToObject(voice, "ledger_pending", voice_state.ledger_pending);
     cJSON_AddBoolToObject(voice, "sending", voice_state.sending);
     cJSON_AddBoolToObject(voice, "storage_error", voice_state.storage_error);
     cJSON_AddBoolToObject(voice, "setup_active", network_setup_active());

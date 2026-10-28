@@ -235,10 +235,11 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
           <div><dt>S2</dt><dd>播放第一条未读，并重设 S1 回听起点；播放中可按 S1 回听</dd></div>
           <div><dt>S3</dt><dd><Bell size={13} />设置每日闹钟，长按取消</dd></div>
           <div><dt>S4</dt><dd><Timer size={13} />设置倒计时</dd></div>
-          <div><dt>S5 / S6</dt><dd>录音 / 发送</dd></div>
+          <div><dt>S5</dt><dd>短按开始录音，再短按结束并发送；长按 3 秒取消本次未发送录音。满 20 秒后短按发送</dd></div>
+          <div><dt>S6</dt><dd>记账（1～999 元）：先输入百十位，短按旋钮后输入个位，再短按保存；例如 27 → 短按 → 3 → 短按，保存 273 元</dd></div>
           <div><dt>S7</dt><dd>记录血压：妈妈高压 → 妈妈低压 → 爸爸高压 → 爸爸低压；先播报上次值。高压 80～220，低压 50～120</dd></div>
           <div><dt>S8</dt><dd>记录血糖：爸爸 → 妈妈；先播报上次值，范围 3.0～20.0</dd></div>
-          <div><dt>旋钮</dt><dd>记录时血压每格 ±10，血糖每格 ±1；短按切换精细调整（±1 / ±0.1）。停止旋转 2 秒自动保存，长按 3 秒取消本次记录</dd></div>
+          <div><dt>旋钮</dt><dd>记录时血压每格 ±10，血糖每格 ±1；第一次短按进入精细调整（±1 / ±0.1），第二次短按保存。记账和测量记录中长按 3 秒取消本次记录</dd></div>
         </dl>
       </section>
     </aside>

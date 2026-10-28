@@ -271,8 +271,8 @@ static void cloud_task(void *arg)
             // This low-rate state heartbeat repairs a lost realtime start/stop frame.
             char presence[160];
             const int length = snprintf(presence, sizeof(presence),
-                "{\"type\":\"status\",\"protocol\":2,\"uptime_ms\":%lld,\"realtime_active\":%s,\"health_pending\":%u}",
-                (long long)(now / 1000), voice_state.realtime_active ? "true" : "false", voice_state.health_pending);
+                "{\"type\":\"status\",\"protocol\":2,\"uptime_ms\":%lld,\"realtime_active\":%s,\"health_pending\":%u,\"ledger_pending\":%u}",
+                (long long)(now / 1000), voice_state.realtime_active ? "true" : "false", voice_state.health_pending, voice_state.ledger_pending);
             if (length > 0 && (size_t)length < sizeof(presence) && send_text(presence, (size_t)length, pdMS_TO_TICKS(1000))) {
                 if (last_presence_us == 0) ESP_LOGI(TAG, "cloud presence heartbeat active");
                 last_presence_us = now;

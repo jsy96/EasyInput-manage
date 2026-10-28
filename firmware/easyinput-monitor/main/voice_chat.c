@@ -14,6 +14,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "health_records.h"
+#include "ledger_records.h"
 #include "lights.h"
 #include "mbedtls/base64.h"
 #include "network_setup.h"
@@ -87,6 +88,7 @@ typedef enum {
     MODE_REALTIME,
     MODE_COUNTDOWN,
     MODE_SETTING_HEALTH,
+    MODE_SETTING_LEDGER,
 } ui_mode_t;
 
 typedef enum {
@@ -121,6 +123,10 @@ static bool outbox_ready;
 static bool realtime_enabled;
 static bool realtime_active;
 static health_edit_t health_edit;
+static ledger_edit_t ledger_edit;
+static char ledger_request_id[40];
+static char ledger_inflight_id[33];
+static int64_t ledger_retry_at;
 static char health_request_id[40];
 static char health_inflight_id[33];
 static int64_t health_retry_at;
@@ -232,6 +238,28 @@ static void sync_health(int64_t now)
     if (line) { send_line(line); free(line); }
     cJSON_Delete(frame);
     health_retry_at = now + ACK_TIMEOUT_US;
+}
+
+static void sync_ledger(int64_t now)
+{
+    if (now < ledger_retry_at || !network_fresh(now)) return;
+    ledger_pending_t record;
+    if (!ledger_pending_oldest(&record)) return;
+    cJSON *frame = new_frame("ledger.put");
+    if (!frame) return;
+    snprintf(ledger_request_id, sizeof(ledger_request_id), "ledger-%lu", (unsigned long)++sequence);
+    strlcpy(ledger_inflight_id, record.id, sizeof(ledger_inflight_id));
+    cJSON_AddStringToObject(frame, "req", ledger_request_id);
+    cJSON *item = cJSON_AddObjectToObject(frame, "record");
+    cJSON_AddStringToObject(item, "id", record.id);
+    cJSON_AddNumberToObject(item, "amount", record.amount);
+    if (record.recorded_at_ms) cJSON_AddNumberToObject(item, "recordedAt", record.recorded_at_ms);
+    else cJSON_AddNullToObject(item, "recordedAt");
+    cJSON_AddNumberToObject(item, "uptimeMs", record.uptime_ms);
+    char *line = cJSON_PrintUnformatted(frame);
+    if (line) { send_line(line); free(line); }
+    cJSON_Delete(frame);
+    ledger_retry_at = now + ACK_TIMEOUT_US;
 }
 
 static void request(cJSON *value)
@@ -836,9 +864,8 @@ static void begin_health_record(bool blood_pressure)
     start_prompt_sequence(ids, length, PROMPT_ACTION_NONE);
 }
 
-static void commit_health_record(int64_t now)
+static void commit_health_record(void)
 {
-    if (!health_edit_save_due(&health_edit, now)) return;
     const health_kind_t kind = health_edit.kind;
     const int value = health_edit.value;
     const bool saved = health_edit_save(&health_edit);
@@ -850,6 +877,63 @@ static void commit_health_record(int64_t now)
     }
     append_prompt(ids, &length, saved ? PROMPT_HEALTH_SAVED : PROMPT_HEALTH_SAVE_FAILED);
     start_prompt_sequence(ids, length, PROMPT_ACTION_NONE);
+}
+
+static void begin_ledger_record(void)
+{
+    stop_message_playback();
+    stop_prompt();
+    ledger_edit_begin(&ledger_edit);
+    mode = MODE_SETTING_LEDGER;
+    int ids[] = {PROMPT_LEDGER_HIGH, PROMPT_DIGIT_0};
+    start_prompt_sequence(ids, 2, PROMPT_ACTION_NONE);
+}
+
+static void confirm_ledger_record(void)
+{
+    if (!ledger_edit.ones) {
+        ledger_edit.ones = true;
+        int ids[] = {PROMPT_LEDGER_ONES, PROMPT_DIGIT_0};
+        start_prompt_sequence(ids, 2, PROMPT_ACTION_NONE);
+        return;
+    }
+    const int amount = ledger_edit_amount(&ledger_edit);
+    if (amount == 0) {
+        start_prompt(PROMPT_LEDGER_INVALID, PROMPT_ACTION_NONE);
+        return;
+    }
+    const bool saved = ledger_edit_save(&ledger_edit);
+    mode = MODE_IDLE;
+    int ids[16], length = 0;
+    if (saved) {
+        append_number(ids, &length, amount);
+        append_prompt(ids, &length, PROMPT_YUAN);
+    }
+    append_prompt(ids, &length, saved ? PROMPT_LEDGER_SAVED : PROMPT_LEDGER_SAVE_FAILED);
+    start_prompt_sequence(ids, length, PROMPT_ACTION_NONE);
+}
+
+static void cancel_recording(void)
+{
+    if (mode != MODE_RECORDING && job != JOB_CACHE && !hold_id[0] &&
+        prompt_action != PROMPT_ACTION_START_RECORDING) return;
+    stop_prompt();
+    if (hold_id[0]) {
+        if (voice_outbox_discard(hold_id) != ESP_OK) {
+            start_prompt(PROMPT_RECORD_CANCEL_FAILED, PROMPT_ACTION_NONE);
+            return;
+        }
+        hold_id[0] = '\0';
+    }
+    if (mode == MODE_RECORDING && audio_record_stop() != ESP_OK) {
+        start_prompt(PROMPT_RECORD_CANCEL_FAILED, PROMPT_ACTION_NONE);
+        return;
+    }
+    if (mode == MODE_RECORDING || job == JOB_CACHE) release_audio();
+    if (job == JOB_CACHE) finish_job();
+    send_when_saved = false;
+    mode = MODE_IDLE;
+    start_prompt(PROMPT_RECORD_CANCELLED, PROMPT_ACTION_NONE);
 }
 
 static void start_realtime(void)
@@ -903,21 +987,21 @@ static void on_short_key(int key)
             begin_timer_setting();
             break;
         case 4:
-            begin_recording_with_prompt();
-            break;
-        case 5:
-            diag_s6_actions++;
             if (mode == MODE_RECORDING) {
                 stop_prompt();
                 send_when_saved = true;
                 (void)audio_record_stop();
-            } else if (mode == MODE_RECORD_READY) {
+            } else if (mode == MODE_RECORD_READY || job == JOB_CACHE || hold_id[0]) {
                 stop_prompt();
                 hold_id[0] = '\0';
                 send_when_saved = true;
                 if (job == JOB_CACHE) retry_at = now;
-                else if (job == JOB_IDLE) upload_begin();
-            }
+                else { mode = MODE_IDLE; if (job == JOB_IDLE) upload_begin(); }
+            } else begin_recording_with_prompt();
+            break;
+        case 5:
+            diag_s6_actions++;
+            begin_ledger_record();
             break;
         case 6:
             begin_health_record(true);
@@ -927,13 +1011,23 @@ static void on_short_key(int key)
             break;
         case 8:
             if (health_edit.active) {
-                health_edit_toggle_step(&health_edit, now);
-                start_prompt(health_edit.fine ? PROMPT_HEALTH_FINE : PROMPT_HEALTH_COARSE, PROMPT_ACTION_NONE);
-            }
+                if (health_edit.fine) commit_health_record();
+                else {
+                    health_edit_refine(&health_edit);
+                    start_prompt(PROMPT_HEALTH_FINE, PROMPT_ACTION_NONE);
+                }
+            } else if (ledger_edit.active) confirm_ledger_record();
             break;
         default:
             break;
     }
+}
+
+static bool on_long_key(int key);
+
+static int64_t key_long_threshold(int key)
+{
+    return key <= 1 || key == 4 || key == 8 ? SETUP_LONG_US : LONG_US;
 }
 
 static void on_key(int key, bool down)
@@ -948,33 +1042,37 @@ static void on_key(int key, bool down)
         else diag_s6_up_events++;
     }
     if (down && key == 6) diag_s7_events++;
-    if (health_edit.active && key == 8) {
-        health_edit_button(&health_edit, down, now);
+    if ((health_edit.active || ledger_edit.active) && key == 8) {
         if (down) {
             key_consumed[key] = key_held[key] = key_long_handled[key] = false;
             key_down[key] = now;
         } else {
-            const bool handled = key_long_handled[key];
+            bool handled = key_long_handled[key] || key_consumed[key];
+            if (!handled && key_down[key] && now - key_down[key] >= key_long_threshold(key)) handled = on_long_key(key);
             key_down[key] = 0;
             key_held[key] = key_long_handled[key] = key_consumed[key] = false;
             if (!handled) on_short_key(key);
         }
         return;
     }
-    // S7/S8 can advance the measurement even while its introduction is speaking.
-    if (down && (key == 6 || key == 7) && !mark_all_read_confirming &&
-        mode != MODE_RECORDING && mode != MODE_COUNTDOWN) {
+    // Record editors can be selected while their introductions are speaking.
+    if (down && key >= 5 && key <= 7 && !mark_all_read_confirming &&
+        mode != MODE_RECORDING && job != JOB_CACHE && mode != MODE_COUNTDOWN) {
         stop_message_playback();
         stop_prompt();
         key_consumed[key] = key_held[key] = key_long_handled[key] = false;
         key_down[key] = now;
         // A new selection discards the previous unsaved draft.
+        if (key_down[8]) key_consumed[8] = true;
         health_edit_cancel(&health_edit);
-        if (mode == MODE_SETTING_HEALTH) mode = MODE_IDLE;
+        ledger_edit_cancel(&ledger_edit);
+        if (mode == MODE_SETTING_HEALTH || mode == MODE_SETTING_LEDGER) mode = MODE_IDLE;
         return;
     }
-    if (health_edit.active && down) {
+    if ((health_edit.active || ledger_edit.active) && down) {
+        if (key_down[8]) key_consumed[8] = true;
         health_edit_cancel(&health_edit);
+        ledger_edit_cancel(&ledger_edit);
         stop_prompt();
         mode = MODE_IDLE;
     }
@@ -994,8 +1092,12 @@ static void on_key(int key, bool down)
             key_consumed[key] = true;
             return;
         }
-        if (realtime_active && key <= 5) {
+        if (realtime_active && key <= 4) {
             // The webpage owns capture; physical voice keys cannot stop it.
+            key_consumed[key] = true;
+            return;
+        }
+        if (job == JOB_CACHE && key != 4) {
             key_consumed[key] = true;
             return;
         }
@@ -1004,14 +1106,15 @@ static void on_key(int key, bool down)
             key_consumed[key] = key != 0 && key != 1;
         }
         if (prompt_playing && key != 0 && key != 1) {
-            const bool recording_control = key == 5 &&
-                (mode == MODE_RECORDING || mode == MODE_RECORD_READY);
+            const bool recording_control = key == 4 &&
+                (mode == MODE_RECORDING || mode == MODE_RECORD_READY || hold_id[0] ||
+                 prompt_action == PROMPT_ACTION_START_RECORDING || job == JOB_CACHE);
             if (!recording_control) {
                 stop_prompt();
                 key_consumed[key] = true;
             }
         }
-        if (mode == MODE_RECORDING && key != 5) {
+        if (mode == MODE_RECORDING && key != 4) {
             key_consumed[key] = true;
         }
         key_down[key] = now;
@@ -1019,7 +1122,8 @@ static void on_key(int key, bool down)
     }
 
     const bool consumed = key_consumed[key];
-    const bool long_handled = key_long_handled[key];
+    bool long_handled = key_long_handled[key];
+    if (!consumed && !long_handled && key_down[key] && now - key_down[key] >= key_long_threshold(key)) long_handled = on_long_key(key);
     key_down[key] = 0;
     key_held[key] = false;
     key_long_handled[key] = false;
@@ -1057,9 +1161,18 @@ static bool on_long_key(int key)
         stop_prompt();
         start_prompt(removed ? PROMPT_ALARM_CANCEL : PROMPT_SAVE_FAILED, PROMPT_ACTION_NONE);
         return true;
+    } else if (key == 4) {
+        cancel_recording();
+        return true;
     } else if (key == 8) {
         if (health_edit.active) {
             health_edit_cancel(&health_edit);
+            mode = MODE_IDLE;
+            start_prompt(PROMPT_HEALTH_CANCELLED, PROMPT_ACTION_NONE);
+            return true;
+        }
+        if (ledger_edit.active) {
+            ledger_edit_cancel(&ledger_edit);
             mode = MODE_IDLE;
             start_prompt(PROMPT_HEALTH_CANCELLED, PROMPT_ACTION_NONE);
             return true;
@@ -1076,9 +1189,14 @@ static void on_rotate(int delta)
 {
     if (delta == 0) return;
     if (health_edit.active) {
-        health_edit_rotate(&health_edit, delta, esp_timer_get_time());
+        health_edit_rotate(&health_edit, delta);
         int ids[16], length = 0;
         append_health_value(ids, &length, health_edit.kind, health_edit.value);
+        start_prompt_sequence(ids, length, PROMPT_ACTION_NONE);
+    } else if (ledger_edit.active) {
+        ledger_edit_rotate(&ledger_edit, delta);
+        int ids[16], length = 0;
+        append_number(ids, &length, ledger_edit.ones ? ledger_edit.digit : ledger_edit.high);
         start_prompt_sequence(ids, length, PROMPT_ACTION_NONE);
     } else if (mode == MODE_SETTING_ALARM) {
         alarm_draft += delta * 30;
@@ -1140,12 +1258,14 @@ static void handle_timer_events(unsigned timer_events, int64_t now)
         alarm_fired_at_us = now;
         stop_message_playback();
         health_edit_cancel(&health_edit);
+        ledger_edit_cancel(&ledger_edit);
         stop_prompt();
         mode = MODE_IDLE;
         start_prompt(PROMPT_ALARM_DUE, PROMPT_ACTION_NONE);
     }
     if (timer_events & TIMER_EVENT_DONE) {
         health_edit_cancel(&health_edit);
+        ledger_edit_cancel(&ledger_edit);
         stop_prompt();
         mode = MODE_IDLE;
         start_prompt(PROMPT_COUNTDOWN_DONE, PROMPT_ACTION_NONE);
@@ -1168,6 +1288,15 @@ static void receive(cJSON *value)
     const cJSON *op = cJSON_GetObjectItemCaseSensitive(value, "op");
     const cJSON *req = cJSON_GetObjectItemCaseSensitive(value, "req");
     if (!cJSON_IsString(op)) return;
+    if (cJSON_IsString(req) && ledger_request_id[0] && strcmp(req->valuestring, ledger_request_id) == 0) {
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(value, "id");
+        if (strcmp(op->valuestring, "ledger.ack") == 0 && cJSON_IsString(id) &&
+            strcmp(id->valuestring, ledger_inflight_id) == 0 && ledger_pending_ack(id->valuestring)) {
+            ledger_request_id[0] = '\0';
+            ledger_retry_at = esp_timer_get_time() + 200000;
+        }
+        return;
+    }
     if (cJSON_IsString(req) && health_request_id[0] && strcmp(req->valuestring, health_request_id) == 0) {
         const cJSON *id = cJSON_GetObjectItemCaseSensitive(value, "id");
         if (strcmp(op->valuestring, "health.ack") == 0 && cJSON_IsString(id) && strcmp(id->valuestring, health_inflight_id) == 0 && health_pending_ack(id->valuestring)) {
@@ -1418,7 +1547,7 @@ static void task(void *argument)
         const int64_t now = esp_timer_get_time();
         if (now >= probe_at) probe(now);
         for (int key = 0; key < 9; key++) {
-            const int64_t threshold = key <= 1 || key == 8 ? SETUP_LONG_US : LONG_US;
+            const int64_t threshold = key_long_threshold(key);
             if (key_down[key] && !key_held[key] && !key_consumed[key] && now - key_down[key] >= threshold) {
                 key_held[key] = true;
                 key_long_handled[key] = on_long_key(key);
@@ -1437,8 +1566,8 @@ static void task(void *argument)
         const unsigned timer_events = timers_poll(now);
         handle_timer_events(timer_events, now);
         commit_settings(now);
-        commit_health_record(now);
         sync_health(now);
+        sync_ledger(now);
 
         diag_stage = 7;
         audio_snapshot_t audio;
@@ -1518,7 +1647,7 @@ static void task(void *argument)
         }
         diag_stage = 11;
 
-        if (job == JOB_IDLE && network_fresh(now) && !prompt_playing && !health_edit.active && !realtime_active && mode != MODE_RECORDING &&
+        if (job == JOB_IDLE && network_fresh(now) && !prompt_playing && !health_edit.active && !ledger_edit.active && !realtime_active && mode != MODE_RECORDING &&
             mode != MODE_PLAYING && mode != MODE_COUNTDOWN) {
             message_t *receipt = NULL;
             for (int i = 0; i < message_count; i++) if (messages[i].pending_read) { receipt = &messages[i]; break; }
@@ -1532,7 +1661,7 @@ static void task(void *argument)
             } else if (voice_outbox_count() && now >= retry_at) {
                 upload_begin();
             }
-        } else if (job == JOB_IDLE && network_fresh(now) && mode == MODE_IDLE && !health_edit.active && !realtime_active &&
+        } else if (job == JOB_IDLE && network_fresh(now) && mode == MODE_IDLE && !health_edit.active && !ledger_edit.active && !realtime_active &&
                    !prompt_playing && voice_outbox_count() && now >= retry_at) {
             upload_begin();
         }
@@ -1541,7 +1670,7 @@ static void task(void *argument)
             (realtime_start_pending && now - realtime_start_sent_at >= ACK_TIMEOUT_US))) {
             if (realtime_start_pending) diag_realtime_failures++;
             stop_realtime();
-            if (!health_edit.active) start_prompt(PROMPT_OFFLINE, PROMPT_ACTION_NONE);
+            if (!health_edit.active && !ledger_edit.active) start_prompt(PROMPT_OFFLINE, PROMPT_ACTION_NONE);
         }
         if (realtime_stop_pending && network_fresh(now) &&
             now - realtime_stop_sent_at >= REALTIME_STOP_RETRY_US) {
@@ -1558,6 +1687,7 @@ static void task(void *argument)
         const voice_chat_snapshot_t value = {
             .pending = voice_outbox_count() + (job == JOB_CACHE ? 1 : 0),
             .health_pending = health_pending_count(),
+            .ledger_pending = ledger_pending_count(),
             .sending = uploading(),
             .storage_error = !outbox_ready || job == JOB_CACHE,
             .alarm_minute = timers_alarm_minute(),
@@ -1615,6 +1745,7 @@ void voice_chat_init(void (*send)(const char *line),
     cloud_online = is_cloud_online;
     timers_init();
     health_records_init();
+    ledger_records_init();
     snapshot.alarm_minute = -1;
     messages = heap_caps_calloc(MAX_MESSAGES, sizeof(*messages), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (messages == NULL) {

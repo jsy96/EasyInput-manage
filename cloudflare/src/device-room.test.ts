@@ -45,6 +45,60 @@ beforeEach(() => {
 })
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks() })
 describe('shared voice room', () => {
+  const entry = { id: 'd'.repeat(32), amount: 273, recordedAt: null, uptimeMs: 12345 }
+  it('persists ledger entries, deduplicates retries after restart and retains repeated amounts as distinct records', async () => {
+    const board = socket('board'), browser = socket()
+    await chat(board, 'ledger.put', { record: entry })
+    await chat(board, 'ledger.put', { record: entry })
+    expect(board.frames.at(-1)).toMatchObject({ op: 'ledger.ack', id: entry.id })
+    expect(store.values.get('ledger-count')).toBe(1)
+    room = new DeviceRoomV2({ storage: store, getWebSockets: () => sockets, blockConcurrencyWhile: async (fn: () => Promise<unknown>) => fn() } as unknown as DurableObjectState)
+    await chat(board, 'ledger.put', { record: { ...entry, id: 'e'.repeat(32) } })
+    await chat(browser, 'ledger.list')
+    expect(browser.frames.at(-1)).toMatchObject({ next: 2, through: 2, complete: true, records: [{ ...entry, sequence: 1 }, { ...entry, id: 'e'.repeat(32), sequence: 2 }] })
+  })
+  it('does not acknowledge a ledger save when storage fails', async () => {
+    const board = socket('board')
+    store.values.set('voice-revision', 0)
+    store.put.mockRejectedValueOnce(new Error('Synthetic storage failure'))
+    await chat(board, 'ledger.put', { record: entry })
+    expect(board.frames.at(-1)?.op).toBe('error')
+    expect(store.values.has('ledger-count')).toBe(false)
+    await chat(board, 'ledger.put', { record: entry })
+    expect(board.frames.at(-1)?.op).toBe('ledger.ack')
+    expect(store.values.get('ledger-count')).toBe(1)
+  })
+  it('validates ledger amounts and export cursors', async () => {
+    const board = socket('board'), browser = socket()
+    for (const amount of [0, 1000, 2.5]) {
+      await chat(board, 'ledger.put', { record: { ...entry, amount } })
+      expect(board.frames.at(-1)?.op).toBe('error')
+    }
+    await chat(browser, 'ledger.put', { record: entry })
+    expect(browser.frames.at(-1)?.op).toBe('error')
+    await chat(browser, 'ledger.list', { after: -1 })
+    expect(browser.frames.at(-1)?.op).toBe('error')
+    expect(store.values.has('ledger-count')).toBe(false)
+  })
+  it('exports ledger history with a stable upper bound and bridges Bluetooth saves and pending counts', async () => {
+    const browser = socket(), board = socket('board')
+    for (let i = 1; i <= 105; i++) await chat(board, 'ledger.put', { record: { ...entry, id: i.toString(16).padStart(32, '0') } })
+    await chat(browser, 'ledger.list')
+    expect(browser.frames.at(-1)).toMatchObject({ through: 105, next: 100, complete: false })
+    expect(browser.frames.at(-1)?.records).toHaveLength(100)
+    await chat(board, 'ledger.put', { record: entry })
+    await chat(browser, 'ledger.list', { after: 100, through: 105 })
+    expect(browser.frames.at(-1)?.records).toHaveLength(5)
+    await room.webSocketMessage(board as unknown as WebSocket, JSON.stringify({ type: 'status', protocol: 2, uptime_ms: 100, ledger_pending: 3 }))
+    expect(browser.frames.filter(f => f.op === 'presence').at(-1)).toMatchObject({ ledgerPending: 3 })
+    board.readyState = 3
+    await room.webSocketMessage(browser as unknown as WebSocket, JSON.stringify({ type: 'gateway', payload: { type: 'status', protocol: 2, uptime_ms: 101, voice: { ledger_pending: 2 } } }))
+    expect(browser.frames.filter(f => f.op === 'presence').at(-1)).toMatchObject({ ledgerPending: 2, via: 'ble' })
+    await room.webSocketMessage(browser as unknown as WebSocket, JSON.stringify({ type: 'gateway', payload: { type: 'chat', protocol: 2, op: 'ledger.put', req: 'ledger-1', record: entry } }))
+    expect(browser.frames.at(-1)).toMatchObject({ type: 'bridge', payload: { op: 'ledger.ack', id: entry.id, req: 'ledger-1' } })
+    await chat(browser, 'gateway.off')
+    expect(browser.frames.filter(f => f.op === 'presence').at(-1)).toMatchObject({ ledgerPending: null, online: false })
+  })
   const measurement = { id: 'a'.repeat(32), kind: 'father_glucose', value: 75, measuredAt: null, uptimeMs: 12345 }
   const synthetic = (n: number, read = false) => ({ id: `synthetic-${String(n).padStart(5, '0')}`, sender: 'client', name: 'Synthetic test', samples: 900, created: 1000 + n, read })
   function seed(count: number, read = false): void {

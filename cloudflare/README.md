@@ -24,6 +24,8 @@ The configured custom domains are `easy.leige.online` for the gateway and `studi
 
 ## Behavior
 
+Current recording/ledger release: Studio 0.4.4 and firmware 0.4.14. S5 handles record/send/cancel, S6 enters a two-stage integer-yuan ledger amount, and S7/S8 measurements require a second knob press to save. Deploy the gateway, webpage, and firmware together.
+
 - A fresh board status is required for online presence. A WSS connection or cached status alone is insufficient. The freshness window is 8 seconds; direct board Wi-Fi takes priority over a browser Bluetooth gateway.
 - Browser identities persist in localStorage but no longer map to physical S1–S4/S8 slots.
 - Voice is 8 kHz mono G.711 mu-law. Each message is at most 160,000 samples (20 seconds), transferred in acknowledged 768-byte pieces and committed atomically into the group history.
@@ -32,7 +34,7 @@ The configured custom domains are `easy.leige.online` for the gateway and `studi
 - A protected `POST /admin/clear` endpoint requires the `CLEAR_TOKEN` secret. It permanently removes timeline metadata, audio chunks, and incomplete uploads for the default room; connected browsers receive the removal immediately.
 - Text messages and the `/tts` endpoint are removed. Board prompt audio is generated at build time instead.
 - The webpage directly opens/closes capture through the shared `realtime.set` toggle; `settings.realtime_enabled` is a capture command. Opening requires a fresh direct board Wi-Fi route. Start timeout (8 seconds), disconnect, or stale Wi-Fi presence clears the toggle and active state. Board realtime audio uses 20 ms PCM16 binary frames, is forwarded only to browsers while active, and is never persisted.
-- Presence updates still send the unique online-browser count. S7/S8 now record local blood pressure/glucose values and do not control realtime capture or announce presence. Each saved measurement is queued in board NVS and uploaded through Wi-Fi or the selected Bluetooth gateway. The room persists distinct record IDs and deduplicates retries. Browsers export every synchronized measurement with paginated `health.list` requests; measurements are not pruned with voice history. The board retains up to 64 pending records and rejects new saves when full, preserving older records.
+- Presence updates still send the unique online-browser count. S6 records integer-CNY ledger entries; S7/S8 record local blood pressure/glucose values. These keys do not control realtime capture or announce presence. Each saved record is queued in board NVS and uploaded through Wi-Fi or the selected Bluetooth gateway. The room persists distinct record IDs and deduplicates retries. Browsers export synchronized measurements with paginated `health.list`, and ledger entries with `ledger.list`; neither is pruned with voice history. The board retains independent queues of up to 64 pending measurements and 64 pending ledger entries, rejecting new saves when full. Presence and snapshots expose `ledgerPending` alongside `healthPending`; the count becomes null when the board is offline. Deploy the gateway and update board firmware and website together to enable ledger synchronization and CSV export.
 
 The older `agent/` LAN process is not required for either direct Wi-Fi or the browser Bluetooth gateway. Wi-Fi provisioning and firmware flashing remain on local USB/encrypted BLE. See `../docs/VOICE_CHAT.md` and `../docs/PROTOCOL.md` for usage and the wire contract.
 

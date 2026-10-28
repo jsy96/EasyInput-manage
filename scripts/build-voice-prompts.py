@@ -16,7 +16,7 @@ TEXTS = [
     "每日闹钟", "已设置好", "每日闹钟已取消",
     "倒计时", "已设置好，马上开始倒计时", "还有",
     "倒计时结束", "每日闹钟时间到了",
-    "开始录音", "录音结束，短按S6发送", "发送成功", "暂无语音",
+    "开始录音", "录音结束，短按S5发送，长按S5取消", "发送成功", "暂无语音",
     "实时监听未开启", "开始实时监听", "实时监听已结束",
     "开发板在线", "开发板未联网", "电脑端", "人在线", "未知", "百",
     "录音保存失败，请保持供电", "录音缓存已满", "没有网络连接",
@@ -59,6 +59,10 @@ TEXTS.extend([
     "上次记录", "暂无上次记录", "请旋转旋钮记录本次测量值，当前值",
     "点", "已记录", "本次记录已取消", "测量值保存失败，请重试",
     "已切换为精细调整", "已切换为快速调整",
+    "本次录音已取消", "录音取消失败，请重试",
+    "开始记账，请输入百十位，短按旋钮确认，当前值",
+    "请输入个位，短按旋钮保存，当前值", "元", "记账已保存",
+    "记账保存失败，请重试", "金额不能为零，请调整个位后短按旋钮保存",
 ])
 
 
@@ -112,6 +116,7 @@ def main() -> None:
     parser.add_argument("--reuse-existing", action="store_true", help="Keep entries already present and append missing prompts")
     parser.add_argument("--refresh-first", type=int, default=0, metavar="N", help="With --reuse-existing, regenerate the first N entries")
     parser.add_argument("--refresh-from", type=int, default=0, metavar="INDEX", help="With --reuse-existing, regenerate entries from INDEX through the end")
+    parser.add_argument("--refresh-index", type=int, action="append", default=[], metavar="INDEX", help="With --reuse-existing, replace only these entries and append missing prompts")
     parser.add_argument("--work-dir", type=Path, help="Reuse a directory for generated prompts instead of discarding partial work")
     args = parser.parse_args()
     if not args.tts_script.is_file():
@@ -119,8 +124,10 @@ def main() -> None:
     chunks = load_existing(args.output) if args.reuse_existing and args.output.is_file() else []
     if len(chunks) > len(TEXTS):
         raise SystemExit("Existing prompt pack contains more entries than this script defines")
-    if args.refresh_first and args.refresh_from:
-        raise SystemExit("--refresh-first and --refresh-from are mutually exclusive")
+    if sum(bool(value) for value in (args.refresh_first, args.refresh_from, args.refresh_index)) > 1:
+        raise SystemExit("Prompt refresh options are mutually exclusive")
+    if args.refresh_index and (not args.reuse_existing or any(index < 0 or index >= len(chunks) for index in args.refresh_index)):
+        raise SystemExit("--refresh-index requires --reuse-existing and valid existing indices")
     if args.refresh_first:
         if not args.reuse_existing:
             raise SystemExit("--refresh-first requires --reuse-existing")
@@ -137,6 +144,7 @@ def main() -> None:
         start_index, end_index = args.refresh_from, len(TEXTS)
     else:
         start_index, end_index = len(chunks), len(TEXTS)
+    indices = sorted(set(args.refresh_index) | set(range(start_index, end_index)))
     temporary_directory = None
     if args.work_dir is not None:
         root = args.work_dir.expanduser()
@@ -145,7 +153,7 @@ def main() -> None:
         temporary_directory = tempfile.TemporaryDirectory(prefix="easyinput-prompts-")
         root = Path(temporary_directory.name)
     try:
-        for index in range(start_index, end_index):
+        for index in indices:
             text = TEXTS[index]
             mp3 = root / f"{index:02d}.mp3"
             ulaw = root / f"{index:02d}.ulaw"
@@ -160,7 +168,7 @@ def main() -> None:
                 raise SystemExit(f"Empty prompt: {text}")
             text_file.write_text(text)
             time.sleep(15)
-        for index in range(start_index, end_index):
+        for index in indices:
             data = (root / f"{index:02d}.ulaw").read_bytes()
             if not data:
                 raise SystemExit(f"Empty prompt: {TEXTS[index]}")

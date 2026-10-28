@@ -9,8 +9,6 @@
 #include "esp_timer.h"
 #include "nvs.h"
 
-#define SAVE_DELAY_US 2000000LL
-
 static const char *const keys[HEALTH_RECORD_COUNT] = {
     "mother_high", "mother_low", "father_high", "father_low", "father_glucose", "mother_glucose",
 };
@@ -88,7 +86,7 @@ void health_edit_begin(health_edit_t *edit, health_kind_t kind)
     (void)health_record_get(kind, &edit->value);
 }
 
-void health_edit_rotate(health_edit_t *edit, int delta, int64_t now_us)
+void health_edit_rotate(health_edit_t *edit, int delta)
 {
     if (edit == NULL || !edit->active || delta == 0) return;
     const int step = edit->fine ? 1 : 10;
@@ -96,32 +94,17 @@ void health_edit_rotate(health_edit_t *edit, int delta, int64_t now_us)
     if (next < minimum(edit->kind)) next = minimum(edit->kind);
     if (next > maximum(edit->kind)) next = maximum(edit->kind);
     edit->value = (int)next;
-    edit->changed = true;
-    edit->save_at = now_us + SAVE_DELAY_US;
 }
 
-void health_edit_toggle_step(health_edit_t *edit, int64_t now_us)
+void health_edit_refine(health_edit_t *edit)
 {
     if (edit == NULL || !edit->active) return;
-    edit->fine = !edit->fine;
-    if (edit->changed) edit->save_at = now_us + SAVE_DELAY_US;
-}
-
-void health_edit_button(health_edit_t *edit, bool down, int64_t now_us)
-{
-    if (edit == NULL || !edit->active) return;
-    edit->button_down = down;
-    if (!down && edit->changed) edit->save_at = now_us + SAVE_DELAY_US;
-}
-
-bool health_edit_save_due(const health_edit_t *edit, int64_t now_us)
-{
-    return edit != NULL && edit->active && edit->changed && !edit->button_down && now_us >= edit->save_at;
+    edit->fine = true;
 }
 
 bool health_edit_save(health_edit_t *edit)
 {
-    if (edit == NULL || !edit->active || !edit->changed || !valid_kind(edit->kind) ||
+    if (edit == NULL || !edit->active || !edit->fine || !valid_kind(edit->kind) ||
         edit->value < minimum(edit->kind) || edit->value > maximum(edit->kind)) return false;
     edit->active = false;
     if (!ready || history.count >= HEALTH_PENDING_CAPACITY) return false;

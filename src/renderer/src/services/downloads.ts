@@ -1,5 +1,16 @@
 import type { ChatMessage } from '@shared/chat'
 import type { HealthRecord } from '@shared/health'
+import type { LedgerRecord } from '@shared/ledger'
+
+export function ledgerCsv(records: LedgerRecord[]): string {
+  const rows = [['记录编号', '记账时间', '时间状态', '金额', '单位', '云端接收时间', '开机后毫秒']]
+  for (const r of [...records].sort((a, b) => a.sequence - b.sequence)) {
+    rows.push([r.id, r.recordedAt === null ? '' : new Date(r.recordedAt).toISOString(),
+      r.recordedAt === null ? '未知（设备时钟未校准）' : '设备时间', String(r.amount), '元（人民币）',
+      new Date(r.receivedAt).toISOString(), String(r.uptimeMs)])
+  }
+  return '\ufeff' + rows.map(row => row.map(v => `"${v.replaceAll('"', '""')}"`).join(',')).join('\r\n') + '\r\n'
+}
 
 export function healthCsv(records: HealthRecord[]): string {
   const rows = [['记录编号', '测量时间', '时间状态', '人物', '项目', '测量值', '单位', '云端接收时间', '开机后毫秒']]

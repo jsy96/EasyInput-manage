@@ -55,6 +55,7 @@ export interface BoardStatus {
   voice?: {
     pending: number
     health_pending?: number
+    ledger_pending?: number
     sending: boolean
     storage_error: boolean
     setup_active: boolean
@@ -178,6 +179,7 @@ export function parseBoardMessage(line: string): BoardMessage | null {
     if (record.voice !== undefined && (!isRecord(record.voice) || !isFiniteNumber(record.voice.pending) ||
       !Number.isInteger(record.voice.pending) || record.voice.pending < 0 || record.voice.pending > 9 ||
       (record.voice.health_pending !== undefined && (!Number.isInteger(record.voice.health_pending) || Number(record.voice.health_pending) < 0 || Number(record.voice.health_pending) > 64)) ||
+      (record.voice.ledger_pending !== undefined && (!Number.isInteger(record.voice.ledger_pending) || Number(record.voice.ledger_pending) < 0 || Number(record.voice.ledger_pending) > 64)) ||
       !['sending', 'storage_error', 'setup_active'].every(key => typeof (record.voice as Record<string, unknown>)[key] === 'boolean') ||
       (record.voice.alarm_minute !== undefined && !(record.voice.alarm_minute === null || (isFiniteNumber(record.voice.alarm_minute) &&
         Number.isInteger(record.voice.alarm_minute) && record.voice.alarm_minute >= 0 && record.voice.alarm_minute < 1440))) ||

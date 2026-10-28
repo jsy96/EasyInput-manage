@@ -7,7 +7,7 @@ import {
 } from 'lucide-react'
 import { ESPLoader, Transport } from 'esptool-js'
 import { VoiceChat } from './VoiceChat'
-import { downloadFile, healthCsv } from './services/downloads'
+import { downloadFile, healthCsv, ledgerCsv } from './services/downloads'
 import { ChatConnection } from './services/chat'
 import { BluetoothConnection } from './services/bluetooth'
 import { emptyRoom } from '@shared/chat'
@@ -128,6 +128,8 @@ export default function App(): React.JSX.Element {
   const [chatBusy, setChatBusy] = useState(false)
   const [healthDownloading, setHealthDownloading] = useState(false)
   const [healthNote, setHealthNote] = useState('')
+  const [ledgerDownloading, setLedgerDownloading] = useState(false)
+  const [ledgerNote, setLedgerNote] = useState('')
   const [notice, setNotice] = useState('')
   const [serialOpen, setSerialOpen] = useState(false)
   const [serialConnecting, setSerialConnecting] = useState(false)
@@ -178,7 +180,7 @@ export default function App(): React.JSX.Element {
   const bleProtocolOnline = bleConnected && connectionsRef.current.isOnline('ble', clock)
   const configTransport = usbProtocolOnline ? 'usb' as const : bleProtocolOnline ? 'ble' as const : null
   const deviceBusy = flashing || flashPreparing || flashCandidate !== null
-  const updateBlocked = chatBusy || healthDownloading || serialOpen || bleConnected || serialConnecting || bleConnecting || wifiBusy || cloudBusy || deviceBusy
+  const updateBlocked = chatBusy || healthDownloading || ledgerDownloading || serialOpen || bleConnected || serialConnecting || bleConnecting || wifiBusy || cloudBusy || deviceBusy
 
   useEffect(() => {
     const chat = new ChatConnection({
@@ -543,6 +545,17 @@ export default function App(): React.JSX.Element {
     } catch (error) { setHealthNote(error instanceof Error ? error.message : '测量记录下载失败') }
     finally { setHealthDownloading(false) }
   }
+  async function downloadLedger(): Promise<void> {
+    if (!chatRef.current || ledgerDownloading) return
+    setLedgerDownloading(true); setLedgerNote('正在读取记账记录…')
+    try {
+      const records = await chatRef.current.ledgerHistory(count => setLedgerNote(`已读取 ${count} 笔记账…`))
+      if (!records.length) { setLedgerNote('暂无已同步的记账记录；请更新开发板固件并联网完成同步。'); return }
+      downloadFile(new Blob([ledgerCsv(records)], { type: 'text/csv;charset=utf-8' }), `记账历史-${new Date().toISOString().slice(0, 10)}.csv`)
+      setLedgerNote(`已导出 ${records.length} 笔记账（金额为人民币整数元，时间为 UTC）。${room.ledgerPending ? `板端还有 ${room.ledgerPending} 笔待同步，请稍后再次导出。` : !room.online ? '开发板离线，可能还有未同步记录。' : ''}`)
+    } catch (error) { setLedgerNote(error instanceof Error ? error.message : '记账记录下载失败') }
+    finally { setLedgerDownloading(false) }
+  }
   const alarmMinute = currentStatus.voice?.alarm_minute
   const countdownSeconds = currentStatus.voice?.countdown_seconds ?? 0
   return <main className="app-shell">
@@ -583,8 +596,10 @@ export default function App(): React.JSX.Element {
               <div><Timer size={17} /><span>倒计时</span><strong>{countdownSeconds ? `${Math.ceil(countdownSeconds / 60)} 分钟` : '未运行'}</strong><small>{countdownSeconds ? '任意键取消' : '短按 S4 设置'}</small></div>
               <div><Radio size={17} /><span>实时监听状态</span><strong>{room.realtimeActive ? '监听中' : room.realtimeEnabled ? '开启中' : '关闭'}</strong><small>在语音页打开或关闭</small></div>
               <div><Download size={17} /><span>血压血糖记录</span><button className="text-button" disabled={!room.connected || healthDownloading || deviceBusy} onClick={() => void downloadHealth()}>{healthDownloading ? '正在下载…' : '下载历史 CSV'}</button><small>{room.healthPending ? `板端还有 ${room.healthPending} 条待同步` : '导出云端已同步的全部历史'}</small></div>
+              <div><Download size={17} /><span>记账记录</span><button className="text-button" disabled={!room.connected || ledgerDownloading || deviceBusy} onClick={() => void downloadLedger()}>{ledgerDownloading ? '正在下载…' : '下载记账 CSV'}</button><small>{room.ledgerPending ? `板端还有 ${room.ledgerPending} 笔待同步` : '导出云端已同步的全部记账'}</small></div>
             </div>
             {healthNote && <p className="result-note" role="status">{healthNote}</p>}
+            {ledgerNote && <p className="result-note" role="status">{ledgerNote}</p>}
             <details className="setup-section">
               <summary><Wifi size={16} />连接 Wi-Fi 与语音服务<ChevronDown size={15} /></summary>
               <p className="light-note">Wi-Fi：{stateLabel(currentStatus.wifi.state)} · {currentStatus.wifi.ssid || '尚未配置'}；USB：{usbProtocolOnline ? '已连接' : serialConnecting ? '连接中' : '未连接'}；蓝牙：{bleConnecting ? '连接中' : bleConnected ? '已连接' : '未连接'}{bleRetrying ? '（等待自动重连）' : ''}</p>

@@ -14,3 +14,4 @@ bool voice_outbox_oldest(voice_outbox_item_t *item);
 esp_err_t voice_outbox_save(const char *id, const uint8_t *audio, size_t length);
 esp_err_t voice_outbox_read(const voice_outbox_item_t *item, size_t offset, void *data, size_t length);
 esp_err_t voice_outbox_ack(const voice_outbox_item_t *item);
+esp_err_t voice_outbox_discard(const char *id);

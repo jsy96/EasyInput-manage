@@ -6,6 +6,8 @@ import type { ChatMessage, RoomState, ChatCursor, ChatPage } from '@shared/chat'
 import { emptyRoom } from '@shared/chat'
 import { isHealthRecord } from '@shared/health'
 import type { HealthRecord } from '@shared/health'
+import { isLedgerRecord } from '@shared/ledger'
+import type { LedgerRecord } from '@shared/ledger'
 type Frame = Record<string, unknown>
 export type RealtimeEvent =
   | { type: 'start' }
@@ -89,9 +91,10 @@ export class ChatConnection {
         realtimeEnabled: v.realtimeEnabled === true,
         realtimeActive: v.realtimeActive === true,
         healthPending: typeof v.healthPending === 'number' ? v.healthPending : null,
+        ledgerPending: typeof v.ledgerPending === 'number' ? v.ledgerPending : null,
       })
       }
-      if (v.op === 'presence') this.update({ online: Boolean(v.online), via: v.via as RoomState['via'], clients: v.clients as RoomState['clients'], healthPending: typeof v.healthPending === 'number' ? v.healthPending : null })
+      if (v.op === 'presence') this.update({ online: Boolean(v.online), via: v.via as RoomState['via'], clients: v.clients as RoomState['clients'], healthPending: typeof v.healthPending === 'number' ? v.healthPending : null, ledgerPending: typeof v.ledgerPending === 'number' ? v.ledgerPending : null })
       if (v.op === 'settings') this.update({ realtimeEnabled: v.realtime_enabled === true })
       if (v.op === 'realtime.start') { this.update({ realtimeActive: true }); this.emitRealtime({ type: 'start' }) }
       if (v.op === 'realtime.chunk' && typeof v.data === 'string') this.emitRealtime({ type: 'chunk', data: v.data })
@@ -116,7 +119,7 @@ export class ChatConnection {
       if (this.socket !== socket) return
       this.generation++
       this.socket = null; if (this.heartbeat) clearInterval(this.heartbeat); this.heartbeat = null
-      this.update({ connected: false, online: false, via: null, healthPending: null })
+      this.update({ connected: false, online: false, via: null, healthPending: null, ledgerPending: null })
       for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error('群聊连接中断，请重新发送')) } this.pending.clear()
       if (!this.stopped) this.timer = setTimeout(() => { this.timer = null; this.connect() }, Math.min(30000, 1000 * 2 ** this.retries++))
     }
@@ -219,6 +222,27 @@ export class ChatConnection {
       progress?.(records.length)
       if (page.next === through) return records
       if (Number(page.next) <= after) throw new Error('测量记录下载未能继续')
+      after = Number(page.next)
+    }
+  }
+  async ledgerHistory(progress?: (count: number) => void): Promise<LedgerRecord[]> {
+    const records: LedgerRecord[] = [], ids = new Set<string>()
+    const generation = this.generation
+    let after = 0, through: number | undefined
+    for (;;) {
+      const page = await this.request('ledger.list', { after, ...(through === undefined ? {} : { through }) })
+      if (generation !== this.generation) throw new Error('记账服务已重新连接，请重新下载')
+      if (!Array.isArray(page.records) || !page.records.every(isLedgerRecord) || !Number.isSafeInteger(page.through) ||
+        Number(page.through) < after || (through !== undefined && page.through !== through) ||
+        !Number.isSafeInteger(page.next) || Number(page.next) < after || Number(page.next) > Number(page.through) ||
+        page.records.length > 100 || page.records.length !== Number(page.next) - after ||
+        page.records.some((r, i) => r.sequence !== after + i + 1 || ids.has(r.id)) ||
+        new Set(page.records.map(r => r.id)).size !== page.records.length) throw new Error('记账记录响应异常')
+      through = Number(page.through)
+      for (const record of page.records) { records.push(record); ids.add(record.id) }
+      progress?.(records.length)
+      if (page.next === through) return records
+      if (Number(page.next) <= after) throw new Error('记账记录下载未能继续')
       after = Number(page.next)
     }
   }

@@ -17,11 +17,8 @@ typedef enum {
 typedef struct {
     bool active;
     bool fine;
-    bool changed;
-    bool button_down;
     health_kind_t kind;
     int value;
-    int64_t save_at;
 } health_edit_t;
 
 #define HEALTH_PENDING_CAPACITY 64
@@ -36,10 +33,8 @@ typedef struct {
 void health_records_init(void);
 bool health_record_get(health_kind_t kind, int *value);
 void health_edit_begin(health_edit_t *edit, health_kind_t kind);
-void health_edit_rotate(health_edit_t *edit, int delta, int64_t now_us);
-void health_edit_toggle_step(health_edit_t *edit, int64_t now_us);
-void health_edit_button(health_edit_t *edit, bool down, int64_t now_us);
-bool health_edit_save_due(const health_edit_t *edit, int64_t now_us);
+void health_edit_rotate(health_edit_t *edit, int delta);
+void health_edit_refine(health_edit_t *edit);
 bool health_edit_save(health_edit_t *edit);
 void health_edit_cancel(health_edit_t *edit);
 bool health_pending_oldest(health_pending_t *record);

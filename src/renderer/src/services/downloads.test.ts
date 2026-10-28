@@ -1,8 +1,18 @@
 import { describe, expect, it } from 'vitest'
-import { healthCsv, voiceZip, voiceZipBatches } from './downloads'
+import { healthCsv, ledgerCsv, voiceZip, voiceZipBatches } from './downloads'
 import type { HealthRecord } from '@shared/health'
 
 describe('history downloads', () => {
+  it('exports every ledger entry in save order with integer CNY and explicit unknown times', () => {
+    const base = { id: 'a'.repeat(32), amount: 273, recordedAt: null, uptimeMs: 1, receivedAt: 1793145600000, sequence: 1 }
+    const csv = ledgerCsv([{ ...base, id: 'b'.repeat(32), sequence: 2, recordedAt: 1793145600000 }, base])
+    expect(csv.charCodeAt(0)).toBe(0xfeff)
+    expect(csv).toContain('"273","元（人民币）"')
+    expect(csv).toContain('"","未知（设备时钟未校准）"')
+    expect(csv).toContain('2026-10-28T00:00:00.000Z')
+    expect(csv.indexOf(base.id)).toBeLessThan(csv.indexOf('b'.repeat(32)))
+    expect(csv.split('\r\n')).toHaveLength(4)
+  })
   it('exports every measurement including repeated values and unknown measurement times', () => {
     const base: HealthRecord = { id: 'a'.repeat(32), kind: 'father_glucose', value: 75, measuredAt: null, uptimeMs: 123, receivedAt: 1793145600000, sequence: 1 }
     const csv = healthCsv([{ ...base, id: 'b'.repeat(32), kind: 'mother_high', value: 130, sequence: 2 }, base, { ...base, id: 'c'.repeat(32), measuredAt: 1793145600000, sequence: 3 }])

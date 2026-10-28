@@ -5,8 +5,10 @@ import {
 import type { ChatClient, ChatMessage, ChatCursor, ChatPage } from '../../src/shared/chat'
 import { isHealthMeasurement } from '../../src/shared/health'
 import type { HealthRecord } from '../../src/shared/health'
+import { isLedgerEntry } from '../../src/shared/ledger'
+import type { LedgerRecord } from '../../src/shared/ledger'
 
-type Attachment = { role: 'board' | 'browser'; client?: string; name?: string; last?: number; uptime?: number; healthPending?: number }
+type Attachment = { role: 'board' | 'browser'; client?: string; name?: string; last?: number; uptime?: number; healthPending?: number; ledgerPending?: number }
 type Frame = Record<string, unknown>
 type Upload = { id: string; sender: string; name: string; samples: number; next: number; created: number; updated?: number }
 const frame = (op: string, data: Frame = {}): Frame => ({ type: 'chat', protocol: CHAT_VERSION, op, ...data })
@@ -130,7 +132,7 @@ export class DeviceRoomV2 {
     }
     const clients = (await this.clients()).map((c) => ({ ...c, online: this.sockets().some((s) => this.attachment(s).client === c.id) }))
     const onlineClients = clients.filter((client) => client.online).length
-    this.broadcast(frame('presence', { online: !!route, via: route?.via ?? null, clients, healthPending: route ? this.attachment(route.socket).healthPending ?? null : null }), true)
+    this.broadcast(frame('presence', { online: !!route, via: route?.via ?? null, clients, healthPending: route ? this.attachment(route.socket).healthPending ?? null : null, ledgerPending: route ? this.attachment(route.socket).ledgerPending ?? null : null }), true)
     this.toBoard(frame('audience', { online_clients: onlineClients }))
   }
   async fetch(request: Request): Promise<Response> {
@@ -168,6 +170,7 @@ export class DeviceRoomV2 {
         realtimeEnabled: await this.state.storage.get<boolean>('realtime_enabled') ?? false,
         realtimeActive: await this.state.storage.get<boolean>('realtime_active') ?? false,
         healthPending: route ? this.attachment(route.socket).healthPending ?? null : null,
+        ledgerPending: route ? this.attachment(route.socket).ledgerPending ?? null : null,
       }))
       const hello = await this.state.storage.get<Frame>('hello')
       if (hello) this.send(server, hello)
@@ -226,6 +229,7 @@ export class DeviceRoomV2 {
     if (value.type === 'status' && typeof value.uptime_ms === 'number' && value.uptime_ms !== a.uptime) {
       a.last = Date.now(); a.uptime = value.uptime_ms
       if (Number.isInteger(voice.health_pending) && Number(voice.health_pending) >= 0 && Number(voice.health_pending) <= 64) a.healthPending = Number(voice.health_pending)
+      if (Number.isInteger(voice.ledger_pending) && Number(voice.ledger_pending) >= 0 && Number(voice.ledger_pending) <= 64) a.ledgerPending = Number(voice.ledger_pending)
       socket.serializeAttachment(a)
     }
     const route = this.route()
@@ -259,6 +263,32 @@ export class DeviceRoomV2 {
     }
     const sender = board ? 'board' : a.client!
     const id = v.id
+    if (v.op === 'ledger.put') {
+      if (!board) throw new Error('只有开发板可以写入记账记录')
+      if (!isLedgerEntry(v.record)) throw new Error('记账记录格式错误')
+      const input = v.record
+      await this.state.storage.transaction(async tx => {
+        const previous = await tx.get<number>(`ledger-id:${input.id}`)
+        if (previous) return
+        const sequence = (await tx.get<number>('ledger-count') ?? 0) + 1
+        const record: LedgerRecord = { id: input.id, amount: input.amount, recordedAt: input.recordedAt,
+          uptimeMs: input.uptimeMs, receivedAt: Date.now(), sequence }
+        await tx.put({ [`ledger:${sequence}`]: record, [`ledger-id:${input.id}`]: sequence, 'ledger-count': sequence })
+      })
+      reply('ledger.ack', { id: input.id })
+      return
+    }
+    if (v.op === 'ledger.list' && !board) {
+      const count = await this.state.storage.get<number>('ledger-count') ?? 0
+      const after = v.after ?? 0, through = v.through ?? count
+      if (!Number.isSafeInteger(after) || !Number.isSafeInteger(through) || Number(after) < 0 ||
+        Number(through) < Number(after) || Number(through) > count) throw new Error('记账记录分页参数错误')
+      const next = Math.min(Number(through), Number(after) + 100)
+      const records = await Promise.all(Array.from({ length: next - Number(after) }, (_, i) => this.state.storage.get<LedgerRecord>(`ledger:${Number(after) + i + 1}`)))
+      if (records.some(r => !r)) throw new Error('记账记录暂时不可用，请稍后重试')
+      reply('ledger.list', { records, next, through, complete: next === through })
+      return
+    }
     if (v.op === 'health.put') {
       if (!board) throw new Error('只有开发板可以写入测量记录')
       if (!isHealthMeasurement(v.record)) throw new Error('测量记录格式错误')
