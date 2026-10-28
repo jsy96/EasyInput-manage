@@ -122,12 +122,20 @@ p, h1, h2, h3, h4 { margin: 0; }
 .empty-state p { color: #748078; font-size: 11px; line-height: 1.8; }
 
 .voice-side { min-width: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 13px; padding: 24px 20px; background: #fafbf7; }
-.realtime-card, .key-map { padding: 15px; border: 1px solid #e1e8dc; border-radius: 14px; background: #fffefb; }
+.realtime-card, .key-map, .lights-card { padding: 15px; border: 1px solid #e1e8dc; border-radius: 14px; background: #fffefb; }
 .realtime-card.is-active { border-color: #e7c7cb; background: #fff9fa; }
 .side-title { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #344a3f; }
 .side-title > span { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 650; }
 .live-dot { width: 7px; height: 7px; border-radius: 50%; background: #c6cdc7; }
 .live-dot.active { background: var(--red); animation: blink .7s steps(1) infinite; }
+.board-lights { list-style: none; display: flex; flex-direction: column; gap: 7px; margin: 11px 0 0; padding: 0; }
+.board-light-row { display: flex; align-items: center; gap: 9px; color: #52645a; font-size: 10px; }
+.board-light-row small { margin-left: auto; color: #97a29b; font-size: 9px; }
+.board-light-dot { flex: 0 0 auto; width: 10px; height: 10px; border-radius: 50%; background: #d2d9d3; }
+.board-light-dot.is-solid { background: var(--red); }
+.board-light-dot.is-blink { background: var(--red); animation: light-blink 2.5s linear infinite; }
+.board-light-dot.is-flash { background: var(--red); animation: light-flash 1s linear infinite; }
+.board-light-dot.is-unknown { border: 1px dashed #b9c1ba; background: transparent; }
 .realtime-card p { margin: 10px 0 13px; color: #6f7c73; font-size: 10px; line-height: 1.7; }
 .key-map dl { margin: 10px 0 0; }
 .key-map dl > div { display: grid; grid-template-columns: 51px minmax(0, 1fr); gap: 7px; padding: 8px 0; border-top: 1px solid #eef1e9; }
@@ -183,6 +191,8 @@ p, h1, h2, h3, h4 { margin: 0; }
 .notice button { margin-left: auto; border: 0; background: transparent; }
 
 @keyframes blink { 50% { opacity: .16; } }
+@keyframes light-blink { 0%, 19.9% { opacity: 1; } 20%, 100% { opacity: .14; } }
+@keyframes light-flash { 0%, 14.9% { opacity: 1; } 15%, 100% { opacity: .14; } }
 
 @media (max-width: 860px) {
   .voice-page { grid-template-columns: 1fr; overflow-y: auto; }

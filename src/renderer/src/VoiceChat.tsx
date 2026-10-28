@@ -1,11 +1,18 @@
 import { useEffect, useRef, useState } from 'react'
-import { Bell, Keyboard, Mic, Radio, Square, Timer, Volume2 } from 'lucide-react'
+import { Bell, Keyboard, Lightbulb, Mic, Radio, Square, Timer, Volume2 } from 'lucide-react'
 import type { ChatMessage, RoomState } from '@shared/chat'
-import type { BoardStatus } from '@shared/protocol'
+import type { BoardLights, BoardStatus } from '@shared/protocol'
 import type { ChatConnection } from './services/chat'
 import { LiveVoicePlayer } from './services/live-audio'
 import { VoiceRecorder, voiceWav } from './services/voice'
-export function VoiceChat({ room, board, connection, busyChanged, disabled }: { room: RoomState; board: BoardStatus | null; connection: ChatConnection | null; busyChanged(busy: boolean): void; disabled: boolean }): React.JSX.Element {
+const BOARD_LIGHTS = [
+  { label: '灯 1', hint: '未读慢闪 · 批量已读确认常亮' },
+  { label: '灯 2', hint: '闹钟到点常亮 1 分钟' },
+  { label: '灯 3', hint: '倒计时每 1 秒闪 1 次' },
+  { label: '灯 4', hint: '录音常亮 · 发送慢闪' },
+  { label: '灯 5', hint: '实时录音常亮' },
+]
+export function VoiceChat({ room, board, lights, connection, busyChanged, disabled }: { room: RoomState; board: BoardStatus | null; lights: BoardLights | null; connection: ChatConnection | null; busyChanged(busy: boolean): void; disabled: boolean }): React.JSX.Element {
   const [recording, setRecording] = useState(false), [seconds, setSeconds] = useState(0)
   const [sending, setSending] = useState(false), [progress, setProgress] = useState(0), [error, setError] = useState('')
   const [draft, setDraft] = useState<Uint8Array | null>(null)
@@ -108,6 +115,16 @@ export function VoiceChat({ room, board, connection, busyChanged, disabled }: { 
       </div>
     </div>
     <aside className="voice-side">
+      <section className="lights-card">
+        <div className="side-title"><span><Lightbulb size={17} />开发板灯光</span></div>
+        <ul className="board-lights">
+          {BOARD_LIGHTS.map(({ label, hint }, index) => {
+            const pixel = board?.lights.pixels[index]
+            const mode = lights?.modes?.[index] ?? (pixel === 'on' ? 'solid' : pixel === 'off' ? 'off' : 'unknown')
+            return <li className="board-light-row" key={label}><i className={`board-light-dot is-${mode}`} /><span>{label}</span><small>{hint}</small></li>
+          })}
+        </ul>
+      </section>
       <section className={`realtime-card ${room.realtimeActive ? 'is-active' : ''}`}>
         <div className="side-title"><span><Radio size={17} />实时麦克风</span><i className={room.realtimeActive ? 'live-dot active' : 'live-dot'} /></div>
         <p>{room.realtimeActive ? '开发板正在采集，声音仅实时播放，不会保存；按开发板 S8 可结束。' : room.realtimeEnabled ? '房间已允许开发板按 S7 开始采集；当前没有采集。再次点击可关闭权限。' : '允许后，按开发板 S7 可实时收听麦克风，按 S8 结束。'}</p>

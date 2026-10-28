@@ -51,7 +51,8 @@ typedef struct {
 
 void voice_chat_init(void (*send)(const char *line),
                      bool (*send_binary)(const uint8_t *data, size_t length),
-                     bool (*send_immediate)(const char *line));
+                     bool (*send_immediate)(const char *line),
+                     bool (*is_cloud_online)(void));
 bool voice_chat_receive(const cJSON *value);
 void voice_chat_key(int key, bool pressed);
 void voice_chat_rotate(int delta);

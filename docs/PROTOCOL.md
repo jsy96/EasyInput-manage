@@ -96,6 +96,14 @@ Send light commands only through USB or encrypted BLE. Wi-Fi accepts only its ex
 
 Pixel set changes exactly one setting; all set copies one setting to five pixels. `lights.off` clears only enable flags and sends a black frame when powered. It does not switch off GPIO8 or alter per-pixel colors/brightness. Indicator brightness 0 switches GPIO42 off; positive values set its independent 5 kHz/13-bit PWM output. Invalid indexes, colors, brightness values or boolean flags are rejected before changing output.
 
+The auto-driven indicator mapping above is mirrored to Studio in real time. Whenever the computed state changes, the firmware queues a compact frame through the cloud WebSocket; while the cloud is down the frame rides the BLE queue and is re-queued once the cloud link returns (USB viewers follow within the next one-second full status):
+
+```json
+{"type":"lights","protocol":2,"uptime_ms":12345,"status_led":"off","modes":["off","solid","flash","blink","off"]}
+```
+
+`modes` is five strings in 0-based wire order, each `off`, `solid`, `blink` (slow blink), or `flash` (one 0.15 s flash per second). The cloud gateway relays the frame to every browser, which renders the same states with matching timing; over USB without a `lights` frame the page falls back to the sampled `lights.pixels` on/off values.
+
 The shared rail defaults off. A nonzero emitted pixel automatically enables it. At cold start, GPIO8 and downstream command outputs are latched low before output direction is enabled; GPIO11 stays disabled/floating without pulls. On every rail enable the firmware restores downstream safe levels, raises GPIO8, waits `SHARED_RAIL_SETTLE_MS=100` plus one scheduler tick, then creates/enables RMT and sends a black frame before colors. This is a **provisional project bring-up wait**, not a measurement or proof that all components/batches have stabilized. The board exposes no rail-ready feedback in this implementation. Qualify the settling waveform and voltage/DIN margins on the actual assembled board before accepting the result.
 
 RMT transmits GRB at 800 kbit/s (T0H/T0L 0.40/0.85 µs, T1H/T1L 0.80/0.45 µs) plus a 300 µs low latch. The entire five-pixel frame and end marker fit in RMT memory. Each channel is scaled with `(value * brightness + 50) / 100` when enabled. Shared shutdown sends black, waits for audio I/O, stops/detaches both I²S controllers and RMT, restores GPIO9/10/12/13/14/15 low and GPIO11 disabled/floating, then lowers GPIO8. Pixel enable flags are cleared; powering back on alone does not restore previously lit pixels. The independent GPIO42 PWM is unaffected. The shared-rail mutex serializes light operations and audio startup. The audio worker uses a separate mutex, with strict lock order rail → audio → I²S. Shutdown takes the audio mutex to wait for bounded in-flight DMA calls; if an audio controller cannot be stopped/detached, GPIO8 stays on and an error is reported.
@@ -215,13 +223,15 @@ Protocol-2 status optionally adds:
 
 `pending` is an integer 0–9 (8 Flash slots plus a possible RAM clip on save failure). `alarm_minute` is `null` or minute-of-day 0–1439. WS2812 brightness is the minimum non-zero level, 1%:
 
-- LED 1 slow-blinks red while any timeline message is unread, otherwise off.
-- LED 2 is solid red while recording and slow-blinks red while sending or waiting to retry.
-- LED 3 slow-blinks red while realtime listening is active.
-- LED 4 slow-blinks red while the latest audience count is nonzero and the board has fresh cloud connectivity.
-- LED 5 is solid red when an alarm is set and slow-blinks red while a countdown runs; countdown takes priority.
+- LED 1 slow-blinks red while any timeline message is unread, stays solid red while the board is confirming or awaiting acknowledgement for marking all unread messages read, and turns off when all messages are read.
+- LED 2 slow-blinks red while an alarm is set, stays solid red for one minute when the alarm fires, and turns off when the alarm is canceled.
+- LED 3 flashes red once per second while a countdown runs, otherwise off.
+- LED 4 is solid red while recording and slow-blinks red while sending or waiting to retry.
+- LED 5 is solid red while realtime listening is active, otherwise off.
 
-Every red slow blink uses 0.1 seconds on followed by 2 seconds off.
+Every slow blink uses 0.5 seconds on followed by 2 seconds off; the countdown flash is 0.15 seconds on every second.
+
+Holding S1 for three seconds asks whether to mark all unread voice messages read. Holding S2 for another three seconds sends the board-only chat operation `readAll`; the room marks every unread timeline item read, preserves history and stored audio, broadcasts the updated items, and replies `{"op":"ack","count":<changed>}`. Releasing S2 before three seconds or pressing another key cancels the confirmation.
 
 Firmware 0.2.3 initializes SNTP with `ntp.aliyun.com` and starts it when DHCP supplies the station IPv4 address. The cloud WebSocket task remains closed until system time is at or after 2025-01-01 UTC. This prevents a cold-boot clock from rejecting current TLS certificates as not yet valid. Once connected, the board sends a lightweight protocol-2 status with an advancing `uptime_ms` every three seconds; the server uses it for presence, while full telemetry remains a separate frame.
 

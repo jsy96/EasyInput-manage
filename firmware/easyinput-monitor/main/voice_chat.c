@@ -35,6 +35,9 @@
 #define INPUT_QUEUE_DEPTH 16
 #define SLOW_BLINK_ON_US 500000LL
 #define SLOW_BLINK_PERIOD_US 2500000LL
+#define FLASH_ON_US 150000LL
+#define FLASH_PERIOD_US 1000000LL
+#define ALARM_SOLID_US 60000000LL
 #define TOKEN_VALID_FROM 1735689600LL
 #define REALTIME_HEADER_BYTES 12
 #define REALTIME_FRAME_BYTES (AUDIO_SAMPLE_RATE / 50 * (int)sizeof(int16_t))
@@ -64,6 +67,7 @@ typedef enum {
     JOB_DOWNLOAD,
     JOB_PLAYING,
     JOB_MARK_READ,
+    JOB_MARK_ALL_READ,
     JOB_CACHE,
     JOB_UP_BEGIN,
     JOB_UP_CHUNK,
@@ -96,6 +100,7 @@ static SemaphoreHandle_t event_ready;
 static void (*send_line)(const char *);
 static bool (*send_binary_line)(const uint8_t *data, size_t length);
 static bool (*send_immediate_line)(const char *line);
+static bool (*cloud_online)(void);
 static message_t messages[MAX_MESSAGES];
 static int message_count;
 static job_t job;
@@ -116,6 +121,7 @@ static int64_t sync_at;
 static int64_t retry_at;
 static int64_t cache_at;
 static int64_t settings_commit_at;
+static bool mark_all_read_confirming;
 static int64_t key_down[9];
 static bool key_held[9];
 static bool key_long_handled[9];
@@ -134,6 +140,7 @@ static int64_t last_network_at;
 static int network_via;
 static int alarm_draft = 12 * 60;
 static int timer_draft = 30;
+static int64_t alarm_fired_at_us;
 static int prompt_ids[16];
 static int prompt_length;
 static int prompt_position;
@@ -425,25 +432,65 @@ static void cancel_countdown(bool prompt)
     if (prompt) start_prompt(PROMPT_COUNTDOWN_DONE, PROMPT_ACTION_NONE);
 }
 
+// Auto-driven indicator semantics are mirrored to Studio through compact
+// `lights` frames so the web page renders the same state in real time.
+static char pushed_modes[LIGHT_PIXEL_COUNT][8];
+static char lights_line[320];
+static bool lights_push_pending;
+
+static void queue_light_modes(const char *const modes[LIGHT_PIXEL_COUNT])
+{
+    lights_snapshot_t state;
+    lights_get_snapshot(&state);
+    const char *status_led = !state.ready ? "unknown" : state.status_brightness ? "on" : "off";
+    const int length = snprintf(lights_line, sizeof(lights_line),
+        "{\"type\":\"lights\",\"protocol\":%d,\"uptime_ms\":%lld,\"status_led\":\"%s\","
+        "\"modes\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}",
+        CHAT_PROTOCOL, (long long)(esp_timer_get_time() / 1000), status_led,
+        modes[0], modes[1], modes[2], modes[3], modes[4]);
+    if (length <= 0 || (size_t)length >= sizeof(lights_line)) return;
+    // The queued cloud path is the reliable transport; while the cloud is
+    // down the frame rides BLE and a retry re-queues once the link returns.
+    send_line(lights_line);
+    lights_push_pending = !cloud_online || !cloud_online();
+}
+
 static void refresh_lights(int64_t now)
 {
     const bool unread = earliest_unread() != NULL;
     const bool recording = mode == MODE_RECORDING;
     const bool sending = uploading() || job == JOB_CACHE || voice_outbox_count() > 0;
     const bool realtime = mode == MODE_REALTIME;
-    const bool slow_blink = (now % SLOW_BLINK_PERIOD_US) < SLOW_BLINK_ON_US;
-    const bool computers_online = network_fresh(now) && last_audience_at &&
-        now - last_audience_at < 10000000 && online_clients > 0;
-    const bool timer_running = timers_countdown_active();
     const bool alarm_set = timers_alarm_minute() >= 0;
-    int color[5] = {0};
-    if (unread && slow_blink) color[0] = 0xff0000;
-    if (recording) color[1] = 0xff0000;
-    else if (sending && slow_blink) color[1] = 0xff0000;
-    if (realtime && slow_blink) color[2] = 0xff0000;
-    if (computers_online && slow_blink) color[3] = 0xff0000;
-    if (timer_running && slow_blink) color[4] = 0xff0000;
-    else if (alarm_set) color[4] = 0xff0000;
+    const bool alarm_fired = alarm_set && alarm_fired_at_us != 0 &&
+        now - alarm_fired_at_us < ALARM_SOLID_US;
+    const bool timer_running = timers_countdown_active();
+    const bool slow_blink = (now % SLOW_BLINK_PERIOD_US) < SLOW_BLINK_ON_US;
+    const bool second_flash = (now % FLASH_PERIOD_US) < FLASH_ON_US;
+    const char *modes[LIGHT_PIXEL_COUNT];
+    int color[LIGHT_PIXEL_COUNT] = {0};
+    modes[0] = mark_all_read_confirming ? "solid" : unread ? "blink" : "off";
+    modes[1] = alarm_fired ? "solid" : alarm_set ? "blink" : "off";
+    modes[2] = timer_running ? "flash" : "off";
+    modes[3] = recording ? "solid" : sending ? "blink" : "off";
+    modes[4] = realtime ? "solid" : "off";
+    if (mark_all_read_confirming || (unread && slow_blink)) color[0] = 0xff0000;
+    if (alarm_fired || (alarm_set && slow_blink)) color[1] = 0xff0000;
+    if (timer_running && second_flash) color[2] = 0xff0000;
+    if (recording || (sending && slow_blink)) color[3] = 0xff0000;
+    if (realtime) color[4] = 0xff0000;
+    bool changed = false;
+    for (int index = 0; index < LIGHT_PIXEL_COUNT; index++) {
+        if (strcmp(pushed_modes[index], modes[index]) != 0) {
+            strlcpy(pushed_modes[index], modes[index], sizeof(pushed_modes[index]));
+            changed = true;
+        }
+    }
+    if (changed) {
+        queue_light_modes(modes);
+    } else if (lights_push_pending && cloud_online && cloud_online()) {
+        queue_light_modes(modes);
+    }
     lights_snapshot_t current;
     lights_get_snapshot(&current);
     for (int index = 0; index < LIGHT_PIXEL_COUNT; index++) {
@@ -478,6 +525,15 @@ static void mark_read(message_t *message)
     job = JOB_MARK_READ;
     cJSON *value = new_frame("read");
     cJSON_AddStringToObject(value, "id", active_id);
+    request(value);
+}
+
+static void mark_all_unread_read(void)
+{
+    cJSON *value = new_frame("readAll");
+    if (value == NULL) return;
+    stop_prompt();
+    job = JOB_MARK_ALL_READ;
     request(value);
 }
 
@@ -783,6 +839,12 @@ static void on_key(int key, bool down)
         else diag_s6_up_events++;
     }
     if (down && key == 6) diag_s7_events++;
+    if (mark_all_read_confirming && down && key != 0 && key != 1) {
+        stop_prompt();
+        mark_all_read_confirming = false;
+        key_consumed[key] = true;
+        return;
+    }
     if (down) {
         key_consumed[key] = false;
         key_held[key] = false;
@@ -827,13 +889,36 @@ static void on_key(int key, bool down)
     key_held[key] = false;
     key_long_handled[key] = false;
     key_consumed[key] = false;
+    if (mark_all_read_confirming && key == 1 && !long_handled) {
+        stop_prompt();
+        mark_all_read_confirming = false;
+        return;
+    }
     if (!consumed && !long_handled) on_short_key(key);
 }
 
 static bool on_long_key(int key)
 {
-    if (key == 2) {
+    if (key == 0) {
+        stop_message_playback();
+        stop_realtime();
+        cancel_countdown(false);
+        mode = MODE_IDLE;
+        mark_all_read_confirming = true;
+        start_prompt(PROMPT_MARK_ALL_READ_CONFIRM, PROMPT_ACTION_NONE);
+        return true;
+    } else if (key == 1) {
+        if (mark_all_read_confirming && job == JOB_IDLE && network_fresh(esp_timer_get_time())) {
+            mark_all_unread_read();
+        } else if (mark_all_read_confirming) {
+            stop_prompt();
+            mark_all_read_confirming = false;
+            start_prompt(PROMPT_OFFLINE, PROMPT_ACTION_NONE);
+        }
+        return true;
+    } else if (key == 2) {
         const bool removed = timers_set_alarm_minute(-1);
+        if (removed) alarm_fired_at_us = 0;
         mode = MODE_IDLE;
         stop_prompt();
         start_prompt(removed ? PROMPT_ALARM_CANCEL : PROMPT_SAVE_FAILED, PROMPT_ACTION_NONE);
@@ -893,6 +978,7 @@ static void commit_settings(int64_t now)
 static void handle_timer_events(unsigned timer_events, int64_t now)
 {
     if (timer_events & TIMER_EVENT_ALARM) {
+        alarm_fired_at_us = now;
         stop_message_playback();
         stop_realtime();
         stop_prompt();
@@ -915,7 +1001,6 @@ static void handle_timer_events(unsigned timer_events, int64_t now)
                !(timer_events & TIMER_EVENT_MINUTE)) {
         (void)audio_play_beep(55, false);
     }
-    (void)now;
 }
 
 static void receive(cJSON *value)
@@ -979,6 +1064,12 @@ static void receive(cJSON *value)
     }
     if (strcmp(op->valuestring, "error") == 0) {
         if (uploading()) upload_failed();
+        else if (job == JOB_MARK_ALL_READ) {
+            finish_job();
+            mode = MODE_IDLE;
+            mark_all_read_confirming = false;
+            start_prompt(PROMPT_OFFLINE, PROMPT_ACTION_NONE);
+        }
         else {
             release_audio();
             finish_job();
@@ -1058,6 +1149,15 @@ static void receive(cJSON *value)
         }
         finish_job();
         mode = MODE_IDLE;
+    } else if (job == JOB_MARK_ALL_READ && strcmp(op->valuestring, "ack") == 0) {
+        for (int index = 0; index < message_count; index++) {
+            messages[index].read = true;
+            messages[index].pending_read = false;
+        }
+        set_cursor(NULL);
+        finish_job();
+        mode = MODE_IDLE;
+        mark_all_read_confirming = false;
     }
 }
 
@@ -1146,7 +1246,7 @@ static void task(void *argument)
         const int64_t now = esp_timer_get_time();
         if (now >= probe_at) probe(now);
         for (int key = 0; key < 9; key++) {
-            const int64_t threshold = key == 8 ? SETUP_LONG_US : LONG_US;
+            const int64_t threshold = key <= 1 || key == 8 ? SETUP_LONG_US : LONG_US;
             if (key_down[key] && !key_held[key] && !key_consumed[key] && now - key_down[key] >= threshold) {
                 key_held[key] = true;
                 key_long_handled[key] = on_long_key(key);
@@ -1221,6 +1321,12 @@ static void task(void *argument)
             else if (job == JOB_MARK_READ) {
                 finish_job();
                 mode = MODE_IDLE;
+            }
+            else if (job == JOB_MARK_ALL_READ) {
+                finish_job();
+                mode = MODE_IDLE;
+                mark_all_read_confirming = false;
+                start_prompt(PROMPT_OFFLINE, PROMPT_ACTION_NONE);
             }
             else if (job == JOB_PLAYING && !stream_complete) {
                 (void)audio_stop_speaker();
@@ -1322,11 +1428,13 @@ static void task(void *argument)
 
 void voice_chat_init(void (*send)(const char *line),
                      bool (*send_binary)(const uint8_t *data, size_t length),
-                     bool (*send_immediate)(const char *line))
+                     bool (*send_immediate)(const char *line),
+                     bool (*is_cloud_online)(void))
 {
     send_line = send;
     send_binary_line = send_binary;
     send_immediate_line = send_immediate;
+    cloud_online = is_cloud_online;
     timers_init();
     snapshot.alarm_minute = -1;
     events = xQueueCreate(64, sizeof(event_t));

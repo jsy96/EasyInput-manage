@@ -2,6 +2,19 @@ import { describe, expect, it } from 'vitest'
 import { describeInputEvent, commandResultMatches, parseBoardMessage, pixelIsLit } from './protocol'
 
 describe('board protocol', () => {
+  it('accepts compact lights frames and rejects invalid modes', () => {
+    const lights = { type: 'lights', protocol: 2, uptime_ms: 42, status_led: 'off', modes: ['off', 'solid', 'blink', 'flash', 'off'] }
+    expect(parseBoardMessage(JSON.stringify(lights))).toEqual(lights)
+    for (const invalid of [
+      { ...lights, modes: ['off', 'solid', 'blink'] },
+      { ...lights, modes: ['off', 'solid', 'blink', 'flash', 'nope'] },
+      { ...lights, modes: ['off', 'solid', 'blink', 'flash', 1] },
+      { ...lights, status_led: 'green' },
+      { ...lights, uptime_ms: '1' },
+      { ...lights, protocol: 1 },
+    ]) expect(parseBoardMessage(JSON.stringify(invalid))).toBeNull()
+  })
+
   it('accepts complete status frames for protocol v2 and rejects old or unknown versions', () => {
     const status = {
       type: 'status', protocol: 2, uptime_ms: 42,

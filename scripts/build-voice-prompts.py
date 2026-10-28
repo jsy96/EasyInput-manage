@@ -12,7 +12,7 @@ import time
 
 TEXTS = [
     "零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十",
-    "点", "分", "分钟", "整",
+    "分钟",
     "每日闹钟", "已设置好", "每日闹钟已取消",
     "倒计时", "已设置好，马上开始倒计时", "还有",
     "倒计时结束", "每日闹钟时间到了",
@@ -40,6 +40,7 @@ ALARM_TEXTS = [f"{chinese_number(hour)}点{chinese_number(minute)}分"
 COUNTDOWN_TEXTS = [f"{chinese_number(minute)}分钟" for minute in range(1, 61)]
 TEXTS.extend(ALARM_TEXTS)
 TEXTS.extend(COUNTDOWN_TEXTS)
+TEXTS.append("是否所有未读语音标记为已读？")
 
 
 def load_existing(path: Path) -> list[bytes]:

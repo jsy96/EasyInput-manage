@@ -84,6 +84,20 @@ describe('shared voice room', () => {
     await chat(board, 'index', { offset: 1 })
     expect(board.frames.at(-1)).toMatchObject({ op: 'index', id: 'unread-two', read: false })
   })
+  it('marks every unread item read for the board without deleting audio', async () => {
+    const browser = socket(), board = socket('board')
+    await upload(browser, 'bulk-read-one'); await upload(browser, 'bulk-read-two')
+    await chat(board, 'read', { id: 'bulk-read-one' })
+    await chat(board, 'readAll')
+    const messages = store.values.get('messages') as { id: string; read: boolean }[]
+    expect(messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'bulk-read-one', read: true }),
+      expect.objectContaining({ id: 'bulk-read-two', read: true }),
+    ]))
+    expect(store.values.has('audio:bulk-read-one:0')).toBe(true)
+    expect(store.values.has('audio:bulk-read-two:0')).toBe(true)
+    expect(board.frames.at(-1)).toMatchObject({ op: 'ack', count: 1 })
+  })
   it('uses fresh telemetry for presence and prefers direct Wi-Fi over a Bluetooth gateway', async () => {
     const browser = socket(), board = socket('board')
     await chat(browser, 'ping')
@@ -97,6 +111,14 @@ describe('shared voice room', () => {
     board.readyState = 3
     await room.webSocketClose()
     expect(browser.frames.at(-1)).toMatchObject({ online: false, via: null })
+  })
+  it('relays compact board lights frames to every browser', async () => {
+    const board = socket('board'), first = socket(), second = socket('browser', 'second')
+    await room.webSocketMessage(board as unknown as WebSocket, JSON.stringify({ type: 'status', protocol: 2, uptime_ms: 100 }))
+    const lights = { type: 'lights', protocol: 2, uptime_ms: 101, status_led: 'off', modes: ['off', 'solid', 'flash', 'blink', 'off'] }
+    await room.webSocketMessage(board as unknown as WebSocket, JSON.stringify(lights))
+    expect(first.frames.at(-1)).toMatchObject(lights)
+    expect(second.frames.at(-1)).toMatchObject(lights)
   })
   it('synchronizes board replies to the whole group and accepts retried commits once', async () => {
     const first = socket(), later = socket('browser','sixth'), board = socket('board')

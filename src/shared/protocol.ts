@@ -79,6 +79,16 @@ export interface BoardStatus {
   power: { battery_mv?: number; battery_percent_estimate?: number; external_power?: boolean; charging?: boolean }
 }
 
+export type LightMode = 'off' | 'solid' | 'blink' | 'flash' | 'unknown'
+
+export interface BoardLights {
+  type: 'lights'
+  protocol: number
+  uptime_ms: number
+  status_led: 'off' | 'on' | 'unknown'
+  modes: LightMode[]
+}
+
 export interface BoardHello {
   type: 'hello'
   protocol: number
@@ -109,7 +119,7 @@ export interface BoardResult {
   request_id?: string
 }
 
-export type BoardMessage = BoardHello | BoardStatus | InputEvent | BoardResult
+export type BoardMessage = BoardHello | BoardStatus | BoardLights | InputEvent | BoardResult
 
 export function parseBoardMessage(line: string): BoardMessage | null {
   let value: unknown
@@ -181,6 +191,16 @@ export function parseBoardMessage(line: string): BoardMessage | null {
       (speaker.volume !== undefined && !isBrightness(speaker.volume)) ||
       (speaker.error !== undefined && typeof speaker.error !== 'string')) return null
     return record as unknown as BoardStatus
+  }
+
+  if (record.type === 'lights') {
+    if (
+      !isFiniteNumber(record.uptime_ms) ||
+      !['off', 'on', 'unknown'].includes(String(record.status_led)) ||
+      !Array.isArray(record.modes) || record.modes.length !== 5 ||
+      !record.modes.every((mode) => ['off', 'solid', 'blink', 'flash', 'unknown'].includes(String(mode)))
+    ) return null
+    return record as unknown as BoardLights
   }
 
   if (record.type === 'event') {

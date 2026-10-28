@@ -148,7 +148,7 @@ export class DeviceRoomV2 {
       }
       return
     }
-    if (value.protocol !== 2 || !['hello', 'status', 'event', 'result'].includes(String(value.type))) return
+    if (value.protocol !== 2 || !['hello', 'status', 'event', 'result', 'lights'].includes(String(value.type))) return
     const a = this.attachment(socket)
     if (value.type === 'status' && typeof value.uptime_ms === 'number' && value.uptime_ms !== a.uptime) {
       a.last = Date.now(); a.uptime = value.uptime_ms
@@ -299,6 +299,16 @@ export class DeviceRoomV2 {
       const m = items.find((m) => m.id === id)
       if (m) { m.read = true; await this.state.storage.put('messages', items); this.broadcast(frame('message', { message: m }), true) }
       reply('ack', { id }); return
+    }
+    if (v.op === 'readAll' && board) {
+      const items = await this.messages()
+      const changed = items.filter((m) => !m.read)
+      for (const m of changed) m.read = true
+      if (changed.length) {
+        await this.state.storage.put('messages', items)
+        for (const m of changed) this.broadcast(frame('message', { message: m }), true)
+      }
+      reply('ack', { count: changed.length }); return
     }
     if (v.op === 'realtime.set' && !board) {
       const enabled = v.enabled === true

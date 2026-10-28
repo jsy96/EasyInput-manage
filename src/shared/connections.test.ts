@@ -85,6 +85,17 @@ describe('independent board connections', () => {
     expect(connections.current(103)).toBeNull()
   })
 
+  it('keeps the latest compact lights frame per transport', () => {
+    const connections = new BoardConnections()
+    const lights = { type: 'lights', protocol: 2, uptime_ms: 5100, status_led: 'off', modes: ['off', 'solid', 'flash', 'blink', 'off'] }
+    expect(connections.receive('wifi', frame(lights), 100)).toHaveLength(1)
+    expect(connections.current(101)?.session.lights).toEqual(lights)
+    expect(connections.receive('wifi', frame({ ...lights, uptime_ms: 5101, modes: ['off', 'off', 'off', 'off', 'off'] }), 102)).toHaveLength(1)
+    expect(connections.current(103)?.session.lights?.modes).toEqual(['off', 'off', 'off', 'off', 'off'])
+    connections.reset('wifi')
+    expect(connections.current(104)).toBeNull()
+  })
+
   it('continues receiving over Wi-Fi after both USB and BLE disconnect', () => {
     const connections = new BoardConnections()
     for (const transport of ['usb', 'ble', 'wifi'] as const) connections.receive(transport, handshake, 100)

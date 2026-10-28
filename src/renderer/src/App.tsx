@@ -168,6 +168,7 @@ export default function App(): React.JSX.Element {
   const activeConnection = connectionsRef.current.current(clock)
   const hello = activeConnection?.session.hello ?? null
   const status = activeConnection?.session.status ?? null
+  const lights = activeConnection?.session.lights ?? null
   const currentStatus = status ?? emptyStatus
   const lastSeenAt = activeConnection?.session.lastSeenAt ?? null
   const usbProtocolOnline = serialOpen && connectionsRef.current.isOnline('usb', clock)
@@ -281,7 +282,7 @@ export default function App(): React.JSX.Element {
       for (const line of lines) {
         try {
           const value = JSON.parse(line) as Record<string, unknown>
-          if (['hello', 'status', 'event', 'result', 'chat'].includes(String(value.type))) chatRef.current?.bridge(value)
+          if (['hello', 'status', 'event', 'result', 'chat', 'lights'].includes(String(value.type))) chatRef.current?.bridge(value)
         } catch { /* Partial frames wait for newline. */ }
       }
     }
@@ -560,7 +561,7 @@ export default function App(): React.JSX.Element {
           <span className="page-number">{activePage === 'voice' ? '01' : '02'} <span>/ 02</span></span>
         </div>
         <div className="page-body">
-          {activePage === 'voice' && <VoiceChat room={room} board={boardOnline ? currentStatus : null} connection={chatRef.current} busyChanged={setChatBusy} disabled={deviceBusy} />}
+          {activePage === 'voice' && <VoiceChat room={room} board={boardOnline ? currentStatus : null} lights={lights} connection={chatRef.current} busyChanged={setChatBusy} disabled={deviceBusy} />}
           {activePage === 'device' && <article className="panel device-page">
             <div className="device-summary">
               <div><span className="section-kicker">CONNECTION</span><h3>EasyInput V2.0</h3><p>{hello ? `固件 ${hello.firmware}` : '等待开发板状态'}{lastSeenAt ? ` · ${new Date(lastSeenAt).toLocaleTimeString('zh-CN')}` : ''}</p></div>

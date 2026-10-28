@@ -1819,7 +1819,7 @@ void app_main(void)
     init_wifi_websocket();
     cloud_monitor_init();
     network_setup_init(wifi_websocket_server, save_phone_config, reconnect_phone_wifi);
-    voice_chat_init(send_chat_line, send_chat_binary, send_chat_immediate);
+    voice_chat_init(send_chat_line, send_chat_binary, send_chat_immediate, cloud_monitor_is_online);
     init_ble_monitor();
     xTaskCreateWithCaps(ble_tx_task, "ble_tx", 4096, NULL, 6, NULL,
                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);

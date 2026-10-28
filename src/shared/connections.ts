@@ -1,5 +1,5 @@
 import { parseBoardMessage } from './protocol'
-import type { BoardHello, BoardMessage, BoardStatus, InputEvent } from './protocol'
+import type { BoardHello, BoardLights, BoardMessage, BoardStatus, InputEvent } from './protocol'
 
 export type BoardTransport = 'usb' | 'ble' | 'wifi'
 
@@ -9,12 +9,13 @@ interface BoardSession {
   buffer: string
   hello: BoardHello | null
   status: BoardStatus | null
+  lights: BoardLights | null
   lastSeenAt: number | null
   lastStatusAt: number | null
 }
 
 function emptySession(): BoardSession {
-  return { buffer: '', hello: null, status: null, lastSeenAt: null, lastStatusAt: null }
+  return { buffer: '', hello: null, status: null, lights: null, lastSeenAt: null, lastStatusAt: null }
 }
 
 export class BoardConnections {
@@ -45,6 +46,7 @@ export class BoardConnections {
     const transport = TRANSPORTS.find((candidate) => this.isOnline(candidate, now))
       ?? TRANSPORTS.find((candidate) => this.sessions[candidate].status)
       ?? TRANSPORTS.find((candidate) => this.sessions[candidate].hello)
+      ?? TRANSPORTS.find((candidate) => this.sessions[candidate].lights)
     return transport ? { transport, session: this.sessions[transport] } : null
   }
 
@@ -63,6 +65,7 @@ export class BoardConnections {
         session.status = message
         session.lastStatusAt = now
       }
+      if (message.type === 'lights') session.lights = message
       if (message.type !== 'event' || this.acceptEvent(transport, message, now)) messages.push(message)
     }
     return messages
