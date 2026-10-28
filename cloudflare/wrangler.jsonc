@@ -4,11 +4,12 @@
   "compatibility_date": "2026-10-26",
   "durable_objects": {
     "bindings": [
-      { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" }
+      { "name": "DEVICE_ROOMS", "class_name": "DeviceRoomV2" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["DeviceRoom"] }
+    { "tag": "v1", "new_sqlite_classes": ["DeviceRoom"] },
+    { "tag": "v2", "renamed_classes": [{ "from": "DeviceRoom", "to": "DeviceRoomV2" }] }
   ],
   "vars": {
     "PUBLIC_DEVICE_ID": "easyinput-v2",

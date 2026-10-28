@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { AUDIO_LIMIT, adjacentMessage, decodeMulaw, encodeMulaw, latestUnreadMessage, sortMessages } from './chat'
+import {
+  AUDIO_LIMIT, REALTIME_FRAME_BYTES, REALTIME_FRAME_SAMPLES, adjacentMessage,
+  decodeMulaw, decodeRealtimePacket, encodeMulaw, encodeRealtimePacket, isRealtimePacket,
+  latestUnreadMessage, sortMessages,
+} from './chat'
 import type { ChatMessage } from './chat'
 const message = (id: string, created: number, read = false, sender = 'computer'): ChatMessage => ({ id, sender, name: '电脑', samples: 8000, created, read })
 describe('voice timeline behavior', () => {
@@ -25,5 +29,14 @@ describe('voice timeline behavior', () => {
     expect(encodeMulaw(32767)).toBe(128)
     expect(decodeMulaw(128)).toBe(32124)
     for (const s of [-30000, -10000, -1000, 1000, 10000, 30000]) expect(Math.abs(decodeMulaw(encodeMulaw(s)) - s)).toBeLessThan(Math.abs(s) * 0.04 + 8)
+  })
+  it('round-trips 20 ms PCM16 realtime packets', () => {
+    const samples = Int16Array.from({ length: REALTIME_FRAME_SAMPLES }, (_, index) => index * 31 - 5000)
+    const packet = encodeRealtimePacket(42, samples)
+    expect(packet.byteLength).toBe(REALTIME_FRAME_BYTES)
+    expect(isRealtimePacket(packet)).toBe(true)
+    expect(decodeRealtimePacket(packet.buffer as ArrayBuffer)).toMatchObject({ sequence: 42, samples })
+    packet[5] = 2
+    expect(isRealtimePacket(packet)).toBe(false)
   })
 })

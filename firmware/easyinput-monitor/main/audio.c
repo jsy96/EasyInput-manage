@@ -17,7 +17,8 @@
 #define VAD_END_RMS 180
 #define VAD_HOLD_US 300000
 #define TONE_FADE_FRAMES (AUDIO_SAMPLE_RATE / 50)
-#define LIVE_CHUNK_BYTES 640
+#define LIVE_FRAME_FRAMES (AUDIO_SAMPLE_RATE / 50)
+#define LIVE_FRAME_BYTES (LIVE_FRAME_FRAMES * sizeof(int16_t))
 // Six DMA blocks can still be in flight after the last write returns.
 #define TONE_DRAIN_US (6LL * AUDIO_BLOCK_FRAMES * 1000000 / AUDIO_SAMPLE_RATE + 20000)
 
@@ -46,6 +47,7 @@ static int16_t mulaw_decode(uint8_t value)
 }
 static SemaphoreHandle_t audio_mutex;
 static audio_snapshot_t state;
+static volatile bool mic_stop_requested;
 static i2s_chan_handle_t microphone_channel;
 static i2s_chan_handle_t speaker_channel;
 static bool microphone_enabled;
@@ -61,8 +63,8 @@ static float tone_frequency;
 static uint8_t tone_volume;
 static int64_t tone_drain_until_us;
 static audio_microphone_sink_t live_sink;
-static uint8_t live_chunk[LIVE_CHUNK_BYTES];
-static size_t live_chunk_length;
+static int16_t live_chunk[LIVE_FRAME_FRAMES];
+static size_t live_chunk_frames;
 
 static esp_err_t safe_audio_pins(bool microphone)
 {
@@ -119,8 +121,10 @@ static esp_err_t start_channel(bool microphone)
     if (result != ESP_OK) return result;
     i2s_chan_handle_t *channel = microphone ? &microphone_channel : &speaker_channel;
     i2s_chan_config_t channel_config = I2S_CHANNEL_DEFAULT_CONFIG(microphone ? I2S_NUM_0 : I2S_NUM_1, I2S_ROLE_MASTER);
-    channel_config.dma_desc_num = 6;
-    channel_config.dma_frame_num = AUDIO_BLOCK_FRAMES;
+    // Keep the DMA rings small enough for the fragmented internal-RAM pool.
+    // Microphone uses 16 ms total; speaker retains 32 ms for smoother output.
+    channel_config.dma_desc_num = 4;
+    channel_config.dma_frame_num = microphone ? 64 : 128;
     channel_config.auto_clear = true;
     result = i2s_new_channel(&channel_config, microphone ? NULL : channel, microphone ? channel : NULL);
     if (result != ESP_OK) return result;
@@ -178,9 +182,20 @@ static void audio_task(void *arg)
     (void)arg;
     while (true) {
         bool did_io = false;
+        state.stage = 1;
         xSemaphoreTake(audio_mutex, portMAX_DELAY);
+        state.stage = 2;
+        if (mic_stop_requested) {
+            // The audio task owns the microphone teardown: callers request the
+            // stop instead of contending with the busy capture loop for the
+            // mutex, which starved the voice timeline task after S1.
+            mic_stop_requested = false;
+            state.stage = 10;
+            (void)stop_channel(true);
+        }
         if (state.recording && esp_timer_get_time() >= record_deadline_us) (void)stop_channel(true);
         if (state.microphone_active) {
+            state.stage = 3;
             did_io = true;
             size_t bytes = 0;
             esp_err_t result = i2s_channel_read(microphone_channel, microphone_samples, sizeof(microphone_samples), &bytes, AUDIO_IO_TIMEOUT_MS);
@@ -199,14 +214,13 @@ static void audio_task(void *arg)
                         }
                         if (state.recorded_bytes >= record_capacity) (void)stop_channel(true);
                     }
-                    if (!state.recording && live_sink != NULL) {
-                        for (size_t i = 0; i + 1 < frames; i += 2) {
-                            const int a = microphone_samples[i * 2 + 1] >> 16;
-                            const int b = microphone_samples[(i + 1) * 2 + 1] >> 16;
-                            live_chunk[live_chunk_length++] = mulaw_encode((a + b) / 2);
-                            if (live_chunk_length == sizeof(live_chunk)) {
-                                live_sink(live_chunk, live_chunk_length);
-                                live_chunk_length = 0;
+                    if (live_sink != NULL) {
+                        state.stage = 4;
+                        for (size_t i = 0; i < frames; i++) {
+                            live_chunk[live_chunk_frames++] = (int16_t)(microphone_samples[i * 2 + 1] >> 16);
+                            if (live_chunk_frames == LIVE_FRAME_FRAMES) {
+                                live_sink((const uint8_t *)live_chunk, LIVE_FRAME_BYTES);
+                                live_chunk_frames = 0;
                             }
                         }
                     }
@@ -221,6 +235,7 @@ static void audio_task(void *arg)
             }
         }
         if (state.speaker_playing && voice_buffer != NULL && voice_frame < voice_available * 2) {
+            state.stage = 5;
             did_io = true;
             size_t frames = voice_length * 2 - voice_frame;
             if (frames > AUDIO_BLOCK_FRAMES) frames = AUDIO_BLOCK_FRAMES;
@@ -238,6 +253,7 @@ static void audio_task(void *arg)
                 if (voice_frame == voice_length * 2) tone_drain_until_us = esp_timer_get_time() + TONE_DRAIN_US;
             }
         } else if (state.speaker_playing && voice_buffer == NULL && tone_frame < tone_target_frames) {
+            state.stage = 6;
             did_io = true;
             unsigned frames = tone_target_frames - tone_frame;
             if (frames > AUDIO_BLOCK_FRAMES) frames = AUDIO_BLOCK_FRAMES;
@@ -265,7 +281,10 @@ static void audio_task(void *arg)
         }
         xSemaphoreGive(audio_mutex);
         // DMA blocks active I/O. An extra tick would starve 16 ms audio blocks.
-        if (!did_io) vTaskDelay(pdMS_TO_TICKS(10) + 1);
+        if (!did_io) {
+            state.stage = 7;
+            vTaskDelay(pdMS_TO_TICKS(10) + 1);
+        }
     }
 }
 
@@ -286,6 +305,8 @@ void audio_get_snapshot(audio_snapshot_t *snapshot)
 {
     if (audio_mutex) xSemaphoreTake(audio_mutex, portMAX_DELAY);
     *snapshot = state;
+    snapshot->live_sink_active = live_sink != NULL;
+    snapshot->live_chunk_frames = live_chunk_frames;
     if (audio_mutex) xSemaphoreGive(audio_mutex);
 }
 
@@ -308,10 +329,23 @@ esp_err_t audio_set_microphone(bool on)
 {
     if (!audio_mutex || !state.ready) return ESP_ERR_INVALID_STATE;
     if (on) return lights_with_shared_power(start_microphone, NULL);
-    xSemaphoreTake(audio_mutex, portMAX_DELAY);
+    state.stage = 8;
+    mic_stop_requested = true;
+    for (int attempt = 0; attempt < 20; attempt++) {
+        if (!mic_stop_requested) {
+            state.stage = 9;
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    // Fallback: the capture task may be wedged; stop from here with a bounded
+    // wait so this call can never hang the voice timeline task.
+    if (xSemaphoreTake(audio_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    mic_stop_requested = false;
     const esp_err_t result = stop_channel(true);
     if (result != ESP_OK) state.microphone_error = result;
     xSemaphoreGive(audio_mutex);
+    state.stage = 9;
     return result;
 }
 
@@ -451,12 +485,15 @@ esp_err_t audio_record_stop(void) { return audio_set_microphone(false); }
 esp_err_t audio_live_start(audio_microphone_sink_t sink)
 {
     if (sink == NULL || !audio_mutex || !state.ready) return ESP_ERR_INVALID_ARG;
+    state.recording = false;
+    record_buffer = NULL;
+    record_capacity = 0;
     live_sink = sink;
-    live_chunk_length = 0;
+    live_chunk_frames = 0;
     const esp_err_t result = audio_set_microphone(true);
     if (result != ESP_OK) {
         live_sink = NULL;
-        live_chunk_length = 0;
+        live_chunk_frames = 0;
     }
     return result;
 }
@@ -464,6 +501,6 @@ esp_err_t audio_live_start(audio_microphone_sink_t sink)
 esp_err_t audio_live_stop(void)
 {
     live_sink = NULL;
-    live_chunk_length = 0;
+    live_chunk_frames = 0;
     return audio_set_microphone(false);
 }

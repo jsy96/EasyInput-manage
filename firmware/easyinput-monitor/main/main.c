@@ -24,6 +24,7 @@
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_app_desc.h"
+#include "esp_coexist.h"
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_flash.h"
@@ -382,6 +383,16 @@ static void send_chat_line(const char *line)
     else queue_ble_line(line);
 }
 
+static bool send_chat_binary(const uint8_t *data, size_t length)
+{
+    return cloud_monitor_send_binary(data, length);
+}
+
+static bool send_chat_immediate(const char *line)
+{
+    return cloud_monitor_send_immediate(line);
+}
+
 static bool ble_frame_is_current(const ble_tx_frame_t *frame)
 {
     bool current;
@@ -655,7 +666,19 @@ static void emit_status(void)
     const bool has_temperature = temperature_handle != NULL && temperature_sensor_get_celsius(temperature_handle, &temperature_c) == ESP_OK;
 
     cJSON *root = cJSON_CreateObject();
-    if (root == NULL) return;
+    if (root == NULL) {
+        // Internal RAM is exhausted; keep diagnostics flowing with a tiny line.
+        voice_chat_snapshot_t mini_voice;
+        voice_chat_get_snapshot(&mini_voice);
+        char mini[224];
+        snprintf(mini, sizeof(mini),
+                 "{\"type\":\"status_mini\",\"protocol\":%d,\"uptime_ms\":%llu,\"internal_free\":%u,\"internal_minimum\":%u,\"largest\":%u,\"stage\":%d,\"mode\":%u,\"ready\":%d,\"rt_wait\":%u}",
+                 PROTOCOL_VERSION, (unsigned long long)(now_us / 1000),
+                 (unsigned)internal_free, (unsigned)internal_minimum, (unsigned)internal_largest,
+                 mini_voice.stage, mini_voice.mode, mini_voice.realtime_ready, mini_voice.realtime_waiting);
+        send_line(mini);
+        return;
+    }
     cJSON_AddStringToObject(root, "type", "status");
     cJSON_AddNumberToObject(root, "protocol", PROTOCOL_VERSION);
     cJSON_AddNumberToObject(root, "uptime_ms", now_us / 1000);
@@ -704,9 +727,20 @@ static void emit_status(void)
     }
     audio_snapshot_t audio_state;
     audio_get_snapshot(&audio_state);
+    cloud_monitor_stats_t cloud_stats;
+    cloud_monitor_get_stats(&cloud_stats);
     cJSON *cloud = cJSON_AddObjectToObject(root, "cloud");
     cJSON_AddBoolToObject(cloud, "configured", cloud_monitor_is_configured());
     cJSON_AddBoolToObject(cloud, "online", cloud_monitor_is_online());
+    cJSON *cloud_debug = cJSON_AddObjectToObject(cloud, "debug");
+    cJSON_AddNumberToObject(cloud_debug, "sent", cloud_stats.sent);
+    cJSON_AddNumberToObject(cloud_debug, "failed", cloud_stats.failed);
+    cJSON_AddNumberToObject(cloud_debug, "dropped", cloud_stats.dropped);
+    cJSON_AddNumberToObject(cloud_debug, "realtime_starts_sent", cloud_stats.realtime_starts_sent);
+    cJSON_AddNumberToObject(cloud_debug, "realtime_starts_failed", cloud_stats.realtime_starts_failed);
+    cJSON_AddNumberToObject(cloud_debug, "realtime_chunks_sent", cloud_stats.realtime_chunks_sent);
+    cJSON_AddNumberToObject(cloud_debug, "realtime_chunks_failed", cloud_stats.realtime_chunks_failed);
+    cJSON_AddNumberToObject(cloud_debug, "realtime_chunks_dropped", cloud_stats.realtime_chunks_dropped);
     voice_chat_snapshot_t voice_state;
     voice_chat_get_snapshot(&voice_state);
     cJSON *voice = cJSON_AddObjectToObject(root, "voice");
@@ -719,9 +753,47 @@ static void emit_status(void)
     cJSON_AddNumberToObject(voice, "countdown_seconds", voice_state.countdown_seconds);
     cJSON_AddBoolToObject(voice, "realtime_active", voice_state.realtime_active);
     cJSON_AddBoolToObject(voice, "realtime_enabled", voice_state.realtime_enabled);
+    cJSON *voice_debug = cJSON_AddObjectToObject(voice, "debug");
+    cJSON_AddNumberToObject(voice_debug, "messages", voice_state.message_count);
+    cJSON_AddBoolToObject(voice_debug, "cursor", voice_state.cursor_present);
+    cJSON_AddNumberToObject(voice_debug, "mode", voice_state.mode);
+    cJSON_AddNumberToObject(voice_debug, "job", voice_state.job);
+    cJSON_AddNumberToObject(voice_debug, "audio_size", voice_state.audio_size);
+    cJSON_AddNumberToObject(voice_debug, "chunk_index", voice_state.chunk_index);
+    cJSON_AddNumberToObject(voice_debug, "expected_chunks", voice_state.expected_chunks);
+    cJSON_AddBoolToObject(voice_debug, "stream_started", voice_state.stream_started);
+    cJSON_AddBoolToObject(voice_debug, "stream_complete", voice_state.stream_complete);
+    cJSON_AddBoolToObject(voice_debug, "network_fresh", voice_state.network_fresh);
+    cJSON_AddNumberToObject(voice_debug, "s5_events", voice_state.s5_events);
+    cJSON_AddNumberToObject(voice_debug, "s6_down", voice_state.s6_down_events);
+    cJSON_AddNumberToObject(voice_debug, "s6_up", voice_state.s6_up_events);
+    cJSON_AddNumberToObject(voice_debug, "s6_actions", voice_state.s6_actions);
+    cJSON_AddNumberToObject(voice_debug, "s7_events", voice_state.s7_events);
+    cJSON_AddNumberToObject(voice_debug, "realtime_starts", voice_state.realtime_starts);
+    cJSON_AddNumberToObject(voice_debug, "realtime_stops", voice_state.realtime_stops);
+    cJSON_AddBoolToObject(voice_debug, "realtime_ready", voice_state.realtime_ready);
+    cJSON_AddNumberToObject(voice_debug, "realtime_acks", voice_state.realtime_acks);
+    cJSON_AddNumberToObject(voice_debug, "realtime_failures", voice_state.realtime_failures);
+    cJSON_AddNumberToObject(voice_debug, "realtime_chunks_queued", voice_state.realtime_chunks_queued);
+    cJSON_AddNumberToObject(voice_debug, "realtime_chunks_dropped", voice_state.realtime_chunks_dropped);
+    cJSON_AddNumberToObject(voice_debug, "realtime_sink_calls", voice_state.realtime_sink_calls);
+    cJSON_AddNumberToObject(voice_debug, "realtime_sink_bytes", voice_state.realtime_sink_bytes);
+    cJSON_AddNumberToObject(voice_debug, "input_dropped", voice_state.input_dropped);
+    cJSON_AddNumberToObject(voice_debug, "control_dropped", voice_state.control_dropped);
+    cJSON_AddNumberToObject(voice_debug, "input_waiting", voice_state.input_waiting);
+    cJSON_AddNumberToObject(voice_debug, "control_waiting", voice_state.control_waiting);
+    cJSON_AddNumberToObject(voice_debug, "realtime_waiting", voice_state.realtime_waiting);
+    cJSON_AddNumberToObject(voice_debug, "last_key", voice_state.last_key);
+    cJSON_AddNumberToObject(voice_debug, "last_key_mode", voice_state.last_key_mode);
+    cJSON_AddNumberToObject(voice_debug, "stage", voice_state.stage);
     cJSON *audio = cJSON_AddObjectToObject(root, "audio");
     cJSON_AddBoolToObject(audio, "ready", audio_state.ready && light_state.ready);
     cJSON_AddNumberToObject(audio, "sample_rate_hz", AUDIO_SAMPLE_RATE);
+    cJSON *audio_debug = cJSON_AddObjectToObject(audio, "debug");
+    cJSON_AddBoolToObject(audio_debug, "recording", audio_state.recording);
+    cJSON_AddBoolToObject(audio_debug, "live_sink_active", audio_state.live_sink_active);
+    cJSON_AddNumberToObject(audio_debug, "live_chunk_frames", audio_state.live_chunk_frames);
+    cJSON_AddNumberToObject(audio_debug, "stage", audio_state.stage);
     cJSON *speaker = cJSON_AddObjectToObject(root, "speaker");
     cJSON_AddStringToObject(speaker, "state", !audio_state.ready || audio_state.speaker_error != ESP_OK ? "unavailable" : audio_state.speaker_playing ? "playing" : "idle");
     cJSON_AddNumberToObject(speaker, "volume", audio_state.volume);
@@ -1288,10 +1360,14 @@ static void usb_task(void *arg)
 
 static void send_microphone_event(const char *action, const audio_snapshot_t *audio)
 {
-    char line[224];
+    voice_chat_snapshot_t voice_state;
+    voice_chat_get_snapshot(&voice_state);
+    char line[320];
     snprintf(line, sizeof(line),
-             "{\"type\":\"event\",\"protocol\":%d,\"source\":\"microphone\",\"action\":\"%s\",\"rms\":%u,\"vad\":%s,\"uptime_ms\":%lld}",
-             PROTOCOL_VERSION, action, audio->rms, audio->vad ? "true" : "false", (long long)(esp_timer_get_time() / 1000));
+             "{\"type\":\"event\",\"protocol\":%d,\"source\":\"microphone\",\"action\":\"%s\",\"rms\":%u,\"vad\":%s,\"uptime_ms\":%lld,\"stage\":%d,\"mode\":%u,\"ready\":%d,\"rt_wait\":%u,\"audio_stage\":%d}",
+             PROTOCOL_VERSION, action, audio->rms, audio->vad ? "true" : "false",
+             (long long)(esp_timer_get_time() / 1000), voice_state.stage, voice_state.mode,
+             voice_state.realtime_ready, voice_state.realtime_waiting, audio->stage);
     send_line(line);
 }
 
@@ -1448,6 +1524,10 @@ static void init_wifi_monitor(void)
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_FLASH));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+    const esp_err_t ps_result = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (ps_result != ESP_OK) ESP_LOGW(TAG, "Unable to disable Wi-Fi power save: %s", esp_err_to_name(ps_result));
+    const esp_err_t coex_result = esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+    if (coex_result != ESP_OK) ESP_LOGW(TAG, "Unable to prioritize Wi-Fi coexistence: %s", esp_err_to_name(coex_result));
 }
 
 static void time_sync_notification_cb(struct timeval *tv)
@@ -1687,8 +1767,27 @@ static bool init_nvs_safely(void)
     return true;
 }
 
+static void *json_psram_malloc(size_t size)
+{
+    return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+
+static void json_psram_free(void *ptr)
+{
+    free(ptr);
+}
+
 void app_main(void)
 {
+    // All JSON work allocates from PSRAM: the per-second status JSON churned
+    // internal RAM into fragments small enough to break TLS (AES) allocations
+    // and knock the cloud connection offline.
+    static const cJSON_Hooks psram_hooks = {
+        .malloc_fn = json_psram_malloc,
+        .free_fn = json_psram_free,
+    };
+    cJSON_InitHooks(&psram_hooks);
+
     configure_board_gpio();
     const esp_err_t light_result = lights_init();
     if (light_result != ESP_OK) ESP_LOGE(TAG, "Light control init failed: %s", esp_err_to_name(light_result));
@@ -1720,7 +1819,7 @@ void app_main(void)
     init_wifi_websocket();
     cloud_monitor_init();
     network_setup_init(wifi_websocket_server, save_phone_config, reconnect_phone_wifi);
-    voice_chat_init(send_chat_line);
+    voice_chat_init(send_chat_line, send_chat_binary, send_chat_immediate);
     init_ble_monitor();
     xTaskCreateWithCaps(ble_tx_task, "ble_tx", 4096, NULL, 6, NULL,
                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);

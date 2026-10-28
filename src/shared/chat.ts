@@ -5,6 +5,10 @@ export const AUDIO_CHUNK = 768
 export const AUDIO_BATCH = 16
 export const AUDIO_STREAM_WINDOW = 8
 export const CHAT_LIMIT = 100
+export const REALTIME_SAMPLE_RATE = 16_000
+export const REALTIME_FRAME_SAMPLES = 320
+export const REALTIME_HEADER_BYTES = 12
+export const REALTIME_FRAME_BYTES = REALTIME_HEADER_BYTES + REALTIME_FRAME_SAMPLES * 2
 export interface ChatMessage {
   id: string
   sender: string
@@ -70,3 +74,30 @@ export function toBase64(bytes: Uint8Array): string {
 }
 export function fromBase64(value: string): Uint8Array { return Uint8Array.from(atob(value), (c) => c.charCodeAt(0)) }
 export function validId(value: unknown): value is string { return typeof value === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(value) }
+
+export function encodeRealtimePacket(sequence: number, samples: Int16Array): Uint8Array {
+  if (!Number.isInteger(sequence) || sequence < 0 || sequence > 0xffffffff || samples.length !== REALTIME_FRAME_SAMPLES) {
+    throw new Error('Invalid realtime packet')
+  }
+  const bytes = new Uint8Array(REALTIME_FRAME_BYTES)
+  bytes.set([0x45, 0x49, 0x56, 0x32, 1, 1, 0, 0])
+  new DataView(bytes.buffer).setUint32(8, sequence, true)
+  const view = new DataView(bytes.buffer)
+  for (let index = 0; index < samples.length; index++) view.setInt16(REALTIME_HEADER_BYTES + index * 2, samples[index], true)
+  return bytes
+}
+
+export function isRealtimePacket(value: ArrayBuffer | Uint8Array): boolean {
+  const bytes = value instanceof Uint8Array ? value : new Uint8Array(value)
+  return bytes.byteLength === REALTIME_FRAME_BYTES &&
+    bytes[0] === 0x45 && bytes[1] === 0x49 && bytes[2] === 0x56 && bytes[3] === 0x32 &&
+    bytes[4] === 1 && bytes[5] === 1 && bytes[6] === 0 && bytes[7] === 0
+}
+
+export function decodeRealtimePacket(value: ArrayBuffer): { sequence: number; samples: Int16Array } | null {
+  if (!isRealtimePacket(value)) return null
+  const view = new DataView(value)
+  const samples = new Int16Array(REALTIME_FRAME_SAMPLES)
+  for (let index = 0; index < samples.length; index++) samples[index] = view.getInt16(REALTIME_HEADER_BYTES + index * 2, true)
+  return { sequence: view.getUint32(8, true), samples }
+}

@@ -29,8 +29,9 @@ The configured custom domains are `easy.leige.online` for the gateway and `studi
 - Voice is 8 kHz mono G.711 mu-law. Each message is at most 160,000 samples (20 seconds), transferred in acknowledged 768-byte pieces and committed atomically into the group history.
 - The room retains at most 100 committed messages. New messages never evict unread messages. The board marks a message read only after complete speaker playback.
 - Stored metadata and audio survive reconnects and Worker upgrades. Incomplete uploads expire after 10 minutes. The board recording buffer is volatile until upload succeeds.
+- A protected `POST /admin/clear` endpoint requires the `CLEAR_TOKEN` secret. It permanently removes timeline metadata, audio chunks, and incomplete uploads for the default room; connected browsers receive the removal immediately.
 - Text messages and the `/tts` endpoint are removed. Board prompt audio is generated at build time instead.
-- The webpage owns one shared realtime-listening toggle. Board realtime chunks are forwarded only to browsers while a session is active and are never persisted.
+- The webpage owns one shared realtime-listening toggle. Board realtime audio uses acknowledged 20 ms PCM16 binary frames, is forwarded only to browsers while a session is active, and is never persisted.
 - Presence updates send the board a unique online-browser count. S8 uses it for speech, and LED 4 uses it for its 0.1-second red / 2-second off indication.
 
 The older `agent/` LAN process is not required for either direct Wi-Fi or the browser Bluetooth gateway. Wi-Fi provisioning and firmware flashing remain on local USB/encrypted BLE. See `../docs/VOICE_CHAT.md` and `../docs/PROTOCOL.md` for usage and the wire contract.

@@ -1,11 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { DeviceRoom } from './device-room'
-import { CHAT_VERSION } from '../../src/shared/chat'
+import { DeviceRoomV2 } from './device-room'
+import { CHAT_VERSION, REALTIME_FRAME_SAMPLES, encodeRealtimePacket } from '../../src/shared/chat'
 class Socket {
   readyState = 1
   attachment: unknown
   frames: Record<string, unknown>[] = []
-  send(s: string): void { this.frames.push(JSON.parse(s) as Record<string, unknown>) }
+  binaryFrames: Uint8Array[] = []
+  send(value: string | ArrayBuffer): void {
+    if (typeof value === 'string') this.frames.push(JSON.parse(value) as Record<string, unknown>)
+    else this.binaryFrames.push(new Uint8Array(value).slice())
+  }
   serializeAttachment(a: unknown): void { this.attachment = structuredClone(a) }
   deserializeAttachment(): unknown { return this.attachment }
 }
@@ -17,7 +21,7 @@ class Store {
   list = vi.fn(async ({ prefix }: { prefix: string }) => new Map([...this.values].filter(([k]) => k.startsWith(prefix))))
   setAlarm = vi.fn(async () => {})
 }
-let store: Store, sockets: Socket[], room: DeviceRoom
+let store: Store, sockets: Socket[], room: DeviceRoomV2
 const chat = async (s: Socket, op: string, data: Record<string, unknown> = {}): Promise<void> => room.webSocketMessage(s as unknown as WebSocket, JSON.stringify({ type: 'chat', protocol: CHAT_VERSION, op, req: op, ...data }))
 function socket(role = 'browser', client = 'client'): Socket {
   const s = new Socket(); s.serializeAttachment({ role, client, name: client }); sockets.push(s); return s
@@ -30,7 +34,7 @@ async function upload(s: Socket, id: string): Promise<void> {
 }
 beforeEach(() => {
   store = new Store(); sockets = []
-  room = new DeviceRoom({ storage: store, getWebSockets: () => sockets, acceptWebSocket: (s: Socket) => sockets.push(s), blockConcurrencyWhile: async (fn: () => Promise<unknown>) => fn() } as unknown as DurableObjectState)
+  room = new DeviceRoomV2({ storage: store, getWebSockets: () => sockets, acceptWebSocket: (s: Socket) => sockets.push(s), blockConcurrencyWhile: async (fn: () => Promise<unknown>) => fn() } as unknown as DurableObjectState)
 })
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks() })
 describe('shared voice room', () => {
@@ -139,19 +143,69 @@ describe('shared voice room', () => {
     await room.webSocketMessage(bridge as unknown as WebSocket, JSON.stringify({ type: 'gateway', payload: { type: 'chat', protocol: CHAT_VERSION, op: 'commit', req: 'commit-try', id: 'not-yet-complete' } }))
     expect(bridge.frames.at(-1)).toMatchObject({ type: 'bridge', payload: { op: 'error', req: 'commit-try' } })
   })
+  it('clears chat metadata, audio, and incomplete uploads while preserving delivery receipts', async () => {
+    const browser = socket(), board = socket('board')
+    await upload(browser, 'clear-one'); await upload(board, 'clear-two')
+    await chat(browser, 'begin', { id: 'incomplete', samples: 900 })
+    await chat(browser, 'chunk', { id: 'incomplete', index: 0, data: btoa('a'.repeat(768)) })
+    store.values.set('realtime_enabled', true)
+    const response = await room.fetch(new Request('https://room.internal/admin/clear', { method: 'POST', headers: { 'X-EasyInput-Clear': '1' } }))
+    expect(await response.json()).toEqual({ ok: true, cleared: 2 })
+    expect(store.values.has('messages')).toBe(false)
+    expect([...store.values.keys()].filter((key) => key.startsWith('audio:'))).toEqual([])
+    expect([...store.values.keys()].filter((key) => key.startsWith('upload:'))).toEqual([])
+    expect(store.values.get('delivered:clear-two')).toBe(true)
+    expect(store.values.get('realtime_enabled')).toBe(true)
+    expect(browser.frames.filter((frame) => frame.op === 'pruned').at(-1)).toMatchObject({ ids: ['clear-one', 'clear-two'] })
+  })
   it('stores the webpage realtime toggle and forwards board audio only to browsers', async () => {
     const browser = socket(), board = socket('board')
     await room.webSocketMessage(board as unknown as WebSocket, JSON.stringify({ type: 'status', protocol: 2, uptime_ms: 100 }))
     await chat(browser, 'realtime.set', { enabled: true })
     expect(store.values.get('realtime_enabled')).toBe(true)
     expect(board.frames.at(-1)).toMatchObject({ type: 'chat', op: 'settings', realtime_enabled: true })
+    const packet = encodeRealtimePacket(7, Int16Array.from({ length: REALTIME_FRAME_SAMPLES }, (_, index) => index - 160))
+    await room.webSocketMessage(board as unknown as WebSocket, packet.buffer as ArrayBuffer)
+    expect(browser.binaryFrames).toHaveLength(0)
     await chat(board, 'realtime.start')
     expect(browser.frames.at(-1)).toMatchObject({ op: 'realtime.start' })
-    await chat(board, 'realtime.chunk', { data: btoa('pcm') })
-    expect(browser.frames.at(-1)).toMatchObject({ op: 'realtime.chunk', data: btoa('pcm') })
-    expect(board.frames.some(f => f.op === 'realtime.chunk')).toBe(false)
+    expect(board.frames.at(-1)).toMatchObject({ op: 'ack', active: true })
+    await room.webSocketMessage(board as unknown as WebSocket, packet.buffer as ArrayBuffer)
+    expect(browser.binaryFrames).toHaveLength(1)
+    expect(browser.binaryFrames[0]).toEqual(packet)
+    await room.webSocketMessage(browser as unknown as WebSocket, packet.buffer as ArrayBuffer)
+    expect(browser.binaryFrames).toHaveLength(1)
     await chat(board, 'realtime.stop')
     expect(browser.frames.at(-1)).toMatchObject({ op: 'realtime.stop' })
+  })
+  it('clears realtime when the direct board connection disappears behind a live gateway', async () => {
+    const browser = socket(), board = socket('board')
+    await room.webSocketMessage(board as unknown as WebSocket, JSON.stringify({ type: 'status', protocol: 2, uptime_ms: 100 }))
+    await chat(browser, 'realtime.set', { enabled: true })
+    await chat(board, 'realtime.start')
+    await room.webSocketMessage(browser as unknown as WebSocket, JSON.stringify({
+      type: 'gateway', payload: { type: 'status', protocol: 2, uptime_ms: 200 },
+    }))
+    await chat(browser, 'ping')
+
+    board.readyState = 3
+    await room.webSocketClose(board as unknown as WebSocket)
+
+    expect(store.values.get('realtime_active')).toBe(false)
+    expect(browser.frames.filter((frame) => frame.op === 'realtime.stop')).toHaveLength(1)
+    expect(browser.frames.filter((frame) => frame.op === 'presence').at(-1)).toMatchObject({ online: true, via: 'ble' })
+  })
+  it('reconciles a lost realtime stop from the board heartbeat', async () => {
+    const browser = socket(), board = socket('board')
+    await room.webSocketMessage(board as unknown as WebSocket, JSON.stringify({ type: 'status', protocol: 2, uptime_ms: 100 }))
+    store.values.set('realtime_enabled', true)
+    await chat(board, 'realtime.start')
+    await room.webSocketMessage(board as unknown as WebSocket, JSON.stringify({
+      type: 'status', protocol: 2, uptime_ms: 3100, realtime_active: false,
+    }))
+
+    expect(store.values.get('realtime_active')).toBe(false)
+    expect(browser.frames.filter((frame) => frame.op === 'realtime.stop')).toHaveLength(1)
   })
   it('sends the board the current unique online browser count', async () => {
     store.values.set('clients', [

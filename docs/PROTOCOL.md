@@ -1,6 +1,6 @@
 # EasyInput Studio board protocol
 
-Studio and `firmware/easyinput-monitor` exchange UTF-8 JSON frames over the board's native USB Serial/JTAG interface, encrypted BLE GATT, or a local-network WebSocket. All three connections can remain open simultaneously. Each frame is one JSON object followed by `\n`. The firmware sends a `hello` frame at startup or when requested, a `status` frame every second, and an `event` frame for each debounced input transition or encoder detent.
+Studio and `firmware/easyinput-monitor` exchange UTF-8 JSON control and telemetry frames over the board's native USB Serial/JTAG interface, encrypted BLE GATT, or a local-network WebSocket. Realtime S7 audio additionally uses binary PCM16 frames over the board's direct cloud WSS. All monitoring connections can remain open simultaneously. JSON frames are newline delimited on USB/BLE. The firmware sends a `hello` frame at startup or when requested, a `status` frame every second, and an `event` frame for each debounced input transition or encoder detent.
 
 All frames use `protocol: 2`. The desktop ignores older, unknown, or malformed versions. Credentials are accepted only in the `wifi.configure` command and are never included in board status, result frames, or firmware logs.
 
@@ -168,7 +168,7 @@ The board syncs metadata one item at a time with `op: index, offset`. A response
 {"type":"chat","protocol":2,"op":"read","req":"read-1","id":"message-uuid"}
 ```
 
-`read` is emitted only after complete speaker playback plus DMA drain, never on download or playback start. There is no clear operation; retention removes old read messages automatically. Board recording upload IDs are random, permitting retry across a transport reconnect. A failed or interrupted playback does not emit `read`.
+`read` is emitted only after complete speaker playback plus DMA drain, never on download or playback start. Retention removes old eligible messages automatically. A separate `POST /admin/clear` maintenance endpoint requires a Bearer `CLEAR_TOKEN`, clears the default room's message metadata, audio chunks, and incomplete uploads, and broadcasts `op: pruned` with all removed IDs to connected browsers. It preserves board delivery receipts, client identities, and realtime settings. Board recording upload IDs are random, permitting retry across a transport reconnect. A failed or interrupted playback does not emit `read`.
 
 A browser Bluetooth gateway sends `{ "type": "gateway", "payload": <actual board frame> }`. The server sends `{ "type": "bridge", "payload": <board-bound frame> }` only to the chosen gateway. BLE disconnection emits `op: gateway.off`. Status frames must continue advancing `uptime_ms`; pings from a browser cannot keep a disconnected board online. Browser `op: ping` / `pong` checks only cloud connectivity. The room alarm updates expired presence while browsers are idle.
 
@@ -179,12 +179,25 @@ Realtime listening uses transient frames:
 ```json
 {"type":"chat","protocol":2,"op":"realtime.set","req":"settings-1","enabled":true}
 {"type":"chat","protocol":2,"op":"settings","realtime_enabled":true}
-{"type":"chat","protocol":2,"op":"realtime.start"}
-{"type":"chat","protocol":2,"op":"realtime.chunk","data":"base64 mu-law bytes"}
+{"type":"chat","protocol":2,"op":"realtime.start","req":"realtime-1"}
+{"type":"chat","protocol":2,"op":"ack","req":"realtime-1","active":true}
 {"type":"chat","protocol":2,"op":"realtime.stop"}
 ```
 
-`realtime.set` comes from a browser and persists only a small room flag. Board start/chunk/stop frames are broadcast to browsers while active. Chunks are not stored and do not enter the timeline. Turning the room flag off forces an active board stream to stop.
+`realtime.set` comes from a browser and persists only a small room flag. The board sends `realtime.start` synchronously on the same ordered WebSocket, then immediately starts binary audio. The matching acknowledgement is retained for diagnostics but does not block the audio stream. Realtime audio uses binary WebSocket messages, not JSON or Base64:
+
+```text
+bytes 0..3   "EIV2"
+byte 4       version 1
+byte 5       codec 1 = PCM16LE
+bytes 6..7   reserved, zero
+bytes 8..11  uint32 little-endian sequence
+bytes 12..   exactly 320 mono samples, 640 bytes
+```
+
+Each packet is 652 bytes and represents 20 ms at 16 kHz. Only an authenticated board may send binary packets, and the Worker forwards them only to browsers while the room realtime session is active. Realtime packets are not stored and do not enter the timeline. Turning the room flag off, starting another session, or closing the board transport stops the stream.
+
+This PCM16 realtime phase requires the board's direct Wi-Fi cloud connection. The browser Bluetooth gateway continues to carry monitoring and timeline frames, but does not carry realtime audio.
 
 Status protocol 2 now optionally includes `cloud: { configured: boolean, online: boolean }`, enabling the one-time setup form to hide already saved cloud credentials. This board-reported cloud field does not override the room's presence decision.
 

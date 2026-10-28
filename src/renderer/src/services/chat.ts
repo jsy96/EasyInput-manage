@@ -1,8 +1,15 @@
-import { AUDIO_BATCH, AUDIO_CHUNK, CHAT_VERSION, fromBase64, sortMessages, toBase64 } from '@shared/chat'
+import {
+  AUDIO_BATCH, AUDIO_CHUNK, CHAT_VERSION, REALTIME_FRAME_BYTES,
+  decodeRealtimePacket, fromBase64, sortMessages, toBase64,
+} from '@shared/chat'
 import type { ChatMessage, RoomState } from '@shared/chat'
 import { emptyRoom } from '@shared/chat'
 type Frame = Record<string, unknown>
-export type RealtimeEvent = { type: 'start' | 'chunk' | 'stop'; data?: string }
+export type RealtimeEvent =
+  | { type: 'start' }
+  | { type: 'packet'; sequence: number; samples: Int16Array }
+  | { type: 'chunk'; data: string }
+  | { type: 'stop' }
 const ID_KEY = 'easyinput.chat.client.v1'
 export function clientIdentity(): { id: string; name: string } {
   try { const s = JSON.parse(localStorage.getItem(ID_KEY) ?? 'null') as { id: string; name: string } | null; if (s?.id && s.name) return s } catch { /* initialize */ }
@@ -38,6 +45,7 @@ export class ChatConnection {
     if (this.stopped || this.socket) return
     const query = new URLSearchParams({ role: 'browser', device: this.device, client: this.identity.id, name: this.identity.name })
     const socket = this.socket = new WebSocket(`${this.gateway}/ws?${query}`)
+    socket.binaryType = 'arraybuffer'
     socket.onopen = () => {
       if (this.stopped || this.socket !== socket) { socket.close(); return }
       this.lastPong = Date.now(); this.retries = 0
@@ -48,6 +56,12 @@ export class ChatConnection {
     }
     socket.onmessage = (event: MessageEvent) => {
       if (this.stopped || this.socket !== socket) return
+      if (event.data instanceof ArrayBuffer) {
+        if (event.data.byteLength !== REALTIME_FRAME_BYTES) return
+        const packet = decodeRealtimePacket(event.data)
+        if (packet) this.emitRealtime({ type: 'packet', sequence: packet.sequence, samples: packet.samples })
+        return
+      }
       if (typeof event.data !== 'string' || event.data.length > 131072) return
       let v: Frame
       try { v = JSON.parse(event.data) as Frame } catch { return }

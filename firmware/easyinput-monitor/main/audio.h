@@ -15,6 +15,9 @@ typedef struct {
     bool voice_completed;
     bool microphone_active;
     bool speaker_playing;
+    bool live_sink_active;
+    size_t live_chunk_frames;
+    int stage;
     uint16_t rms;
     bool vad;
     uint8_t volume;

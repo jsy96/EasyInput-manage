@@ -1,15 +1,19 @@
-import { DeviceRoom } from './device-room'
+import { DeviceRoomV2 } from './device-room'
 import { CHAT_VERSION } from '../../src/shared/chat'
 export interface Env {
   DEVICE_ROOMS: DurableObjectNamespace
   ALLOWED_ORIGINS: string
   PAIRING_SECRET?: string
   PUBLIC_DEVICE_ID?: string
+  CLEAR_TOKEN?: string
 }
 function allowedOrigin(request: Request, env: Env): boolean {
   return env.ALLOWED_ORIGINS.split(',').map(v => v.trim()).includes(request.headers.get('Origin') ?? '')
 }
 function authorized(env: Env, token: string | null): boolean { return Boolean(token && env.PAIRING_SECRET && token.length >= 16 && token === env.PAIRING_SECRET) }
+function authorizedClear(env: Env, token: string | null): boolean {
+  return Boolean(token && env.CLEAR_TOKEN && token.length >= 32 && token === env.CLEAR_TOKEN)
+}
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url)
@@ -18,6 +22,18 @@ export default {
     if (request.method === 'OPTIONS') return new Response(null, { status: origin ? 204 : 403, headers: cors })
     if (url.pathname === '/health') return Response.json({ ok: true, service: 'easyinput-gateway', chat: CHAT_VERSION })
     if (url.pathname === '/session' && origin) return Response.json({ device: env.PUBLIC_DEVICE_ID ?? 'easyinput-v2', gateway: url.origin.replace('https:', 'wss:') }, { headers: cors })
+    if (url.pathname === '/admin/clear') {
+      if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 })
+      if (!env.CLEAR_TOKEN) return new Response('Clear token is not configured', { status: 503 })
+      const token = request.headers.get('Authorization')?.match(/^Bearer ([^\s]+)$/)?.[1] ?? null
+      if (!authorizedClear(env, token)) return new Response('Unauthorized', { status: 401 })
+      const device = env.PUBLIC_DEVICE_ID ?? 'easyinput-v2'
+      const room = env.DEVICE_ROOMS.get(env.DEVICE_ROOMS.idFromName(device))
+      return room.fetch(new Request('https://room.internal/admin/clear', {
+        method: 'POST',
+        headers: { 'X-EasyInput-Clear': '1' },
+      }))
+    }
     if (url.pathname !== '/ws' || request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') return new Response('EasyInput gateway', { status: 200 })
     const device = url.searchParams.get('device')?.trim()
     const role = url.searchParams.get('role')
@@ -32,4 +48,4 @@ export default {
     return room.fetch(new Request(target.toString(), request))
   },
 }
-export { DeviceRoom }
+export { DeviceRoomV2 }

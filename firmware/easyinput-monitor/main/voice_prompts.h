@@ -45,7 +45,10 @@ typedef enum {
     PROMPT_OFFLINE,
     PROMPT_SETUP,
     PROMPT_SETUP_FAILED,
-    PROMPT_COUNT,
+    PROMPT_NEXT,
+    PROMPT_ALARM_TIME_0,
+    PROMPT_TIMER_MINUTE_1 = PROMPT_ALARM_TIME_0 + 48,
+    PROMPT_COUNT = PROMPT_TIMER_MINUTE_1 + 60,
 } voice_prompt_t;
 
 const uint8_t *voice_prompt_data(int prompt, size_t *length);

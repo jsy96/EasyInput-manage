@@ -1,4 +1,7 @@
-import { AUDIO_CHUNK, AUDIO_LIMIT, AUDIO_STREAM_WINDOW, CHAT_LIMIT, CHAT_VERSION, sortMessages, validId } from '../../src/shared/chat'
+import {
+  AUDIO_CHUNK, AUDIO_LIMIT, AUDIO_STREAM_WINDOW, CHAT_LIMIT, CHAT_VERSION,
+  isRealtimePacket, sortMessages, validId,
+} from '../../src/shared/chat'
 import type { ChatClient, ChatMessage } from '../../src/shared/chat'
 
 type Attachment = { role: 'board' | 'browser'; client?: string; name?: string; last?: number; uptime?: number }
@@ -7,13 +10,26 @@ type Upload = { id: string; sender: string; name: string; samples: number; next:
 const frame = (op: string, data: Frame = {}): Frame => ({ type: 'chat', protocol: CHAT_VERSION, op, ...data })
 const MAX_BATCH = 32
 
-export class DeviceRoom {
+export class DeviceRoomV2 {
+  private realtimeOpen = false
   constructor(private readonly state: DurableObjectState) {}
   private sockets(): WebSocket[] { return this.state.getWebSockets().filter((s) => s.readyState === 1) }
   private attachment(s: WebSocket): Attachment { return s.deserializeAttachment() as Attachment }
   private send(s: WebSocket, value: Frame): void { try { s.send(JSON.stringify(value)) } catch { /* close callback cleans presence */ } }
+  private sendBinary(s: WebSocket, value: ArrayBuffer): void { try { s.send(value) } catch { /* close callback cleans presence */ } }
   private broadcast(value: Frame, browsersOnly = false): void {
     for (const s of this.sockets()) if (!browsersOnly || this.attachment(s).role === 'browser') this.send(s, value)
+  }
+  private broadcastBinary(value: ArrayBuffer): void {
+    for (const s of this.sockets()) if (this.attachment(s).role === 'browser') this.sendBinary(s, value)
+  }
+  // Persist and broadcast state changes so clients cannot remain stuck on a stale live indicator.
+  private async syncRealtime(active: boolean): Promise<void> {
+    const stored = await this.state.storage.get<boolean>('realtime_active') ?? false
+    if (stored === active && this.realtimeOpen === active) return
+    this.realtimeOpen = active
+    await this.state.storage.put('realtime_active', active)
+    this.broadcast(frame(active ? 'realtime.start' : 'realtime.stop', {}), true)
   }
   private route(): { socket: WebSocket; via: 'wifi' | 'ble' } | null {
     const fresh = this.sockets().filter((s) => Date.now() - (this.attachment(s).last ?? 0) < 8000)
@@ -49,6 +65,10 @@ export class DeviceRoom {
     this.toBoard(frame('audience', { online_clients: onlineClients }))
   }
   async fetch(request: Request): Promise<Response> {
+    if (request.method === 'POST' && request.headers.get('X-EasyInput-Clear') === '1') {
+      const cleared = await this.state.blockConcurrencyWhile(() => this.clearHistory())
+      return Response.json({ ok: true, cleared })
+    }
     if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') return new Response('WebSocket required', { status: 426 })
     const url = new URL(request.url)
     const role = url.searchParams.get('role')
@@ -91,7 +111,14 @@ export class DeviceRoom {
     return new Response(null, { status: 101, webSocket: client })
   }
   async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    if (typeof message !== 'string' || message.length > 65536) return
+    if (message instanceof ArrayBuffer) {
+      if (this.attachment(socket).role !== 'board' || !isRealtimePacket(message)) return
+      if (!this.realtimeOpen) this.realtimeOpen = await this.state.storage.get<boolean>('realtime_active') ?? false
+      if (!this.realtimeOpen) return
+      this.broadcastBinary(message)
+      return
+    }
+    if (message.length > 65536) return
     let value: Frame
     try { value = JSON.parse(message) as Frame } catch { return }
     if (!value || typeof value !== 'object' || Array.isArray(value)) return
@@ -130,6 +157,9 @@ export class DeviceRoom {
     const route = this.route()
     if (value.type === 'hello') await this.state.storage.put('hello', value)
     if (route?.socket === socket || value.type === 'hello') this.broadcast(value, true)
+    if (a.role === 'board' && !bridge && typeof value.realtime_active === 'boolean') {
+      await this.syncRealtime(value.realtime_active)
+    }
     if (value.type === 'status') await this.presence()
   }
   private async chat(socket: WebSocket, v: Frame, board: boolean): Promise<void> {
@@ -273,10 +303,7 @@ export class DeviceRoom {
     if (v.op === 'realtime.set' && !board) {
       const enabled = v.enabled === true
       await this.state.storage.put('realtime_enabled', enabled)
-      if (!enabled) {
-        await this.state.storage.put('realtime_active', false)
-        this.broadcast(frame('realtime.stop', {}))
-      }
+      if (!enabled) await this.syncRealtime(false)
       this.broadcast(frame('settings', { realtime_enabled: enabled }))
       this.toBoard(frame('settings', { realtime_enabled: enabled }))
       reply('settings', { realtime_enabled: enabled })
@@ -284,8 +311,7 @@ export class DeviceRoom {
     }
     if (v.op === 'realtime.start' && board) {
       if (!(await this.state.storage.get<boolean>('realtime_enabled') ?? false)) throw new Error('实时监听未在网页开启')
-      await this.state.storage.put('realtime_active', true)
-      this.broadcast(frame('realtime.start', {}), true)
+      await this.syncRealtime(true)
       reply('ack', { active: true })
       return
     }
@@ -296,8 +322,7 @@ export class DeviceRoom {
       return
     }
     if (v.op === 'realtime.stop') {
-      if (board) await this.state.storage.put('realtime_active', false)
-      this.broadcast(frame('realtime.stop', {}))
+      await this.syncRealtime(false)
       if (board) reply('ack', { active: false })
       return
     }
@@ -305,6 +330,17 @@ export class DeviceRoom {
   private async deleteAudio(id: string, samples: number): Promise<void> {
     const keys = Array.from({ length: Math.ceil(samples / AUDIO_CHUNK) }, (_, i) => `audio:${id}:${i}`)
     for (let i = 0; i < keys.length; i += 100) await this.state.storage.delete(keys.slice(i, i + 100))
+  }
+  private async clearHistory(): Promise<number> {
+    const messages = await this.messages()
+    const audioKeys = [...(await this.state.storage.list<unknown>({ prefix: 'audio:' })).keys()]
+    const uploadKeys = [...(await this.state.storage.list<unknown>({ prefix: 'upload:' })).keys()]
+    await this.state.storage.delete('messages')
+    for (const keys of [audioKeys, uploadKeys]) {
+      for (let i = 0; i < keys.length; i += 100) await this.state.storage.delete(keys.slice(i, i + 100))
+    }
+    if (messages.length) this.broadcast(frame('pruned', { ids: messages.map((message) => message.id) }), true)
+    return messages.length
   }
   async alarm(): Promise<void> {
     const pending = await this.state.storage.list<Upload>({ prefix: 'upload:' })
@@ -315,17 +351,23 @@ export class DeviceRoom {
     await this.presence()
     if (this.sockets().length || pending.size) await this.state.storage.setAlarm(Date.now() + 5000)
   }
-  async webSocketClose(): Promise<void> {
-    if (!this.route()) {
-      await this.state.storage.put('realtime_active', false)
-      this.broadcast(frame('realtime.stop', {}), true)
+  async webSocketClose(socket?: WebSocket): Promise<void> {
+    if (socket) {
+      const role = this.attachment(socket).role
+      const replacementBoard = this.sockets().some((s) => s !== socket && this.attachment(s).role === 'board')
+      if (role === 'board' && !replacementBoard) await this.syncRealtime(false)
+    } else if (!this.route()) {
+      await this.syncRealtime(false)
     }
     await this.presence()
   }
-  async webSocketError(): Promise<void> {
-    if (!this.route()) {
-      await this.state.storage.put('realtime_active', false)
-      this.broadcast(frame('realtime.stop', {}), true)
+  async webSocketError(socket?: WebSocket): Promise<void> {
+    if (socket) {
+      const role = this.attachment(socket).role
+      const replacementBoard = this.sockets().some((s) => s !== socket && this.attachment(s).role === 'board')
+      if (role === 'board' && !replacementBoard) await this.syncRealtime(false)
+    } else if (!this.route()) {
+      await this.syncRealtime(false)
     }
     await this.presence()
   }

@@ -3,7 +3,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #include "audio.h"
 #include "esp_heap_caps.h"
@@ -12,6 +11,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lights.h"
 #include "mbedtls/base64.h"
@@ -23,15 +23,22 @@
 #define CHAT_PROTOCOL 2
 #define CHUNK 768
 #define MAX_AUDIO 160000
-#define STREAM_WINDOW 4
-#define PREBUFFER 4096
+#define STREAM_WINDOW 8
 #define MAX_MESSAGES 100
 #define LONG_US 1200000
 #define SETUP_LONG_US 3000000
-#define SETTINGS_COMMIT_US 2000000
+#define SETTINGS_COMMIT_US 3000000
 #define RETRY_US 3000000
 #define ACK_TIMEOUT_US 12000000
+#define REALTIME_STOP_RETRY_US 1000000
+#define REALTIME_QUEUE_DEPTH 32
+#define INPUT_QUEUE_DEPTH 16
+#define SLOW_BLINK_ON_US 500000LL
+#define SLOW_BLINK_PERIOD_US 2500000LL
 #define TOKEN_VALID_FROM 1735689600LL
+#define REALTIME_HEADER_BYTES 12
+#define REALTIME_FRAME_BYTES (AUDIO_SAMPLE_RATE / 50 * (int)sizeof(int16_t))
+#define REALTIME_PACKET_BYTES (REALTIME_HEADER_BYTES + REALTIME_FRAME_BYTES)
 
 typedef struct {
     char id[65];
@@ -78,11 +85,17 @@ typedef enum {
     PROMPT_ACTION_NONE,
     PROMPT_ACTION_START_RECORDING,
     PROMPT_ACTION_START_REALTIME,
+    PROMPT_ACTION_SETTINGS_CONFIRM,
 } prompt_action_t;
 
 static const char *TAG = "voice_chat";
 static QueueHandle_t events;
+static QueueHandle_t input_events;
+static QueueHandle_t realtime_events;
+static SemaphoreHandle_t event_ready;
 static void (*send_line)(const char *);
+static bool (*send_binary_line)(const uint8_t *data, size_t length);
+static bool (*send_immediate_line)(const char *line);
 static message_t messages[MAX_MESSAGES];
 static int message_count;
 static job_t job;
@@ -105,10 +118,14 @@ static int64_t cache_at;
 static int64_t settings_commit_at;
 static int64_t key_down[9];
 static bool key_held[9];
+static bool key_long_handled[9];
 static bool key_consumed[9];
 static char request_line[1600];
 static char request_id[24];
 static char probe_id[24];
+static char realtime_stop_id[24];
+static bool realtime_stop_pending;
+static int64_t realtime_stop_sent_at;
 static uint32_t sequence;
 static int64_t sent_at;
 static int64_t started_at;
@@ -127,10 +144,29 @@ static bool stream_complete;
 static voice_outbox_item_t outgoing;
 static voice_chat_snapshot_t snapshot;
 static portMUX_TYPE snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
-static bool navigation_active;
-static int64_t navigation_at;
 static bool setup_waiting;
 static int64_t setup_deadline;
+static unsigned diag_s5_events;
+static unsigned diag_s6_down_events;
+static unsigned diag_s6_up_events;
+static unsigned diag_s6_actions;
+static unsigned diag_s7_events;
+static unsigned diag_realtime_starts;
+static unsigned diag_realtime_stops;
+static unsigned diag_realtime_acks;
+static unsigned diag_realtime_failures;
+static unsigned diag_realtime_chunks_queued;
+static unsigned diag_realtime_chunks_dropped;
+static unsigned diag_realtime_sink_calls;
+static unsigned diag_realtime_sink_bytes;
+static unsigned diag_input_dropped;
+static unsigned diag_control_dropped;
+static int diag_stage;
+static uint32_t realtime_sequence;
+static bool realtime_ready;
+static bool realtime_start_pending;
+static int diag_last_key = -1;
+static unsigned diag_last_key_mode;
 
 static bool uploading(void)
 {
@@ -167,15 +203,16 @@ static void request(cJSON *value)
     sent_at = started_at = esp_timer_get_time();
 }
 
-static void fire_and_forget(cJSON *value)
+static bool request_immediate(cJSON *value)
 {
-    if (value == NULL) return;
+    if (value == NULL || send_immediate_line == NULL) return false;
+    snprintf(request_id, sizeof(request_id), "board-%lu", (unsigned long)++sequence);
+    cJSON_AddStringToObject(value, "req", request_id);
     char *line = cJSON_PrintUnformatted(value);
-    if (line != NULL) {
-        send_line(line);
-        free(line);
-    }
+    const bool sent = line != NULL && send_immediate_line(line);
+    free(line);
     cJSON_Delete(value);
+    return sent;
 }
 
 static void probe(int64_t now)
@@ -231,10 +268,20 @@ static void add_item(cJSON *value)
     sort_messages();
 }
 
-static message_t *latest_unread(void)
+static message_t *earliest_unread(void)
 {
-    for (int i = message_count - 1; i >= 0; i--) if (!messages[i].read) return &messages[i];
-    return message_count ? &messages[message_count - 1] : NULL;
+    for (int i = 0; i < message_count; i++) if (!messages[i].read) return &messages[i];
+    return NULL;
+}
+
+static message_t *next_unread_after(message_t *current)
+{
+    if (current == NULL) return earliest_unread();
+    int index = -1;
+    for (int i = 0; i < message_count; i++) if (&messages[i] == current) { index = i; break; }
+    if (index < 0) return earliest_unread();
+    for (int i = index + 1; i < message_count; i++) if (!messages[i].read) return &messages[i];
+    return NULL;
 }
 
 static void set_cursor(message_t *message)
@@ -244,8 +291,6 @@ static void set_cursor(message_t *message)
         return;
     }
     strlcpy(cursor_id, message->id, sizeof(cursor_id));
-    navigation_active = true;
-    navigation_at = esp_timer_get_time();
 }
 
 static void release_audio(void)
@@ -297,32 +342,33 @@ static void start_prompt(int prompt, prompt_action_t action)
     start_prompt_sequence(&prompt, 1, action);
 }
 
-static void start_time_prompt(int64_t created, int prefix, int suffix, prompt_action_t action)
+static void announce_alarm_draft(void)
 {
-    const time_t raw = (time_t)(created / 1000);
-    struct tm local;
-    if (localtime_r(&raw, &local) == NULL) return;
-    int ids[16], length = 0;
-    if (prefix >= 0) append_prompt(ids, &length, prefix);
-    append_number(ids, &length, local.tm_hour);
-    append_prompt(ids, &length, PROMPT_POINT);
-    if (local.tm_min == 0) append_prompt(ids, &length, PROMPT_WHOLE);
-    else {
-        append_number(ids, &length, local.tm_min);
-        append_prompt(ids, &length, PROMPT_MINUTE);
-    }
-    if (suffix >= 0) append_prompt(ids, &length, suffix);
-    start_prompt_sequence(ids, length, action);
+    start_prompt(PROMPT_ALARM_TIME_0 + alarm_draft / 30, PROMPT_ACTION_SETTINGS_CONFIRM);
 }
 
-static void announce_cursor(void)
+static void announce_timer_draft(void)
 {
-    message_t *message = find_message(cursor_id);
-    if (message == NULL) {
+    start_prompt(PROMPT_TIMER_MINUTE_1 + timer_draft - 1, PROMPT_ACTION_SETTINGS_CONFIRM);
+}
+
+static void select_next_unread(void)
+{
+    stop_prompt();
+    message_t *first = earliest_unread();
+    if (first == NULL) {
+        set_cursor(NULL);
         start_prompt(PROMPT_NO_MESSAGES, PROMPT_ACTION_NONE);
         return;
     }
-    start_time_prompt(message->created, -1, -1, PROMPT_ACTION_NONE);
+    message_t *current = find_message(cursor_id);
+    message_t *next = first;
+    if (current != NULL && !current->read) {
+        next = next_unread_after(current);
+        if (next == NULL) next = current;
+    }
+    set_cursor(next);
+    start_prompt(PROMPT_NEXT, PROMPT_ACTION_NONE);
 }
 
 static void stop_message_playback(void)
@@ -335,13 +381,39 @@ static void stop_message_playback(void)
     if (mode == MODE_PLAYING) mode = MODE_IDLE;
 }
 
+static void send_realtime_stop(void)
+{
+    cJSON *value = new_frame("realtime.stop");
+    if (value == NULL || send_immediate_line == NULL) {
+        cJSON_Delete(value);
+        return;
+    }
+    snprintf(realtime_stop_id, sizeof(realtime_stop_id), "stop-%lu", (unsigned long)++sequence);
+    cJSON_AddStringToObject(value, "req", realtime_stop_id);
+    char *line = cJSON_PrintUnformatted(value);
+    if (line != NULL) {
+        (void)send_immediate_line(line);
+        free(line);
+    }
+    cJSON_Delete(value);
+    realtime_stop_pending = true;
+    realtime_stop_sent_at = esp_timer_get_time();
+}
+
 static void stop_realtime(void)
 {
     if (mode != MODE_REALTIME) return;
-    (void)audio_live_stop();
+    // Exit the mode and report offline first so the browser red dot clears
+    // immediately, then stop the microphone (the only potentially slow step).
     mode = MODE_IDLE;
-    cJSON *value = new_frame("realtime.stop");
-    fire_and_forget(value);
+    portENTER_CRITICAL(&snapshot_lock);
+    realtime_ready = false;
+    portEXIT_CRITICAL(&snapshot_lock);
+    realtime_start_pending = false;
+    request_line[0] = '\0';
+    diag_realtime_stops++;
+    send_realtime_stop();
+    (void)audio_live_stop();
 }
 
 static void cancel_countdown(bool prompt)
@@ -355,11 +427,11 @@ static void cancel_countdown(bool prompt)
 
 static void refresh_lights(int64_t now)
 {
-    const bool unread = latest_unread() != NULL && latest_unread()->read == false;
+    const bool unread = earliest_unread() != NULL;
     const bool recording = mode == MODE_RECORDING;
     const bool sending = uploading() || job == JOB_CACHE || voice_outbox_count() > 0;
     const bool realtime = mode == MODE_REALTIME;
-    const bool slow_blink = (now % 2100000) < 100000;
+    const bool slow_blink = (now % SLOW_BLINK_PERIOD_US) < SLOW_BLINK_ON_US;
     const bool computers_online = network_fresh(now) && last_audience_at &&
         now - last_audience_at < 10000000 && online_clients > 0;
     const bool timer_running = timers_countdown_active();
@@ -433,35 +505,14 @@ static void play_message(message_t *message)
     request_stream();
 }
 
-static void move_cursor(bool newer)
-{
-    const int64_t now = esp_timer_get_time();
-    stop_prompt();
-    if (!navigation_active || now - navigation_at > 15000000 || find_message(cursor_id) == NULL) {
-        set_cursor(latest_unread());
-        announce_cursor();
-        return;
-    }
-    int index = -1;
-    for (int i = 0; i < message_count; i++) if (strcmp(messages[i].id, cursor_id) == 0) { index = i; break; }
-    if (index < 0) {
-        set_cursor(latest_unread());
-    } else if (newer && index + 1 < message_count) {
-        set_cursor(&messages[index + 1]);
-    } else if (!newer && index > 0) {
-        set_cursor(&messages[index - 1]);
-    }
-    navigation_at = now;
-    announce_cursor();
-}
-
 static void begin_alarm_setting(void)
 {
     stop_message_playback();
     stop_prompt();
     alarm_draft = timers_alarm_minute() >= 0 ? timers_alarm_minute() : 12 * 60;
     mode = MODE_SETTING_ALARM;
-    settings_commit_at = esp_timer_get_time() + SETTINGS_COMMIT_US;
+    settings_commit_at = 0;
+    announce_alarm_draft();
 }
 
 static void begin_timer_setting(void)
@@ -470,7 +521,8 @@ static void begin_timer_setting(void)
     stop_prompt();
     timer_draft = 30;
     mode = MODE_SETTING_TIMER;
-    settings_commit_at = esp_timer_get_time() + SETTINGS_COMMIT_US;
+    settings_commit_at = 0;
+    announce_timer_draft();
 }
 
 static void start_recording(void)
@@ -503,28 +555,89 @@ static void begin_realtime_with_prompt(void)
 
 static void realtime_sink(const uint8_t *data, size_t length)
 {
-    if (length == 0 || length > 2048) return;
+    portENTER_CRITICAL(&snapshot_lock);
+    diag_realtime_sink_calls++;
+    diag_realtime_sink_bytes += (unsigned)length;
+    if (length != REALTIME_FRAME_BYTES) diag_realtime_chunks_dropped++;
+    const bool ready = realtime_ready;
+    if (!ready) diag_realtime_chunks_dropped++;
+    portEXIT_CRITICAL(&snapshot_lock);
+    if (!ready || length != REALTIME_FRAME_BYTES) return;
     uint8_t *copy = heap_caps_malloc(length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (copy == NULL) return;
+    if (copy == NULL) {
+        portENTER_CRITICAL(&snapshot_lock);
+        diag_realtime_chunks_dropped++;
+        portEXIT_CRITICAL(&snapshot_lock);
+        return;
+    }
     memcpy(copy, data, length);
     const event_t event = {.realtime_data = copy, .realtime_length = length};
-    if (xQueueSend(events, &event, 0) != pdTRUE) free(copy);
+    // Keep low-latency audio from consuming the control queue used by keys and stop commands.
+    if (xQueueSend(realtime_events, &event, 0) == pdTRUE) {
+        xSemaphoreGive(event_ready);
+        return;
+    }
+
+    // Under backpressure, discard the oldest audio frame and retain the newest.
+    event_t discarded;
+    unsigned dropped = 1;
+    if (xQueueReceive(realtime_events, &discarded, 0) == pdTRUE) {
+        free(discarded.realtime_data);
+        dropped++;
+    }
+    if (xQueueSend(realtime_events, &event, 0) == pdTRUE) {
+        xSemaphoreGive(event_ready);
+    } else {
+        dropped++;
+        free(copy);
+    }
+    portENTER_CRITICAL(&snapshot_lock);
+    diag_realtime_chunks_dropped += dropped;
+    portEXIT_CRITICAL(&snapshot_lock);
 }
 
 static void send_realtime_chunk(const uint8_t *data, size_t length)
 {
-    if (mode != MODE_REALTIME || data == NULL || length == 0) return;
-    const size_t encoded_capacity = (length * 4 / 3) + 8;
-    char *encoded = heap_caps_malloc(encoded_capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (encoded == NULL) return;
-    size_t encoded_length = 0;
-    if (mbedtls_base64_encode((unsigned char *)encoded, encoded_capacity, &encoded_length, data, length) == 0) {
-        encoded[encoded_length] = '\0';
-        cJSON *value = new_frame("realtime.chunk");
-        cJSON_AddStringToObject(value, "data", encoded);
-        fire_and_forget(value);
+    if (mode != MODE_REALTIME || !realtime_ready || data == NULL || length != REALTIME_FRAME_BYTES) {
+        portENTER_CRITICAL(&snapshot_lock);
+        diag_realtime_chunks_dropped++;
+        portEXIT_CRITICAL(&snapshot_lock);
+        return;
     }
-    free(encoded);
+    uint8_t packet[REALTIME_PACKET_BYTES];
+    memcpy(packet, "EIV2", 4);
+    packet[4] = 1;
+    packet[5] = 1;
+    packet[6] = 0;
+    packet[7] = 0;
+    const uint32_t sequence_value = realtime_sequence++;
+    packet[8] = (uint8_t)sequence_value;
+    packet[9] = (uint8_t)(sequence_value >> 8);
+    packet[10] = (uint8_t)(sequence_value >> 16);
+    packet[11] = (uint8_t)(sequence_value >> 24);
+    memcpy(packet + REALTIME_HEADER_BYTES, data, length);
+    if (send_binary_line != NULL && send_binary_line(packet, sizeof(packet))) {
+        portENTER_CRITICAL(&snapshot_lock);
+        diag_realtime_chunks_queued++;
+        portEXIT_CRITICAL(&snapshot_lock);
+    } else {
+        portENTER_CRITICAL(&snapshot_lock);
+        diag_realtime_chunks_dropped++;
+        portEXIT_CRITICAL(&snapshot_lock);
+    }
+}
+
+// Realtime audio is sent from its own task so the voice timeline task can stall
+// on prompt, timer, or light work without blocking microphone frames.
+static void realtime_tx_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        event_t frame;
+        if (xQueueReceive(realtime_events, &frame, pdMS_TO_TICKS(100)) != pdTRUE) continue;
+        send_realtime_chunk(frame.realtime_data, frame.realtime_length);
+        free(frame.realtime_data);
+    }
 }
 
 static void upload_begin(void)
@@ -592,12 +705,12 @@ static void on_short_key(int key)
     }
     switch (key) {
         case 0:
-            move_cursor(false);
+            select_next_unread();
             break;
         case 1: {
             stop_prompt();
             message_t *message = find_message(cursor_id);
-            if (message == NULL) { message = latest_unread(); set_cursor(message); }
+            if (message == NULL || message->read) { message = earliest_unread(); set_cursor(message); }
             play_message(message);
             break;
         }
@@ -611,10 +724,13 @@ static void on_short_key(int key)
             begin_recording_with_prompt();
             break;
         case 5:
+            diag_s6_actions++;
             if (mode == MODE_RECORDING) {
+                stop_prompt();
                 send_when_saved = true;
                 (void)audio_record_stop();
             } else if (mode == MODE_RECORD_READY) {
+                stop_prompt();
                 hold_id[0] = '\0';
                 send_when_saved = true;
                 if (job == JOB_CACHE) retry_at = now;
@@ -659,8 +775,18 @@ static void on_key(int key, bool down)
 {
     if (key < 0 || key > 8) return;
     const int64_t now = esp_timer_get_time();
+    diag_last_key = key;
+    diag_last_key_mode = mode;
+    if (down && key == 4) diag_s5_events++;
+    if (key == 5) {
+        if (down) diag_s6_down_events++;
+        else diag_s6_up_events++;
+    }
+    if (down && key == 6) diag_s7_events++;
     if (down) {
         key_consumed[key] = false;
+        key_held[key] = false;
+        key_long_handled[key] = false;
         if (mode == MODE_COUNTDOWN) {
             cancel_countdown(false);
             stop_message_playback();
@@ -668,7 +794,11 @@ static void on_key(int key, bool down)
             return;
         }
         if (mode == MODE_REALTIME) {
-            stop_realtime();
+            // Only S8 ends realtime listening, and it announces the stop.
+            if (key == 7) {
+                stop_realtime();
+                start_prompt(PROMPT_REALTIME_STOP, PROMPT_ACTION_NONE);
+            }
             key_consumed[key] = true;
             return;
         }
@@ -677,39 +807,44 @@ static void on_key(int key, bool down)
             key_consumed[key] = key != 1;
         }
         if (prompt_playing && key != 0 && key != 1) {
-            stop_prompt();
-            key_consumed[key] = true;
+            const bool recording_control = key == 5 &&
+                (mode == MODE_RECORDING || mode == MODE_RECORD_READY);
+            if (!recording_control) {
+                stop_prompt();
+                key_consumed[key] = true;
+            }
         }
         if (mode == MODE_RECORDING && key != 5) {
             key_consumed[key] = true;
         }
         key_down[key] = now;
-        key_held[key] = false;
         return;
     }
 
     const bool consumed = key_consumed[key];
-    const bool held = key_held[key];
+    const bool long_handled = key_long_handled[key];
     key_down[key] = 0;
     key_held[key] = false;
+    key_long_handled[key] = false;
     key_consumed[key] = false;
-    if (!consumed && !held) on_short_key(key);
+    if (!consumed && !long_handled) on_short_key(key);
 }
 
-static void on_long_key(int key)
+static bool on_long_key(int key)
 {
-    if (key == 0) {
-        move_cursor(true);
-    } else if (key == 2) {
+    if (key == 2) {
         const bool removed = timers_set_alarm_minute(-1);
         mode = MODE_IDLE;
         stop_prompt();
         start_prompt(removed ? PROMPT_ALARM_CANCEL : PROMPT_SAVE_FAILED, PROMPT_ACTION_NONE);
+        return true;
     } else if (key == 8) {
         network_setup_begin();
         setup_waiting = true;
         setup_deadline = esp_timer_get_time() + SETUP_LONG_US;
+        return true;
     }
+    return false;
 }
 
 static void on_rotate(int delta)
@@ -719,19 +854,22 @@ static void on_rotate(int delta)
         alarm_draft += delta * 30;
         if (alarm_draft < 0) alarm_draft = 0;
         if (alarm_draft >= 1440) alarm_draft = 1439 - 29;
-        settings_commit_at = esp_timer_get_time() + SETTINGS_COMMIT_US;
+        settings_commit_at = 0;
+        announce_alarm_draft();
     } else if (mode == MODE_SETTING_TIMER) {
         timer_draft += delta;
         if (timer_draft < 1) timer_draft = 1;
         if (timer_draft > 60) timer_draft = 60;
-        settings_commit_at = esp_timer_get_time() + SETTINGS_COMMIT_US;
+        settings_commit_at = 0;
+        announce_timer_draft();
     }
 }
 
 static void commit_settings(int64_t now)
 {
     if (mode != MODE_SETTING_ALARM && mode != MODE_SETTING_TIMER) return;
-    if (now < settings_commit_at) return;
+    if (settings_commit_at == 0 || now < settings_commit_at) return;
+    settings_commit_at = 0;
     int ids[16], length = 0;
     if (mode == MODE_SETTING_ALARM) {
         const bool saved = timers_set_alarm_minute(alarm_draft);
@@ -741,21 +879,12 @@ static void commit_settings(int64_t now)
             return;
         }
         append_prompt(ids, &length, PROMPT_ALARM_PREFIX);
-        append_number(ids, &length, alarm_draft / 60);
-        append_prompt(ids, &length, PROMPT_POINT);
-        if (alarm_draft % 60 == 0) append_prompt(ids, &length, PROMPT_WHOLE);
-        else {
-            append_number(ids, &length, alarm_draft % 60);
-            append_prompt(ids, &length, PROMPT_MINUTE);
-        }
         append_prompt(ids, &length, PROMPT_SET_SUFFIX);
         start_prompt_sequence(ids, length, PROMPT_ACTION_NONE);
     } else {
         timers_start_countdown(timer_draft);
         mode = MODE_COUNTDOWN;
         append_prompt(ids, &length, PROMPT_COUNTDOWN_PREFIX);
-        append_number(ids, &length, timer_draft);
-        append_prompt(ids, &length, PROMPT_MINUTES);
         append_prompt(ids, &length, PROMPT_COUNTDOWN_SUFFIX);
         start_prompt_sequence(ids, length, PROMPT_ACTION_NONE);
     }
@@ -819,11 +948,35 @@ static void receive(cJSON *value)
         stop_realtime();
         return;
     }
+    if (realtime_stop_pending && cJSON_IsString(req) && strcmp(req->valuestring, realtime_stop_id) == 0) {
+        if (strcmp(op->valuestring, "ack") == 0) realtime_stop_pending = false;
+        else if (strcmp(op->valuestring, "error") == 0) {
+            realtime_stop_pending = false;
+            diag_realtime_failures++;
+        }
+        return;
+    }
     if (strcmp(op->valuestring, "item") == 0) {
         add_item(value);
         return;
     }
     if (!cJSON_IsString(req) || strcmp(req->valuestring, request_id) != 0) return;
+    if (realtime_start_pending && strcmp(op->valuestring, "ack") == 0) {
+        realtime_start_pending = false;
+        portENTER_CRITICAL(&snapshot_lock);
+        realtime_ready = true;
+        diag_realtime_acks++;
+        portEXIT_CRITICAL(&snapshot_lock);
+        request_line[0] = '\0';
+        return;
+    }
+    if (realtime_start_pending && strcmp(op->valuestring, "error") == 0) {
+        realtime_start_pending = false;
+        diag_realtime_failures++;
+        stop_realtime();
+        start_prompt(PROMPT_OFFLINE, PROMPT_ACTION_NONE);
+        return;
+    }
     if (strcmp(op->valuestring, "error") == 0) {
         if (uploading()) upload_failed();
         else {
@@ -858,36 +1011,22 @@ static void receive(cJSON *value)
                                   strlen(data->valuestring)) != 0 || length != expected) return;
         memcpy(audio_data + chunk_index * CHUNK, decoded, length);
         chunk_index++;
-        if (!stream_started && chunk_index * CHUNK >= PREBUFFER) {
-            if (audio_play_voice_stream(audio_data, audio_size, chunk_index * CHUNK) == ESP_OK) {
-                stream_started = true;
-                job = JOB_PLAYING;
-            } else {
-                release_audio();
-                finish_job();
-                mode = MODE_IDLE;
-            }
-        } else if (stream_started) {
-            (void)audio_voice_stream_extend(chunk_index * CHUNK);
-        }
     } else if ((job == JOB_DOWNLOAD || job == JOB_PLAYING) && strcmp(op->valuestring, "streamAck") == 0) {
         const cJSON *next = cJSON_GetObjectItemCaseSensitive(value, "next");
         stream_complete = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(value, "complete"));
-        if (!stream_started) {
-            if (audio_play_voice_stream(audio_data, audio_size, chunk_index * CHUNK) == ESP_OK) {
-                stream_started = true;
-                job = JOB_PLAYING;
-            } else {
+        if (stream_complete) {
+            const unsigned expected_chunks = (audio_size + CHUNK - 1) / CHUNK;
+            if (chunk_index < expected_chunks || (!stream_started &&
+                audio_play_voice(audio_data, audio_size) != ESP_OK)) {
                 release_audio();
                 finish_job();
                 mode = MODE_IDLE;
                 return;
             }
-        } else {
-            (void)audio_voice_stream_extend(chunk_index * CHUNK);
-        }
-        if (stream_complete) request_line[0] = '\0';
-        else if (!cJSON_IsNumber(next) || next->valueint != (int)chunk_index) {
+            stream_started = true;
+            job = JOB_PLAYING;
+            request_line[0] = '\0';
+        } else if (!cJSON_IsNumber(next) || next->valueint != (int)chunk_index) {
             release_audio();
             finish_job();
             mode = MODE_IDLE;
@@ -915,6 +1054,7 @@ static void receive(cJSON *value)
         if (message != NULL) {
             message->read = true;
             message->pending_read = false;
+            set_cursor(NULL);
         }
         finish_job();
         mode = MODE_IDLE;
@@ -932,7 +1072,7 @@ static void prompt_task_step(int64_t now)
             size_t length = 0;
             const uint8_t *data = voice_prompt_data(prompt_ids[prompt_position], &length);
             if (data != NULL && length && audio_play_voice(data, length) == ESP_OK) prompt_playing = true;
-            else prompt_position++;
+            prompt_position++;
         }
         if (!prompt_playing && prompt_position >= prompt_length) {
             const prompt_action_t action = prompt_action;
@@ -941,13 +1081,32 @@ static void prompt_task_step(int64_t now)
             prompt_action = PROMPT_ACTION_NONE;
             if (action == PROMPT_ACTION_START_RECORDING) start_recording();
             else if (action == PROMPT_ACTION_START_REALTIME) {
+                portENTER_CRITICAL(&snapshot_lock);
+                realtime_ready = false;
+                portEXIT_CRITICAL(&snapshot_lock);
                 if (audio_live_start(realtime_sink) == ESP_OK) {
                     mode = MODE_REALTIME;
+                    diag_realtime_starts++;
+                    realtime_start_pending = true;
+                    realtime_stop_pending = false;
+                    realtime_sequence = 0;
                     cJSON *value = new_frame("realtime.start");
-                    fire_and_forget(value);
+                    if (request_immediate(value)) {
+                        portENTER_CRITICAL(&snapshot_lock);
+                        realtime_ready = true;
+                        portEXIT_CRITICAL(&snapshot_lock);
+                    } else {
+                        realtime_start_pending = false;
+                        diag_realtime_failures++;
+                        stop_realtime();
+                        start_prompt(PROMPT_OFFLINE, PROMPT_ACTION_NONE);
+                    }
                 } else {
+                    diag_realtime_failures++;
                     start_prompt(PROMPT_SAVE_FAILED, PROMPT_ACTION_NONE);
                 }
+            } else if (action == PROMPT_ACTION_SETTINGS_CONFIRM) {
+                settings_commit_at = now + SETTINGS_COMMIT_US;
             }
         }
     }
@@ -960,29 +1119,37 @@ static void task(void *argument)
     outbox_ready = voice_outbox_init() == ESP_OK;
     if (!outbox_ready) ESP_LOGE(TAG, "Persistent voice outbox unavailable");
     while (true) {
-        event_t event;
-        if (xQueueReceive(events, &event, pdMS_TO_TICKS(20)) == pdTRUE) {
-            if (event.json != NULL) {
-                cJSON *value = cJSON_Parse(event.json);
-                if (value != NULL) { receive(value); cJSON_Delete(value); }
-                free(event.json);
-            } else if (event.realtime_data != NULL) {
-                send_realtime_chunk(event.realtime_data, event.realtime_length);
-                free(event.realtime_data);
-            } else if (event.delta != 0) {
-                on_rotate(event.delta);
-            } else {
-                on_key(event.key, event.down);
-            }
+        diag_stage = 1;
+        event_t input_event;
+        event_t control_event;
+        bool have_input = xQueueReceive(input_events, &input_event, 0) == pdTRUE;
+        bool have_control = xQueueReceive(events, &control_event, 0) == pdTRUE;
+        if (!have_input && !have_control) {
+            diag_stage = 2;
+            (void)xSemaphoreTake(event_ready, pdMS_TO_TICKS(20));
+            have_input = xQueueReceive(input_events, &input_event, 0) == pdTRUE;
+            have_control = xQueueReceive(events, &control_event, 0) == pdTRUE;
+        }
+        if (have_input) {
+            diag_stage = 3;
+            if (input_event.delta != 0) on_rotate(input_event.delta);
+            else on_key(input_event.key, input_event.down);
+        }
+        if (have_control && control_event.json != NULL) {
+            diag_stage = 4;
+            cJSON *value = cJSON_Parse(control_event.json);
+            if (value != NULL) { receive(value); cJSON_Delete(value); }
+            free(control_event.json);
         }
 
+        diag_stage = 5;
         const int64_t now = esp_timer_get_time();
         if (now >= probe_at) probe(now);
         for (int key = 0; key < 9; key++) {
             const int64_t threshold = key == 8 ? SETUP_LONG_US : LONG_US;
             if (key_down[key] && !key_held[key] && !key_consumed[key] && now - key_down[key] >= threshold) {
                 key_held[key] = true;
-                on_long_key(key);
+                key_long_handled[key] = on_long_key(key);
             }
         }
         if (setup_waiting) {
@@ -994,12 +1161,15 @@ static void task(void *argument)
                 setup_waiting = false;
             }
         }
+        diag_stage = 6;
         const unsigned timer_events = timers_poll(now);
         handle_timer_events(timer_events, now);
         commit_settings(now);
 
+        diag_stage = 7;
         audio_snapshot_t audio;
         audio_get_snapshot(&audio);
+        diag_stage = 8;
         if (mode == MODE_RECORDING && !audio.recording) {
             audio_size = audio.recorded_bytes;
             if (audio_size) {
@@ -1037,10 +1207,16 @@ static void task(void *argument)
                 mode = MODE_IDLE;
             }
         }
+        diag_stage = 9;
         prompt_task_step(now);
+        diag_stage = 10;
 
         if (request_line[0] && now - sent_at > ACK_TIMEOUT_US) {
-            if (uploading()) upload_failed();
+            if (realtime_start_pending && mode == MODE_REALTIME) {
+                diag_realtime_failures++;
+                stop_realtime();
+                start_prompt(PROMPT_OFFLINE, PROMPT_ACTION_NONE);
+            } else if (uploading()) upload_failed();
             else if (job == JOB_INDEX) { finish_job(); sync_at = now + RETRY_US; }
             else if (job == JOB_MARK_READ) {
                 finish_job();
@@ -1060,6 +1236,7 @@ static void task(void *argument)
                 sent_at = now;
             }
         }
+        diag_stage = 11;
 
         if (job == JOB_IDLE && network_fresh(now) && !prompt_playing && mode != MODE_RECORDING &&
             mode != MODE_PLAYING && mode != MODE_REALTIME && mode != MODE_COUNTDOWN) {
@@ -1078,16 +1255,23 @@ static void task(void *argument)
                    !prompt_playing && voice_outbox_count() && now >= retry_at) {
             upload_begin();
         }
+        diag_stage = 12;
         if (mode == MODE_REALTIME && !network_fresh(now)) {
             stop_realtime();
             start_prompt(PROMPT_OFFLINE, PROMPT_ACTION_NONE);
         }
+        if (realtime_stop_pending && network_fresh(now) &&
+            now - realtime_stop_sent_at >= REALTIME_STOP_RETRY_US) {
+            send_realtime_stop();
+        }
 
+        diag_stage = 13;
         static int64_t lights_at;
         if (now >= lights_at) {
             refresh_lights(now);
             lights_at = now + 50000;
         }
+        diag_stage = 14;
         const voice_chat_snapshot_t value = {
             .pending = voice_outbox_count() + (job == JOB_CACHE ? 1 : 0),
             .sending = uploading(),
@@ -1097,6 +1281,38 @@ static void task(void *argument)
             .realtime_active = mode == MODE_REALTIME,
             .realtime_enabled = realtime_enabled,
             .network_via = network_fresh(now) ? network_via : 0,
+            .message_count = message_count,
+            .cursor_present = cursor_id[0] != '\0',
+            .mode = mode,
+            .job = job,
+            .audio_size = audio_size,
+            .chunk_index = chunk_index,
+            .expected_chunks = audio_size ? (audio_size + CHUNK - 1) / CHUNK : 0,
+            .stream_started = stream_started,
+            .stream_complete = stream_complete,
+            .network_fresh = network_fresh(now),
+            .s5_events = diag_s5_events,
+            .s6_down_events = diag_s6_down_events,
+            .s6_up_events = diag_s6_up_events,
+            .s6_actions = diag_s6_actions,
+            .s7_events = diag_s7_events,
+            .realtime_starts = diag_realtime_starts,
+            .realtime_stops = diag_realtime_stops,
+            .realtime_ready = realtime_ready,
+            .realtime_acks = diag_realtime_acks,
+            .realtime_failures = diag_realtime_failures,
+            .realtime_chunks_queued = diag_realtime_chunks_queued,
+            .realtime_chunks_dropped = diag_realtime_chunks_dropped,
+            .realtime_sink_calls = diag_realtime_sink_calls,
+            .realtime_sink_bytes = diag_realtime_sink_bytes,
+            .input_dropped = diag_input_dropped,
+            .control_dropped = diag_control_dropped,
+            .input_waiting = input_events ? uxQueueMessagesWaiting(input_events) : 0,
+            .control_waiting = events ? uxQueueMessagesWaiting(events) : 0,
+            .realtime_waiting = realtime_events ? uxQueueMessagesWaiting(realtime_events) : 0,
+            .last_key = diag_last_key,
+            .last_key_mode = diag_last_key_mode,
+            .stage = diag_stage,
         };
         portENTER_CRITICAL(&snapshot_lock);
         snapshot = value;
@@ -1104,13 +1320,24 @@ static void task(void *argument)
     }
 }
 
-void voice_chat_init(void (*send)(const char *line))
+void voice_chat_init(void (*send)(const char *line),
+                     bool (*send_binary)(const uint8_t *data, size_t length),
+                     bool (*send_immediate)(const char *line))
 {
     send_line = send;
+    send_binary_line = send_binary;
+    send_immediate_line = send_immediate;
     timers_init();
     snapshot.alarm_minute = -1;
     events = xQueueCreate(64, sizeof(event_t));
-    if (events == NULL || xTaskCreate(task, "voice_timeline", 8192, NULL, 4, NULL) != pdPASS) {
+    input_events = xQueueCreate(INPUT_QUEUE_DEPTH, sizeof(event_t));
+    realtime_events = xQueueCreateWithCaps(REALTIME_QUEUE_DEPTH, sizeof(event_t),
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    event_ready = xSemaphoreCreateBinary();
+    if (events == NULL || input_events == NULL || realtime_events == NULL || event_ready == NULL ||
+        xTaskCreate(task, "voice_timeline", 8192, NULL, 5, NULL) != pdPASS ||
+        xTaskCreateWithCaps(realtime_tx_task, "realtime_tx", 4096, NULL, 6, NULL,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
         ESP_LOGE(TAG, "Unable to create voice timeline task");
     }
 }
@@ -1122,28 +1349,49 @@ bool voice_chat_receive(const cJSON *value)
     const cJSON *protocol = cJSON_GetObjectItemCaseSensitive(value, "protocol");
     if (events != NULL && cJSON_IsNumber(protocol) && protocol->valueint == CHAT_PROTOCOL) {
         event_t event = {.json = cJSON_PrintUnformatted(value)};
-        if (event.json != NULL && xQueueSend(events, &event, 0) != pdTRUE) free(event.json);
+        if (event.json != NULL) {
+            if (xQueueSend(events, &event, 0) == pdTRUE) xSemaphoreGive(event_ready);
+            else {
+                free(event.json);
+                portENTER_CRITICAL(&snapshot_lock);
+                diag_control_dropped++;
+                portEXIT_CRITICAL(&snapshot_lock);
+            }
+        }
     }
     return true;
 }
 
 void voice_chat_key(int key, bool pressed)
 {
-    if (events == NULL) return;
+    if (input_events == NULL) return;
     const event_t event = {.key = key, .down = pressed};
-    (void)xQueueSend(events, &event, 0);
+    if (xQueueSend(input_events, &event, 0) == pdTRUE) xSemaphoreGive(event_ready);
+    else {
+        portENTER_CRITICAL(&snapshot_lock);
+        diag_input_dropped++;
+        portEXIT_CRITICAL(&snapshot_lock);
+    }
 }
 
 void voice_chat_rotate(int delta)
 {
-    if (events == NULL) return;
+    if (input_events == NULL) return;
     const event_t event = {.delta = delta};
-    (void)xQueueSend(events, &event, 0);
+    if (xQueueSend(input_events, &event, 0) == pdTRUE) xSemaphoreGive(event_ready);
+    else {
+        portENTER_CRITICAL(&snapshot_lock);
+        diag_input_dropped++;
+        portEXIT_CRITICAL(&snapshot_lock);
+    }
 }
 
 void voice_chat_get_snapshot(voice_chat_snapshot_t *value)
 {
+    if (value == NULL) return;
     portENTER_CRITICAL(&snapshot_lock);
     *value = snapshot;
+    // Report the live loop position instead of the stored tail value.
+    value->stage = diag_stage;
     portEXIT_CRITICAL(&snapshot_lock);
 }

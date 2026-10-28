@@ -1,13 +1,9 @@
 dependencies:
   espressif/esp_websocket_client:
-    component_hash: dc00233af846f3a744ada283a300e0d586040aadc3ee67361645ecdce4523672
-    dependencies:
-    - name: idf
-      require: private
-      version: '>=5.0'
+    dependencies: []
     source:
-      registry_url: https://components.espressif.com/
-      type: service
+      path: /Users/jsy/test/2nd_app/firmware/easyinput-monitor/managed_components/espressif__esp_websocket_client
+      type: local
     version: 1.8.0
   idf:
     source:
@@ -15,6 +11,7 @@ dependencies:
     version: 5.5.5
 direct_dependencies:
 - espressif/esp_websocket_client
-manifest_hash: 8460fa05a00a794e5e428c79e4539892836280b0e1f2bc766ebe3a5cf626e37e
+- idf
+manifest_hash: 5362a478ae1467e9f9cc4bd22bcb934960e398550eb14f0dc8dd6f0b2bd9d33d
 target: esp32s3
 version: 2.0.0
