@@ -44,9 +44,11 @@ static health_edit_t health_edit;
 static ledger_edit_t ledger_edit;
 static bool realtime_active, mark_all_read_confirming, send_when_saved;
 static bool stt_s6_pressed, stt_s7_pressed, stt_round_started, stt_end_announced, stt_terminal_received;
-static bool stt_text_session, stt_text_result_pending, stt_text_failed;
+static bool stt_text_session, stt_text_result_pending, stt_text_failed, stt_engine_started;
 static int64_t stt_delivery_deadline;
 static unsigned received_texts, acked_texts, queued_texts;
+static unsigned prior_texts, delivery_results;
+static bool delivery_success, delivery_network;
 static char text_request_id[40], text_inflight_id[33];
 static uint32_t sequence;
 static int text_sends;
@@ -74,13 +76,14 @@ static stt_event_t queued[20];
 static int queued_count;
 static int64_t esp_timer_get_time(void) { return clock_us; }
 bool xiaozhi_stt_busy(void) { return worker_busy; }
-void xiaozhi_stt_get_snapshot(stt_snapshot_t *s) { *s=(stt_snapshot_t){.busy=worker_busy,.capturing=capturing,.received_texts=received_texts,.acked_texts=acked_texts,.queued_texts=queued_texts}; }
+void xiaozhi_stt_get_snapshot(stt_snapshot_t *s) { *s=(stt_snapshot_t){.busy=worker_busy,.capturing=capturing,.received_texts=received_texts,.acked_texts=acked_texts,.queued_texts=queued_texts,.session_queued_texts=received_texts-acked_texts}; }
 esp_err_t xiaozhi_dialogue_start(void) { starts++; if(start_error) return start_error; worker_busy=capturing=true; return ESP_OK; }
 void xiaozhi_dialogue_stop(void) { stops++; capturing=speaker_playing=false; }
-esp_err_t xiaozhi_stt_start(void) { text_starts++; if(start_error) return start_error; worker_busy=capturing=true; received_texts=acked_texts=queued_texts=0; return ESP_OK; }
+esp_err_t xiaozhi_stt_start(void) { text_starts++; if(start_error) return start_error; worker_busy=capturing=true; prior_texts=queued_texts; received_texts=acked_texts=0; return ESP_OK; }
+void xiaozhi_stt_delivery_result(bool success,bool network_ready) { delivery_results++; delivery_success=success; delivery_network=network_ready; }
 void xiaozhi_stt_stop(void) { text_stops++; capturing=false; }
-bool xiaozhi_stt_pending(stt_text_t *text) { if(text && queued_texts) { strcpy(text->id,"pending"); strcpy(text->text,"recognized sentence"); } return queued_texts>0; }
-bool xiaozhi_stt_ack(const char *id) { (void)id; if(!queued_texts) return false; queued_texts--; acked_texts++; return true; }
+bool xiaozhi_stt_pending(stt_text_t *text) { if(text && queued_texts) { strcpy(text->id,prior_texts ? "prior-pending" : "pending"); strcpy(text->text,"recognized sentence"); } return queued_texts>0; }
+bool xiaozhi_stt_ack(const char *id) { (void)id; if(!queued_texts) return false; queued_texts--; if(prior_texts) prior_texts--; else acked_texts++; return true; }
 bool xiaozhi_stt_poll(stt_event_t *e) { if(!queued_count) return false; *e=queued[0]; memmove(queued,queued+1,(size_t)--queued_count*sizeof(*queued)); return true; }
 static void push(stt_event_kind_t k) { assert(queued_count<20); queued[queued_count++]=(stt_event_t){.kind=k}; }
 static int audio_stop_speaker(void) { if(speaker_playing) interrupted++; speaker_playing=false; return ESP_OK; }
@@ -118,6 +121,7 @@ static void reset(void) {
   worker_busy=capturing=speaker_playing=prompt_playing=false;
   stt_s6_pressed=stt_s7_pressed=stt_round_started=stt_end_announced=stt_terminal_received=false;
   stt_text_session=stt_text_result_pending=stt_text_failed=false; stt_delivery_deadline=0;
+  stt_engine_started=delivery_success=delivery_network=false; prior_texts=delivery_results=0;
   received_texts=acked_texts=queued_texts=0; text_request_id[0]=text_inflight_id[0]=0;
   text_sends=0; text_retry_at=0; network_available=true;
   realtime_active=mark_all_read_confirming=send_when_saved=false;
@@ -250,7 +254,7 @@ int main(void) {
 
   // Quick cancellation never starts capture, and held keys cannot reopen a round.
   reset(); press(6,50000); press(6,50000); poll_text_result(clock_us); finish_prompts();
-  assert(text_starts==0 && text_stops==0 && count_played(PROMPT_TRANSCRIPT_FAILURE)==1 && mode==MODE_IDLE);
+  assert(text_starts==0 && text_stops==0 && count_played(PROMPT_TRANSCRIPT_FAILURE)==1 && mode==MODE_IDLE && delivery_results==0);
   reset(); press(6,50000); finish_prompts(); on_key(6,true);
   worker_busy=capturing=false; push(STT_FAILED); poll_stt_events(); poll_text_result(clock_us); finish_prompts();
   clock_us+=50000; on_key(6,false); finish_prompts(); assert(text_starts==1 && mode==MODE_IDLE);
@@ -258,10 +262,45 @@ int main(void) {
   worker_busy=capturing=false; push(STT_FAILED); poll_stt_events(); poll_text_result(clock_us); finish_prompts();
   begin(); on_key(6,false); assert(stops==0 && worker_busy && capturing); // Old S7 release cannot stop new S6.
   reset(); press(7,50000); assert(mode==MODE_IDLE && !prompt_length && text_starts==0);
-  for(int state=0;state<3;state++) {
-    reset(); realtime_active=state==0; if(state==1) strcpy(hold_id,"saved"); if(state==2) queued_texts=1;
+  for(int state=0;state<2;state++) {
+    reset(); realtime_active=state==0; if(state==1) strcpy(hold_id,"saved");
     press(6,50000); finish_prompts(); assert(text_starts==0 && count_played(PROMPT_TRANSCRIPT_FAILURE)==1);
   }
+  // Retained text is retried without blocking another S7 or counting old ACKs.
+  reset(); queued_texts=1; press(6,50000); finish_prompts();
+  assert(text_starts==1 && capturing && queued_texts==1 && prior_texts==1);
+  sync_text(clock_us); char old_text_id[33], old_text_req[40];
+  strcpy(old_text_id,text_inflight_id); strcpy(old_text_req,text_request_id);
+  handle_text_receipt("text.displayed",NULL,text_inflight_id,true);
+  assert(queued_texts==0 && acked_texts==0 && received_texts==0);
+  received_texts=queued_texts=1; sync_text(clock_us);
+  assert(strcmp(old_text_id,text_inflight_id)!=0);
+  handle_text_receipt("text.displayed",NULL,old_text_id,true);
+  handle_text_receipt("text.ack",old_text_req,old_text_id,true);
+  assert(acked_texts==0 && queued_texts==1);
+  handle_text_receipt("text.displayed",NULL,text_inflight_id,true);
+  assert(acked_texts==1 && !queued_texts);
+  press(6,50000); finish_prompts(); worker_busy=false; push(STT_FINISHED);
+  poll_stt_events(); poll_text_result(clock_us); finish_prompts();
+  assert(count_played(PROMPT_TRANSCRIPT_SUCCESS)==1 && delivery_success && delivery_results==1);
+  // An old late receipt cannot turn an empty new recognition into success.
+  reset(); queued_texts=1; press(6,50000); finish_prompts(); sync_text(clock_us);
+  handle_text_receipt("text.displayed",NULL,text_inflight_id,true);
+  press(6,50000); finish_prompts(); worker_busy=false; push(STT_EMPTY);
+  poll_stt_events(); poll_text_result(clock_us); finish_prompts();
+  assert(count_played(PROMPT_TRANSCRIPT_FAILURE)==1 && acked_texts==0 && !delivery_success);
+  // A display timeout keeps its text but the following round can start again.
+  reset(); press(6,50000); finish_prompts(); received_texts=queued_texts=1;
+  press(6,50000); finish_prompts(); worker_busy=false; push(STT_FINISHED); poll_stt_events();
+  clock_us+=ACK_TIMEOUT_US; network_available=false; poll_text_result(clock_us); finish_prompts();
+  assert(mode==MODE_IDLE && queued_texts==1 && delivery_results==1 && !delivery_success && !delivery_network);
+  press(6,50000); finish_prompts();
+  assert(text_starts==2 && capturing && queued_texts==1 && prior_texts==1);
+  // A rejected engine start records its own error without rewriting prior diagnostics.
+  reset(); start_error=-1; press(6,50000); finish_prompts();
+  poll_text_result(clock_us); finish_prompts();
+  assert(mode==MODE_IDLE && delivery_results==0 && count_played(PROMPT_TRANSCRIPT_FAILURE)==1);
+  start_error=0; press(6,50000); finish_prompts(); assert(text_starts==2 && capturing);
   reset(); begin(); queued_texts=1; strcpy(text_inflight_id,"old"); strcpy(text_request_id,"text-4");
   handle_text_receipt("text.displayed",NULL,"old",true); assert(queued_texts==1 && acked_texts==0);
   puts("actual S7 transcript, S6 conversation and immediate S5 controls passed");

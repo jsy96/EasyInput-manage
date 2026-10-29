@@ -18,6 +18,8 @@ typedef struct {
     // Chat rows, not server utterances: a long utterance can produce many rows.
     unsigned received_texts, acked_texts;
     size_t queued_texts;
+    // Current-session rows still in FIFO; cancellation clears these without ACKs.
+    size_t session_queued_texts;
 } stt_snapshot_t;
 void xiaozhi_stt_init(void);
 // S6 bidirectional, auto-turn conversation. STT results stay inside this session;
@@ -26,12 +28,14 @@ esp_err_t xiaozhi_dialogue_start(void);
 // Stops microphone/speaker locally before asynchronous network teardown.
 void xiaozhi_dialogue_stop(void);
 // S7 continuous transcription: queue every user STT result without playing replies.
-// Refuses a new session while older text still awaits delivery.
+// Older text remains ahead of this session in the delivery FIFO.
 esp_err_t xiaozhi_stt_start(void);
 // Stop sampling immediately, flush the tail, then collect final STT for 20 seconds.
 void xiaozhi_stt_stop(void);
 bool xiaozhi_stt_busy(void);
 void xiaozhi_stt_get_snapshot(stt_snapshot_t *snapshot);
+// Final S7 display result; an earlier engine failure remains the primary cause.
+void xiaozhi_stt_delivery_result(bool success, bool network_ready);
 // Capture-stop is latched separately from coalescible progress notifications.
 // It is emitted once after confirmed microphone teardown, before terminal events.
 bool xiaozhi_stt_poll(stt_event_t *event);

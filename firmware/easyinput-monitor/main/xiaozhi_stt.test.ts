@@ -58,7 +58,7 @@ static void log_failure(const char *stage, int code) { (void)stage; (void)code; 
 static uint8_t data[PCM_BYTES];
 static stt_stream_t stream;
 static stt_text_t pending, queue_storage[TEXT_QUEUE_CAPACITY], *text_queue = queue_storage, durable;
-static size_t text_head, text_count;
+static size_t text_head, text_count, prior_texts_remaining;
 static int persist_calls, persist_fail;
 static bool persist_text(const stt_text_t *t) { persist_calls++; if(persist_fail) return false; if(t) durable=*t; else memset(&durable,0,sizeof(durable)); return true; }
 static void xSemaphoreTake(int q, int wait) { (void)q; (void)wait; }
@@ -90,7 +90,7 @@ static bool stop_capture(void) {
 ${extract('xiaozhi_stt_stop')}
 static void reset(void) {
   memset(&pending,0,sizeof(pending)); memset(queue_storage,0,sizeof(queue_storage));
-  text_head=text_count=0; persist_calls=persist_fail=0;
+  text_head=text_count=prior_texts_remaining=0; persist_calls=persist_fail=0;
   busy=cancelled=stop_requested=stop_intent=pending_durable=false;
   transport_failed=capacity_failed=false;
   progress_count=notification_resets=0;
@@ -346,7 +346,7 @@ it('runs actual diagnostic lifecycle and emits capture-stopped once only after c
       if (start < 0) throw new Error(`Missing lifecycle function ${name}`)
       return source.slice(start, source.indexOf('\n}\n', start) + 3)
     }
-    writeFileSync(join(root, 'esp_err.h'), '#pragma once\ntypedef int esp_err_t;\n#define ESP_OK 0\n#define ESP_FAIL -1\n#define ESP_ERR_INVALID_STATE 0x103\n#define ESP_ERR_TIMEOUT 0x107\n')
+    writeFileSync(join(root, 'esp_err.h'), '#pragma once\ntypedef int esp_err_t;\n#define ESP_OK 0\n#define ESP_FAIL -1\n#define ESP_ERR_NO_MEM 0x101\n#define ESP_ERR_INVALID_RESPONSE 0x108\n#define ESP_ERR_INVALID_STATE 0x103\n#define ESP_ERR_TIMEOUT 0x107\n')
     writeFileSync(join(root, 'lifecycle.c'), `
 #include <assert.h>
 #include <stdbool.h>
@@ -354,10 +354,16 @@ it('runs actual diagnostic lifecycle and emits capture-stopped once only after c
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "xiaozhi_stt.h"
 #include "stt_stream.h"
 #define PCM_BYTES 64
+#define STT_JSON_BYTES 16384
+#define TEXT_QUEUE_CAPACITY 128
+#define TEXT_BATCH_MAX 17
+#define NVS_READWRITE 1
+#define ESP_ERR_NVS_NOT_FOUND 0x1102
 #define MALLOC_CAP_INTERNAL 1
 #define MALLOC_CAP_8BIT 2
 #define MALLOC_CAP_SPIRAM 4
@@ -371,8 +377,14 @@ static stt_snapshot_t diagnostics={.stage="idle"};
 static bool diagnostic_failed, capture_stopped_pending;
 static uint8_t pcm_storage[PCM_BYTES], *pcm=pcm_storage;
 static stt_stream_t stream;
-static stt_text_t pending;
-static size_t text_head, text_count;
+static stt_text_t pending, queue_storage[TEXT_QUEUE_CAPACITY], *text_queue=queue_storage, durable;
+static size_t text_head, text_count, prior_texts_remaining;
+typedef struct { size_t offset, length; } text_slice_t;
+typedef int nvs_handle_t;
+static int nvs_open(const char *name,int mode,nvs_handle_t *handle) { assert(!strcmp(name,"stt") && mode==NVS_READWRITE);*handle=1;return ESP_OK; }
+static int nvs_get_blob(nvs_handle_t handle,const char *key,void *text,size_t *length) { assert(handle==1 && !strcmp(key,"pending") && *length==sizeof(durable));memcpy(text,&durable,sizeof(durable));return durable.id[0]?ESP_OK:ESP_ERR_NVS_NOT_FOUND; }
+static void nvs_close(nvs_handle_t handle) { assert(handle==1); }
+static void esp_fill_random(void *data,size_t size) { static unsigned value;unsigned char *bytes=data;for(size_t i=0;i<size;i++)bytes[i]=(unsigned char)++value; }
 static int start_result, stop_result, starts, stops, worker_notifications, notification_resets;
 static bool hardware_active, persisted=true;
 static int speaker_stops;
@@ -410,8 +422,8 @@ static int audio_live_stop(void) {
 }
 static void xTaskNotifyGive(int task) { assert(task==worker);worker_notifications++; }
 static bool persist_pending_head(void) { assert(!capturing && !hardware_active);return persisted; }
-static bool persist_text(const stt_text_t *text) { assert(!text && !hardware_active);return persisted; }
-${['set_stage', 'log_failure', 'notify', 'stream_error', 'sink', 'stop_capture', 'capture_running', 'xiaozhi_dialogue_start', 'xiaozhi_dialogue_stop', 'xiaozhi_stt_start', 'xiaozhi_stt_stop', 'xiaozhi_stt_get_snapshot', 'xiaozhi_stt_poll', 'xiaozhi_stt_cancel'].map(extract).join('\n')}
+static bool persist_text(const stt_text_t *text) { assert(!hardware_active);if(!persisted)return false;if(text)durable=*text;else memset(&durable,0,sizeof(durable));return true; }
+${['set_stage', 'log_failure', 'notify', 'stream_error', 'capacity_error', 'sink', 'stop_capture', 'capture_running', 'utf8_next', 'unicode_space', 'valid_text', 'text_slices', 'enqueue_text', 'restore_pending_head', 'xiaozhi_dialogue_start', 'xiaozhi_dialogue_stop', 'xiaozhi_stt_start', 'xiaozhi_stt_stop', 'xiaozhi_stt_get_snapshot', 'xiaozhi_stt_delivery_result', 'xiaozhi_stt_ack', 'xiaozhi_stt_poll', 'xiaozhi_stt_cancel'].map(extract).join('\n')}
 static stt_snapshot_t snapshot(void) { stt_snapshot_t value;xiaozhi_stt_get_snapshot(&value);return value; }
 int main(void) {
   _Static_assert(STT_FULL==7 && STT_CAPTURE_STOPPED==8,"existing event values remain stable");
@@ -461,11 +473,13 @@ int main(void) {
   assert(!strstr(logs,"head") && !strstr(logs,"tail"));
   busy=false; pending.id[0]='p'; pending_durable=true; text_count=2;
   const int old_starts=starts, old_notifications=worker_notifications;
-  assert(xiaozhi_stt_start()==ESP_ERR_INVALID_STATE && starts==old_starts);
-  assert(pending.id[0]=='p' && pending_durable && text_count==2 && !snapshot().busy);
+  assert(xiaozhi_stt_start()==ESP_OK && starts==old_starts+1);
+  assert(snapshot().received_texts==0 && snapshot().acked_texts==0 && snapshot().queued_texts==3 && !snapshot().session_queued_texts);
+  assert(pending.id[0]=='p' && pending_durable && text_count==2 && snapshot().busy);
+  assert(stop_capture());busy=false;
   // Connecting does not capture speech and does not discard old pending text.
   assert(xiaozhi_dialogue_start()==ESP_OK && dialogue_session && snapshot().busy && !snapshot().capturing);
-  assert(starts==old_starts && worker_notifications==old_notifications+1 && !strcmp(snapshot().stage,"connecting"));
+  assert(starts==old_starts+1 && worker_notifications==old_notifications+2 && !strcmp(snapshot().stage,"connecting"));
   assert(pending.id[0]=='p' && pending_durable && text_count==2);
   assert(xiaozhi_dialogue_start()==ESP_ERR_INVALID_STATE);
   xiaozhi_stt_stop(); assert(!cancelled && !stop_intent && !stop_requested && !speaker_stops);
@@ -473,6 +487,53 @@ int main(void) {
   assert(speaker_stops==1 && pending.id[0]=='p' && pending_durable && text_count==2);
   xiaozhi_dialogue_stop(); assert(speaker_stops==1); // Idempotent stop cannot cut its own end cue.
   busy=false; cancelled=false; dialogue_session=false; xiaozhi_dialogue_stop(); assert(speaker_stops==1);
+  // The real restore path classifies the durable head as an earlier session.
+  pending=(stt_text_t){0};text_head=text_count=prior_texts_remaining=0;
+  diagnostics=(stt_snapshot_t){0};diagnostic_failed=false;
+  strcpy(durable.id,"11111111111111111111111111111111");strcpy(durable.text,"restored");
+  restore_pending_head();assert(storage_ready && pending_durable && prior_texts_remaining==1);
+  assert(snapshot().queued_texts==1 && !snapshot().session_queued_texts);
+  assert(xiaozhi_stt_ack(pending.id) && !snapshot().acked_texts && !snapshot().queued_texts);
+  // Failed ACK persistence retains both the prior boundary and the durable head.
+  assert(enqueue_text("older"));const stt_text_t older=pending;
+  assert(xiaozhi_stt_start()==ESP_OK && prior_texts_remaining==1);
+  assert(enqueue_text("current first") && enqueue_text("current second"));
+  assert(snapshot().received_texts==2 && snapshot().session_queued_texts==2 && snapshot().queued_texts==3);
+  assert(stop_capture());busy=false;persisted=false;
+  assert(!xiaozhi_stt_ack(older.id) && prior_texts_remaining==1 && !snapshot().acked_texts && snapshot().queued_texts==3);
+  persisted=true;assert(xiaozhi_stt_ack(older.id) && !prior_texts_remaining && !snapshot().acked_texts);
+  assert(!xiaozhi_stt_ack(older.id) && snapshot().session_queued_texts==2);
+  assert(xiaozhi_stt_ack(pending.id) && snapshot().acked_texts==1 && snapshot().session_queued_texts==1);
+  xiaozhi_stt_delivery_result(false,true);assert(!strcmp(snapshot().stage,"delivery.display_timeout") && snapshot().error==ESP_ERR_TIMEOUT);
+  // A new accepted start retains the previous unsent text and resets diagnostics.
+  assert(xiaozhi_stt_start()==ESP_OK && snapshot().received_texts==0 && !snapshot().session_queued_texts && snapshot().queued_texts==1);
+  assert(enqueue_text("retry current"));assert(xiaozhi_stt_ack(pending.id) && !snapshot().acked_texts);
+  assert(xiaozhi_stt_ack(pending.id) && snapshot().acked_texts==1 && !snapshot().session_queued_texts);
+  assert(stop_capture());busy=false;xiaozhi_stt_delivery_result(true,true);
+  assert(!strcmp(snapshot().stage,"delivered") && !snapshot().error);
+  // The queue holds one durable head plus 128 RAM rows; partial backlog is valid.
+  assert(enqueue_text("full head"));for(int i=0;i<TEXT_QUEUE_CAPACITY-1;i++)assert(enqueue_text("old"));
+  assert(xiaozhi_stt_start()==ESP_OK && prior_texts_remaining==TEXT_QUEUE_CAPACITY);
+  assert(enqueue_text("last slot"));assert(snapshot().queued_texts==TEXT_QUEUE_CAPACITY+1 && snapshot().session_queued_texts==1);
+  assert(stop_capture());busy=false;const int full_starts=starts;
+  assert(xiaozhi_stt_start()==ESP_ERR_NO_MEM && starts==full_starts && !snapshot().busy && !strcmp(snapshot().stage,"start.queue_full"));
+  assert(xiaozhi_stt_ack(pending.id) && snapshot().session_queued_texts==1);
+  assert(xiaozhi_stt_start()==ESP_OK && !snapshot().session_queued_texts && snapshot().queued_texts==TEXT_QUEUE_CAPACITY);
+  assert(enqueue_text("cancelled current"));assert(xiaozhi_stt_cancel());busy=false;
+  assert(!prior_texts_remaining && !snapshot().queued_texts && !snapshot().session_queued_texts && snapshot().acked_texts==0);
+  // Delivery diagnostics separate empty recognition, offline route, timeout and
+  // engine failure, preserving an existing first error even if its code is zero.
+  assert(xiaozhi_stt_start()==ESP_OK);assert(stop_capture());busy=false;
+  xiaozhi_stt_delivery_result(false,false);assert(!strcmp(snapshot().stage,"delivery.no_text"));
+  assert(xiaozhi_stt_start()==ESP_OK);assert(enqueue_text("offline"));assert(stop_capture());busy=false;
+  xiaozhi_stt_delivery_result(false,false);assert(!strcmp(snapshot().stage,"delivery.offline") && snapshot().error==ESP_ERR_INVALID_STATE);
+  assert(xiaozhi_stt_start()==ESP_OK);assert(enqueue_text("engine failed"));
+  assert(xiaozhi_stt_ack(pending.id) && xiaozhi_stt_ack(pending.id));assert(stop_capture());busy=false;
+  xiaozhi_stt_delivery_result(false,true);assert(!strcmp(snapshot().stage,"delivery.engine_failed"));
+  assert(xiaozhi_stt_start()==ESP_OK);log_failure("ws.connection_lost",0);assert(stop_capture());busy=false;
+  xiaozhi_stt_delivery_result(false,true);xiaozhi_stt_delivery_result(true,true);
+  assert(!strcmp(snapshot().stage,"ws.connection_lost") && snapshot().error==0);
+  assert(!guard_depth && !microphone_depth && !critical_depth);
   puts("STT diagnostic lifecycle passed");
 }
 `)

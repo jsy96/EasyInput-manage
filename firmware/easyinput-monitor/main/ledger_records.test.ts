@@ -37,7 +37,7 @@ static char hold_id[65], discarded_id[65];
 static int alarm_draft, timer_draft, last_prompt;
 static unsigned diag_s5_events, diag_s6_down_events, diag_s6_up_events, diag_s6_actions, diag_s7_events, diag_last_key_mode;
 static bool stt_busy, stt_pending, stt_s6_pressed, stt_s7_pressed, stt_text_session;
-static bool stt_text_result_pending, stt_text_failed, stt_round_started, stt_end_announced, stt_terminal_received;
+static bool stt_text_result_pending, stt_text_failed, stt_engine_started, stt_round_started, stt_end_announced, stt_terminal_received;
 static int64_t stt_delivery_deadline;
 static int stt_stops, text_stops;
 static unsigned deferred_timer_events;
@@ -87,7 +87,7 @@ ${['begin_recording_with_prompt', 'begin_dialogue', 'begin_transcription', 'canc
 static void reset_input(void) {
   mode = MODE_IDLE; job = JOB_IDLE; stop_prompt();
   stt_busy = stt_pending = stt_capturing = false;
-  stt_s6_pressed = stt_s7_pressed = stt_text_session = stt_text_result_pending = stt_text_failed = false;
+  stt_s6_pressed = stt_s7_pressed = stt_text_session = stt_text_result_pending = stt_text_failed = stt_engine_started = false;
   stt_stops = text_stops = 0; stt_delivery_deadline = 0;
   deferred_timer_events = 0;
   stt_round_started = stt_end_announced = stt_terminal_received = false;

@@ -840,6 +840,7 @@ static void emit_status(void)
     cJSON_AddNumberToObject(stt, "received_texts", stt_state.received_texts);
     cJSON_AddNumberToObject(stt, "acked_texts", stt_state.acked_texts);
     cJSON_AddNumberToObject(stt, "queued_texts", stt_state.queued_texts);
+    cJSON_AddNumberToObject(stt, "session_queued_texts", stt_state.session_queued_texts);
     cJSON *audio = cJSON_AddObjectToObject(root, "audio");
     cJSON_AddBoolToObject(audio, "ready", audio_state.ready && light_state.ready);
     cJSON_AddNumberToObject(audio, "sample_rate_hz", AUDIO_SAMPLE_RATE);

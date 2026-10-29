@@ -169,6 +169,7 @@ static bool stt_s7_pressed;
 static bool stt_text_session;
 static bool stt_text_result_pending;
 static bool stt_text_failed;
+static bool stt_engine_started;
 static int64_t stt_delivery_deadline;
 static bool stt_round_started;
 static bool stt_end_announced;
@@ -546,10 +547,11 @@ static void poll_text_result(int64_t now)
     stt_snapshot_t stt;
     xiaozhi_stt_get_snapshot(&stt);
     if (stt.capturing) return;
-    if (!stt_text_failed && stt.queued_texts && now < stt_delivery_deadline) return;
+    if (!stt_text_failed && stt.session_queued_texts && now < stt_delivery_deadline) return;
     const bool success = !stt_text_failed && stt.received_texts > 0 &&
-        stt.acked_texts == stt.received_texts && stt.queued_texts == 0;
+        stt.acked_texts == stt.received_texts && stt.session_queued_texts == 0;
     stt_text_result_pending = false;
+    if (stt_engine_started) xiaozhi_stt_delivery_result(success, network_fresh(now));
     start_prompt(success ? PROMPT_TRANSCRIPT_SUCCESS : PROMPT_TRANSCRIPT_FAILURE, PROMPT_ACTION_STT_ENDED);
 }
 
@@ -1059,6 +1061,7 @@ static void begin_dialogue(void)
     if (job != JOB_IDLE) finish_job();
     settings_commit_at = 0;
     stt_text_session = stt_text_result_pending = false;
+    stt_engine_started = false;
     stt_round_started = true;
     stt_end_announced = stt_terminal_received = false;
     mode = MODE_STT;
@@ -1068,7 +1071,7 @@ static void begin_dialogue(void)
 static void begin_transcription(void)
 {
     if (realtime_active || mode == MODE_RECORDING || mode == MODE_RECORD_READY || job == JOB_CACHE ||
-        hold_id[0] || uploading() || xiaozhi_stt_pending(NULL)) {
+        hold_id[0] || uploading()) {
         start_prompt(PROMPT_TRANSCRIPT_FAILURE, PROMPT_ACTION_NONE);
         return;
     }
@@ -1076,6 +1079,7 @@ static void begin_transcription(void)
     if (job != JOB_IDLE) finish_job();
     settings_commit_at = 0;
     stt_text_session = stt_text_result_pending = true;
+    stt_engine_started = false;
     stt_text_failed = false;
     stt_delivery_deadline = 0;
     stt_round_started = stt_end_announced = stt_terminal_received = false;
@@ -1690,7 +1694,7 @@ static void prompt_task_step(int64_t now)
                 if (result != ESP_OK) {
                     const stt_event_t failed = {.kind = STT_FAILED};
                     handle_stt_event(&failed);
-                } else stt_round_started = true;
+                } else stt_round_started = stt_engine_started = true;
             }
             else if (action == PROMPT_ACTION_STT_ENDED && stt_terminal_received && mode == MODE_STT &&
                      (!stt_text_session || !stt_text_result_pending)) {

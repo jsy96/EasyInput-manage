@@ -64,6 +64,9 @@ static bool diagnostic_failed, capture_stopped_pending;
 static stt_text_t pending;
 static stt_text_t *text_queue;
 static size_t text_head, text_count;
+// FIFO entries already present when the current session was accepted. Protected
+// by guard, so late receipts cannot be counted against the next session.
+static size_t prior_texts_remaining;
 static char device[18], client[37];
 // Owned by the WebSocket task. Never put a 16 KiB assembly copy on its stack.
 static char *ws_json;
@@ -1040,6 +1043,17 @@ static void run(void *arg)
         }
     }
 }
+static void restore_pending_head(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("stt", NVS_READWRITE, &h) == ESP_OK) {
+        size_t n = sizeof(pending); esp_err_t e = nvs_get_blob(h, "pending", &pending, &n);
+        storage_ready = e == ESP_ERR_NVS_NOT_FOUND || (e == ESP_OK && n == sizeof(pending) && strnlen(pending.id, sizeof(pending.id)) == 32 && strnlen(pending.text, sizeof(pending.text)) < sizeof(pending.text) && valid_text(pending.text));
+        nvs_close(h);
+    }
+    pending_durable = storage_ready && pending.id[0];
+    prior_texts_remaining = pending_durable ? 1 : 0;
+}
 void xiaozhi_stt_init(void)
 {
     guard = xSemaphoreCreateMutex(); microphone_guard = xSemaphoreCreateMutex();
@@ -1050,13 +1064,7 @@ void xiaozhi_stt_init(void)
     text_queue = heap_caps_calloc(TEXT_QUEUE_CAPACITY, sizeof(*text_queue), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!guard || !microphone_guard || !notifications || !incoming || !ws_json || !pcm || !text_queue) { log_failure("init.resources", ESP_ERR_NO_MEM); return; }
     stt_stream_init(&stream, pcm, PCM_BYTES);
-    nvs_handle_t h;
-    if (nvs_open("stt", NVS_READWRITE, &h) == ESP_OK) {
-        size_t n = sizeof(pending); esp_err_t e = nvs_get_blob(h, "pending", &pending, &n);
-        storage_ready = e == ESP_ERR_NVS_NOT_FOUND || (e == ESP_OK && n == sizeof(pending) && strnlen(pending.id, sizeof(pending.id)) == 32 && strnlen(pending.text, sizeof(pending.text)) < sizeof(pending.text) && valid_text(pending.text));
-        nvs_close(h);
-    }
-    pending_durable = storage_ready && pending.id[0];
+    restore_pending_head();
     // UUID creation/NVS commits happen before any session starts sampling.
     identity_ready = identity();
     if (!codec_init()) return;
@@ -1079,7 +1087,7 @@ esp_err_t xiaozhi_dialogue_start(void)
     cancelled = stop_requested = stop_intent = cancel_storage_failed = cancel_preparing = false;
     dialogue_session = true;
     busy = true;
-    xSemaphoreGive(guard);
+    prior_texts_remaining = text_count + (pending.id[0] ? 1 : 0);
     portENTER_CRITICAL(&capture_lock);
     stt_stream_init(&stream, pcm, PCM_BYTES);
     memset(&diagnostics, 0, sizeof(diagnostics));
@@ -1087,6 +1095,7 @@ esp_err_t xiaozhi_dialogue_start(void)
     diagnostic_failed = capture_stopped_pending = false;
     transport_failed = capacity_failed = capturing = false;
     portEXIT_CRITICAL(&capture_lock);
+    xSemaphoreGive(guard);
     // Do not collect speech during provisioning, activation or the hello wait.
     xTaskNotifyGive(worker);
     xSemaphoreGive(microphone_guard);
@@ -1113,12 +1122,13 @@ esp_err_t xiaozhi_stt_start(void)
     if (!guard || !worker || !storage_ready || !identity_ready) { log_failure("start.unavailable", ESP_ERR_INVALID_STATE); return ESP_ERR_INVALID_STATE; }
     xSemaphoreTake(microphone_guard, portMAX_DELAY);
     xSemaphoreTake(guard, portMAX_DELAY);
-    if (busy || capture_running() || pending.id[0] || text_count) { xSemaphoreGive(guard); xSemaphoreGive(microphone_guard); log_failure("start.busy_or_pending", ESP_ERR_INVALID_STATE); return ESP_ERR_INVALID_STATE; }
+    if (busy || capture_running()) { xSemaphoreGive(guard); xSemaphoreGive(microphone_guard); log_failure("start.busy", ESP_ERR_INVALID_STATE); return ESP_ERR_INVALID_STATE; }
+    if (pending.id[0] && text_count == TEXT_QUEUE_CAPACITY) { xSemaphoreGive(guard); xSemaphoreGive(microphone_guard); log_failure("start.queue_full", ESP_ERR_NO_MEM); return ESP_ERR_NO_MEM; }
     xQueueReset(notifications);
     cancelled = stop_requested = stop_intent = cancel_storage_failed = cancel_preparing = false;
     dialogue_session = false;
     busy = true;
-    xSemaphoreGive(guard);
+    prior_texts_remaining = text_count + (pending.id[0] ? 1 : 0);
     portENTER_CRITICAL(&capture_lock);
     stt_stream_init(&stream, pcm, PCM_BYTES);
     memset(&diagnostics, 0, sizeof(diagnostics));
@@ -1126,6 +1136,7 @@ esp_err_t xiaozhi_stt_start(void)
     diagnostic_failed = capture_stopped_pending = false;
     transport_failed = capacity_failed = false; capturing = true;
     portEXIT_CRITICAL(&capture_lock);
+    xSemaphoreGive(guard);
     const esp_err_t result = audio_live_start(sink);
     if (result == ESP_OK) xTaskNotifyGive(worker);
     else {
@@ -1168,8 +1179,25 @@ void xiaozhi_stt_get_snapshot(stt_snapshot_t *snapshot)
     snapshot->capturing = capturing;
     snapshot->captured_bytes = stream.accepted;
     snapshot->queued_texts = text_count + (pending.id[0] ? 1 : 0);
+    snapshot->session_queued_texts = snapshot->queued_texts - prior_texts_remaining;
     portEXIT_CRITICAL(&capture_lock);
     if (guard) xSemaphoreGive(guard);
+}
+void xiaozhi_stt_delivery_result(bool success, bool network_ready)
+{
+    if (!guard) return;
+    xSemaphoreTake(guard, portMAX_DELAY);
+    portENTER_CRITICAL(&capture_lock);
+    const bool failed = diagnostic_failed;
+    const unsigned received = diagnostics.received_texts, acked = diagnostics.acked_texts;
+    portEXIT_CRITICAL(&capture_lock);
+    if (!failed) {
+        if (success) set_stage("delivered");
+        else if (!received) log_failure("delivery.no_text", ESP_ERR_INVALID_RESPONSE);
+        else if (acked < received) log_failure(network_ready ? "delivery.display_timeout" : "delivery.offline", network_ready ? ESP_ERR_TIMEOUT : ESP_ERR_INVALID_STATE);
+        else log_failure("delivery.engine_failed", ESP_FAIL);
+    }
+    xSemaphoreGive(guard);
 }
 bool xiaozhi_stt_poll(stt_event_t *event)
 {
@@ -1203,9 +1231,12 @@ bool xiaozhi_stt_ack(const char *id)
         if (ok && next) { pending = *next; pending_durable = !live; text_head = (text_head + 1) % TEXT_QUEUE_CAPACITY; text_count--; }
         else if (ok) { memset(&pending, 0, sizeof(pending)); pending_durable = false; }
         if (ok) {
-            portENTER_CRITICAL(&capture_lock);
-            diagnostics.acked_texts++;
-            portEXIT_CRITICAL(&capture_lock);
+            if (prior_texts_remaining) prior_texts_remaining--;
+            else {
+                portENTER_CRITICAL(&capture_lock);
+                diagnostics.acked_texts++;
+                portEXIT_CRITICAL(&capture_lock);
+            }
         }
     }
     xSemaphoreGive(guard); return ok;
@@ -1221,7 +1252,7 @@ bool xiaozhi_stt_cancel(void)
     xSemaphoreTake(guard, portMAX_DELAY);
     const bool ok = !pending_durable || persist_text(NULL);
     cancel_storage_failed = !ok || !stopped;
-    if (ok) { memset(&pending, 0, sizeof(pending)); pending_durable = false; text_head = text_count = 0; }
+    if (ok) { memset(&pending, 0, sizeof(pending)); pending_durable = false; text_head = text_count = prior_texts_remaining = 0; }
     cancel_preparing = false;
     xSemaphoreGive(guard);
     return ok && stopped;
