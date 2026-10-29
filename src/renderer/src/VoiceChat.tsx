@@ -210,7 +210,7 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
         {messages.map(m => <div key={m.id} className={`chat-message ${m.sender === room.self?.id ? 'chat-mine' : ''}`}>
           <div className="chat-message-meta"><strong>{m.sender === 'board' ? '开发板' : m.name}</strong><span>{m.kind === 'text' ? '语音转文字' : m.sender === 'board' ? '录音' : '网页'}</span><time>{new Date(m.created).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</time></div>
           {m.kind === 'text' ? <p style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{m.text}</p> : urls[m.id] ? <audio controls autoPlay preload="metadata" ref={element => { players.current[m.id] = element }} onPlay={() => { stopSequence(); Object.entries(players.current).forEach(([id, player]) => { if (id !== m.id) player?.pause() }); setPlaying(true) }} onPause={() => setPlaying(false)} onEnded={() => setPlaying(false)} src={urls[m.id]} aria-label={`${m.name}的语音留言`} /> : <button className="button button-subtle chat-play" disabled={!room.connected || !!loading || busy} onClick={() => void load(m)}><Volume2 size={16} />{loading === m.id ? '加载语音…' : '播放语音'}<span>{Math.ceil(m.samples / 8000)}″</span></button>}
-          {m.kind !== 'text' && <small className={m.read ? 'is-live' : 'is-muted'}>{m.read ? '开发板已读' : '开发板未读'}</small>}
+          {m.kind !== 'text' && m.sender !== 'board' && <small className={m.read ? 'is-live' : 'is-muted'}>{m.read ? '开发板已读' : '开发板未读'}</small>}
         </div>)}
       </div>
       <div className="chat-compose">

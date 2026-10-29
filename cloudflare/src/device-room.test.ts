@@ -147,6 +147,59 @@ describe('shared voice room', () => {
     expect(snapshot).toMatchObject({ total: 5000, unread: 5000, messages: expect.any(Array), next: { id: synthetic(4950).id } })
     expect(snapshot.messages).toHaveLength(50)
   })
+  it.each(['current', 'legacy'])('corrects outgoing board recordings in %s history without changing browser read status or audio', async format => {
+    const outgoing = { ...synthetic(0), sender: 'board', name: '开发板' }
+    const incoming = synthetic(1), alreadyRead = synthetic(2, true)
+    const messages = [outgoing, incoming, alreadyRead]
+    const revision = format === 'current' ? 7 : 0
+    if (format === 'current') {
+      store.values.set('voice-revision', revision)
+      for (const m of messages) store.values.set(`voice-message:${m.id}`, m)
+    } else store.values.set('messages', messages)
+    const audio = new Uint8Array(900).fill(255).buffer
+    store.values.set(`clip:${outgoing.id}`, audio)
+    const board = socket('board')
+    vi.stubGlobal('WebSocketPair', class { 0 = new Socket(); 1 = new Socket() })
+    vi.stubGlobal('Response', class { constructor(_body: unknown, _init: unknown) {} })
+    await room.fetch(new Request('https://room.internal/ws?role=browser&client=history-viewer', { headers: { Upgrade: 'websocket' } }))
+    const browser = sockets.at(-1)!
+    const normalized = [{ ...outgoing, read: true }, incoming, alreadyRead]
+    expect(browser.frames[0]).toMatchObject({ total: 3, unread: 1, messages: normalized })
+    await chat(browser, 'list')
+    expect(browser.frames.at(-1)).toMatchObject({ total: 3, messages: normalized })
+    await chat(board, 'index', { offset: 0, count: 8, ifRevision: revision })
+    expect(board.frames.at(-1)).toMatchObject({ revision: revision + 1, items: [
+      { id: outgoing.id, read: true }, { id: incoming.id, read: false }, { id: alreadyRead.id, read: true },
+    ] })
+    await chat(board, 'index', { offset: 0 })
+    expect(board.frames.at(-1)).toMatchObject({ id: outgoing.id, read: true })
+    expect(store.values.get(`voice-message:${outgoing.id}`)).toEqual({ ...outgoing, read: true })
+    expect(store.values.get(`clip:${outgoing.id}`)).toEqual(audio)
+    await chat(browser, 'pull', { id: outgoing.id, index: 0 })
+    expect(browser.frames.at(-1)).toMatchObject({ op: 'audio', data: btoa(String.fromCharCode(...new Uint8Array(768).fill(255))) })
+
+    const savedTransactions = store.transaction.mock.calls.length
+    room = new DeviceRoomV2({ storage: store, getWebSockets: () => sockets, blockConcurrencyWhile: async (fn: () => Promise<unknown>) => fn() } as unknown as DurableObjectState)
+    await chat(browser, 'list')
+    expect(browser.frames.at(-1)).toMatchObject({ messages: normalized })
+    expect(store.transaction).toHaveBeenCalledTimes(savedTransactions)
+    await chat(board, 'readAll')
+    expect(board.frames.at(-1)).toMatchObject({ op: 'ack', count: 1 })
+    expect(browser.frames.at(-1)).toMatchObject({ op: 'readAll', total: 3, unread: 0 })
+  })
+  it('retries a failed board read-status correction without partially changing history', async () => {
+    const outgoing = { ...synthetic(0), sender: 'board', name: '开发板' }
+    store.values.set('voice-revision', 7)
+    store.values.set(`voice-message:${outgoing.id}`, outgoing)
+    const browser = socket()
+    store.put.mockRejectedValueOnce(new Error('Synthetic correction failure'))
+    await expect(chat(browser, 'list')).rejects.toThrow('Synthetic correction failure')
+    expect(store.values.get(`voice-message:${outgoing.id}`)).toEqual(outgoing)
+    expect(store.values.get('voice-revision')).toBe(7)
+    await chat(browser, 'list')
+    expect(browser.frames.at(-1)).toMatchObject({ messages: [{ ...outgoing, read: true }] })
+    expect(store.values.get('voice-revision')).toBe(8)
+  })
   it('retains 5000 and evicts the oldest eligible item while preserving unread browser messages', async () => {
     seed(5000)
     store.values.set(`voice-message:${synthetic(1).id}`, synthetic(1, true))
@@ -384,6 +437,16 @@ describe('shared voice room', () => {
     expect(([...store.values.keys()].filter(key => key.startsWith('voice-message:')))).toHaveLength(1)
     expect(first.frames.find(f => f.op === 'message')).toMatchObject({ message: { sender: 'board' } })
     expect(later.frames.find(f => f.op === 'message')).toMatchObject({ message: { sender: 'board' } })
+  })
+  it('excludes new board recordings from unread counts while browser recordings await playback', async () => {
+    const browser = socket(), board = socket('board')
+    await upload(browser, 'incoming-voice')
+    expect(browser.frames.filter(f => f.op === 'message').at(-1)).toMatchObject({ unread: 1, message: { sender: 'client', read: false } })
+    await upload(board, 'outgoing-voice')
+    expect(browser.frames.filter(f => f.op === 'message').at(-1)).toMatchObject({ total: 2, unread: 1, message: { sender: 'board', read: true } })
+    expect(store.values.get('voice-message:outgoing-voice')).toMatchObject({ sender: 'board', read: true })
+    await chat(board, 'read', { id: 'incoming-voice' })
+    expect(browser.frames.filter(f => f.op === 'message').at(-1)).toMatchObject({ total: 2, unread: 0, message: { id: 'incoming-voice', read: true } })
   })
   it('remembers a committed board recording after history eviction and a lost acknowledgement', async () => {
     const board = socket('board'), browser = socket()

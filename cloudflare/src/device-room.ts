@@ -44,6 +44,10 @@ export class DeviceRoomV2 {
           await tx.delete('messages')
         })
       }
+      // Board recordings are outgoing messages, including those saved by older versions.
+      // Persist the correction with a new revision so cached board indexes refresh too.
+      const normalized = this.history.map(m => m.sender === 'board' && !m.read ? { ...m, read: true } : m)
+      if (normalized.some((m, index) => m !== this.history[index])) await this.saveMessages(normalized)
     }).catch(error => { this.historyReady = null; this.history = []; throw error })
     await this.historyReady
   }
@@ -71,7 +75,7 @@ export class DeviceRoomV2 {
     return { messages, next: eligible.length > messages.length ? { created: messages[0].created, id: messages[0].id } : null,
       through: upper ? { created: upper.created, id: upper.id } : null, total: this.history.filter(m => !upper || compareMessages(m, upper) <= 0).length }
   }
-  private stats(): Frame { return { total: this.history.length, unread: this.history.filter(m => !m.read).length } }
+  private stats(): Frame { return { total: this.history.length, unread: this.history.filter(m => m.sender !== 'board' && !m.read).length } }
   private async audioChunk(id: string, index: number, clip?: ArrayBuffer): Promise<string> {
     const bytes = clip ?? await this.state.storage.get<ArrayBuffer>(`clip:${id}`)
     if (bytes) return btoa(String.fromCharCode(...new Uint8Array(bytes).subarray(index * AUDIO_CHUNK, (index + 1) * AUDIO_CHUNK)))
@@ -523,7 +527,7 @@ export class DeviceRoomV2 {
         audio.set(Uint8Array.from(atob(data), c => c.charCodeAt(0)), index * AUDIO_CHUNK)
       }
       // Keep commit times monotonic so a fixed history cursor excludes later uploads.
-      const m: ChatMessage = { id, sender, name: upload.name, samples: upload.samples, created: Math.max(Date.now(), (this.history.at(-1)?.created ?? 0) + 1), read: false }
+      const m: ChatMessage = { id, sender, name: upload.name, samples: upload.samples, created: Math.max(Date.now(), (this.history.at(-1)?.created ?? 0) + 1), read: sender === 'board' }
       items.push(m)
       const remove = [`upload:${id}`, ...Array.from({ length: upload.next }, (_, i) => `audio:${id}:${i}`)]
       if (old) remove.push(`clip:${old.id}`, ...Array.from({ length: Math.ceil(old.samples / AUDIO_CHUNK) }, (_, i) => `audio:${old!.id}:${i}`))
