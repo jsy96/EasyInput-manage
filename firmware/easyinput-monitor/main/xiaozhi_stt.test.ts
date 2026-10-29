@@ -128,6 +128,23 @@ int main(void) {
   assert(text_slices("bad\\xed\\xa0\\x80",slices)==-1);
   const size_t before=text_count; assert(!enqueue_text("bad\\xed\\xa0\\x80") && text_count==before);
 
+  // One long server utterance becomes three chat rows, all of which must be
+  // acknowledged. Repeating the same speech is a new utterance with new IDs.
+  reset(); busy=true; receive("stt",text);
+  stt_snapshot_t split; xiaozhi_stt_get_snapshot(&split);
+  assert(split.received_texts==3 && split.acked_texts==0 && split.queued_texts==3);
+  const stt_text_t split_first=pending;
+  assert(xiaozhi_stt_ack(pending.id) && xiaozhi_stt_ack(pending.id) && xiaozhi_stt_ack(pending.id));
+  assert(!xiaozhi_stt_ack(split_first.id));
+  xiaozhi_stt_get_snapshot(&split);
+  assert(split.received_texts==3 && split.acked_texts==3 && split.queued_texts==0 && persist_calls==0);
+  receive("stt",text); assert(strcmp(pending.id,split_first.id));
+  xiaozhi_stt_get_snapshot(&split);
+  assert(split.received_texts==6 && split.acked_texts==3 && split.queued_texts==3);
+  assert(xiaozhi_stt_ack(pending.id) && xiaozhi_stt_ack(pending.id) && xiaozhi_stt_ack(pending.id));
+  xiaozhi_stt_get_snapshot(&split);
+  assert(split.received_texts==6 && split.acked_texts==6 && !split.queued_texts && persist_calls==0);
+
   reset(); busy=true;
   receive("stt","第一句"); receive("tts",NULL); receive("llm","assistant reply");
   receive("stt","第二句"); receive("tts",NULL); receive("stt","第三句");
@@ -157,6 +174,7 @@ int main(void) {
   const stt_text_t head=pending, oldest=text_queue[text_head];
   assert(!enqueue_text("overflow") && text_count==TEXT_QUEUE_CAPACITY && capacity_exhausted());
   assert(!memcmp(&head,&pending,sizeof(head)) && !memcmp(&oldest,&text_queue[text_head],sizeof(oldest)));
+  xiaozhi_stt_get_snapshot(&snapshot); assert(snapshot.received_texts==TEXT_QUEUE_CAPACITY+1 && !snapshot.acked_texts);
   reset(); capturing=false; persist_fail=1; assert(!enqueue_text("save failure") && !pending.id[0] && text_count==0);
 
   reset();
@@ -443,11 +461,14 @@ int main(void) {
   assert(!strstr(logs,"head") && !strstr(logs,"tail"));
   busy=false; pending.id[0]='p'; pending_durable=true; text_count=2;
   const int old_starts=starts, old_notifications=worker_notifications;
+  assert(xiaozhi_stt_start()==ESP_ERR_INVALID_STATE && starts==old_starts);
+  assert(pending.id[0]=='p' && pending_durable && text_count==2 && !snapshot().busy);
   // Connecting does not capture speech and does not discard old pending text.
   assert(xiaozhi_dialogue_start()==ESP_OK && dialogue_session && snapshot().busy && !snapshot().capturing);
   assert(starts==old_starts && worker_notifications==old_notifications+1 && !strcmp(snapshot().stage,"connecting"));
   assert(pending.id[0]=='p' && pending_durable && text_count==2);
   assert(xiaozhi_dialogue_start()==ESP_ERR_INVALID_STATE);
+  xiaozhi_stt_stop(); assert(!cancelled && !stop_intent && !stop_requested && !speaker_stops);
   xiaozhi_dialogue_stop(); assert(cancelled && stop_intent && !hardware_active && !snapshot().capturing);
   assert(speaker_stops==1 && pending.id[0]=='p' && pending_durable && text_count==2);
   xiaozhi_dialogue_stop(); assert(speaker_stops==1); // Idempotent stop cannot cut its own end cue.
@@ -780,5 +801,199 @@ int main(void) {
 `)
     execFileSync('cc', ['-std=c11', '-Wall', '-Wextra', '-Werror', join(root, 'dispatch.c'), '-o', join(root, 'dispatch')])
     expect(execFileSync(join(root, 'dispatch'), { encoding: 'utf8' })).toContain('codec task dispatch, completion and initialization checks passed')
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+
+it('keeps one continuous transcription session through multiple utterances and the complete final drain window', () => {
+  const root = mkdtempSync(join(tmpdir(), 'easyinput-stt-session-'))
+  try {
+    const sourceDir = resolve('firmware/easyinput-monitor/main')
+    const source = readFileSync(join(sourceDir, 'xiaozhi_stt.c'), 'utf8')
+    const extract = (name: string) => {
+      const start = source.search(new RegExp('static [^\\n]+[ *]' + name + '\\([^;]*?\\)\\n\\{'))
+      if (start < 0) throw new Error('Missing session function ' + name)
+      return source.slice(start, source.indexOf('\n}\n', start) + 3)
+    }
+    writeFileSync(join(root, 'esp_err.h'), '#pragma once\ntypedef int esp_err_t;\n#define ESP_OK 0\n')
+    const prelude = String.raw`
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "xiaozhi_stt.h"
+#include "stt_stream.h"
+#define STT_JSON_BYTES 16384
+#define TEXT_BATCH_MAX 17
+#define AUDIO_SAMPLE_RATE 16000
+#define DECODED_PCM_BYTES 3840
+#define CODEC_STACK_BYTES 49152
+#define ESP_FAIL -1
+#define ESP_ERR_NO_MEM 0x101
+#define ESP_ERR_NOT_SUPPORTED 0x106
+#define ESP_ERR_TIMEOUT 0x107
+#define ESP_ERR_INVALID_RESPONSE 0x108
+#define ESP_ERR_INVALID_STATE 0x103
+#define ESP_AUDIO_ERR_OK 0
+#define ESP_OPUS_DEC_FRAME_DURATION_120_MS 120
+#define ESP_OPUS_ENC_FRAME_DURATION_60_MS 60
+#define ESP_OPUS_DEC_CONFIG_DEFAULT() ((esp_opus_dec_cfg_t){0})
+#define ESP_OPUS_ENC_CONFIG_DEFAULT() ((esp_opus_enc_config_t){0})
+#define WEBSOCKET_EVENT_ANY -1
+#define pdTRUE 1
+#define portMAX_DELAY 0
+#define pdMS_TO_TICKS(n) (n)
+#define esp_crt_bundle_attach NULL
+#define portENTER_CRITICAL(p) ((void)(p))
+#define portEXIT_CRITICAL(p) ((void)(p))
+#define ESP_LOGI(tag, ...) test_log(__VA_ARGS__)
+typedef int esp_audio_err_t;
+typedef void *esp_websocket_client_handle_t;
+typedef struct { const char *uri; void *crt_bundle_attach; bool disable_auto_reconnect; int network_timeout_ms, buffer_size, task_stack; } esp_websocket_client_config_t;
+typedef struct { int sample_rate, channel, frame_duration; } esp_opus_dec_cfg_t;
+typedef struct { int sample_rate, channel, bitrate, frame_duration; } esp_opus_enc_config_t;
+typedef struct { uint8_t *buffer; size_t len; } esp_audio_enc_in_frame_t;
+typedef struct { uint8_t *buffer; size_t len; unsigned encoded_bytes; } esp_audio_enc_out_frame_t;
+typedef enum { CODEC_ENCODER_OPEN, CODEC_ENCODER_SIZE, CODEC_ENCODE, CODEC_ENCODER_CLOSE, CODEC_DECODER_OPEN, CODEC_DECODER_RESET, CODEC_DECODE, CODEC_DECODER_CLOSE } codec_operation_t;
+typedef struct { codec_operation_t operation; void *handle, *input, *output, *info; uint32_t config_size; esp_audio_err_t result; } codec_job_t;
+typedef struct cJSON { const char *valuestring; int valueint; bool number; struct cJSON *children[12]; const char *keys[12]; size_t count; } cJSON;
+typedef struct { char json[STT_JSON_BYTES]; size_t length; bool binary; } incoming_t;
+typedef struct { size_t offset, length; } text_slice_t;
+typedef struct { void *decoder; int16_t *decoded; bool awaiting_reply, replying, tts_stopped; int64_t activity_at; } dialogue_t;
+typedef struct { bool vad; int microphone_error; } audio_snapshot_t;
+static stt_stream_t stream;
+static uint8_t pcm[8192];
+static stt_snapshot_t diagnostics;
+static int capture_lock, incoming=1, microphone_guard=2, codec_worker=3;
+static bool dialogue_session, connected, heard=true, connection_failure;
+static int64_t clock_us, stop_at, stop_sent_at;
+static unsigned listen_starts, listen_stops, aborts, binary_frames, speaker_calls, cleanup_calls;
+static const char *device="test-device", *client="test-client";
+static size_t ws_used, ws_expected, ws_frame_start;
+static bool ws_accepting, ws_binary;
+static size_t script_head, script_count;
+static const struct { int64_t at; const char *key; } script[] = {
+  {100000,"first"}, {200000,"tts"}, {300000,"llm"}, {500000,"second"},
+  {19000000,"last"}, {21010000,"too-late"},
+};
+static char rows[8][40];
+static unsigned row_count;
+static void test_log(const char *format,...) { (void)format; }
+static unsigned uxTaskGetStackHighWaterMark(int task) { assert(task==codec_worker);return CODEC_STACK_BYTES; }
+static int64_t esp_timer_get_time(void) { return clock_us; }
+static void set_stage(const char *stage) { (void)stage; }
+static void log_failure(const char *stage,int code) { (void)stage;(void)code; }
+static void *psram_alloc(size_t size,const char *stage) { (void)stage;return malloc(size); }
+static bool is_cancelled(void) { return false; }
+static bool stream_failed(void) { return false; }
+static bool capacity_exhausted(void) { return false; }
+static bool is_stopping(void) { return clock_us>=stop_at; }
+static bool stop_capture(void) { cleanup_calls++;return true; }
+static void xSemaphoreTake(int h,int wait) { (void)h;(void)wait; }
+static void xSemaphoreGive(int h) { (void)h; }
+static int audio_stop_speaker(void) { speaker_calls++;return ESP_OK; }
+static void audio_get_snapshot(audio_snapshot_t *audio) { *audio=(audio_snapshot_t){.vad=heard}; }
+static bool microphone_healthy(const audio_snapshot_t *audio) { (void)audio;return true; }
+static void vTaskDelay(int ticks) {
+  const int64_t next=clock_us+(int64_t)ticks*1000;
+  if(clock_us<stop_at) {
+    const size_t length=(size_t)((next<stop_at?next:stop_at)-clock_us)*32/1000;
+    uint8_t samples[1600]={0};assert(length<=sizeof(samples));
+    assert(stt_stream_write(&stream,samples,length));
+  }
+  clock_us=next;assert(clock_us<22000000);
+}
+#undef strlcpy
+#define strlcpy stt_session_strlcpy
+static size_t strlcpy(char *dst,const char *src,size_t n) { size_t size=strlen(src);if(n) { size_t used=size<n-1?size:n-1;memcpy(dst,src,used);dst[used]=0; }return size; }
+static cJSON *cJSON_CreateObject(void) { cJSON *node=calloc(1,sizeof(*node));assert(node);return node; }
+static cJSON *add(cJSON *object,const char *key) { assert(object->count<12);cJSON *child=cJSON_CreateObject();object->keys[object->count]=key;object->children[object->count++]=child;return child; }
+static void cJSON_AddStringToObject(cJSON *object,const char *key,const char *value) { add(object,key)->valuestring=value; }
+static void cJSON_AddNumberToObject(cJSON *object,const char *key,int value) { cJSON *node=add(object,key);node->number=true;node->valueint=value; }
+static cJSON *cJSON_AddObjectToObject(cJSON *object,const char *key) { return add(object,key); }
+static const cJSON *cJSON_GetObjectItemCaseSensitive(const cJSON *object,const char *key) { if(object)for(size_t i=0;i<object->count;i++)if(!strcmp(object->keys[i],key))return object->children[i];return NULL; }
+static bool cJSON_IsString(const cJSON *node) { return node && node->valuestring; }
+static bool cJSON_IsNumber(const cJSON *node) { return node && node->number; }
+static void cJSON_Delete(cJSON *object) { if(object) { for(size_t i=0;i<object->count;i++)cJSON_Delete(object->children[i]);free(object); } }
+static cJSON *cJSON_Parse(const char *key) {
+  cJSON *event=cJSON_CreateObject();
+  const char *type=!strcmp(key,"tts")?"tts":!strcmp(key,"llm")?"llm":"stt";
+  cJSON_AddStringToObject(event,"type",type);
+  cJSON_AddStringToObject(event,"text",!strcmp(type,"stt")?script[script_head-1].key:"assistant text");
+  cJSON_AddStringToObject(event,"state","stop");return event;
+}
+static int text_slices(const char *text,text_slice_t slices[TEXT_BATCH_MAX]) { slices[0]=(text_slice_t){.length=strlen(text)};return text[0]?1:0; }
+static bool enqueue_text(const char *text) { assert(row_count<8);strlcpy(rows[row_count++],text,sizeof(rows[0]));return true; }
+static void ws_event(void) {}
+static esp_websocket_client_handle_t esp_websocket_client_init(const esp_websocket_client_config_t *config) { assert(!strcmp(config->uri,"wss://synthetic"));return (void *)1; }
+static void esp_websocket_client_append_header(void *ws,const char *key,const char *value) { assert(ws);(void)key;(void)value; }
+static void xQueueReset(int q) { assert(q==incoming); }
+static void esp_websocket_register_events(void *ws,int any,void (*callback)(void),void *arg) { assert(ws && any==WEBSOCKET_EVENT_ANY && callback==ws_event && !arg); }
+static int esp_websocket_client_start(void *ws) { assert(ws);connected=true;return ESP_OK; }
+static bool esp_websocket_client_is_connected(void *ws) { assert(ws);return connected && !(connection_failure && clock_us>=700000); }
+static bool send_json(void *ws,cJSON *json) {
+  assert(ws);const cJSON *type=cJSON_GetObjectItemCaseSensitive(json,"type");assert(cJSON_IsString(type));
+  if(!strcmp(type->valuestring,"listen")) {
+    const cJSON *state=cJSON_GetObjectItemCaseSensitive(json,"state");assert(cJSON_IsString(state));
+    if(!strcmp(state->valuestring,"start")) { const cJSON *mode=cJSON_GetObjectItemCaseSensitive(json,"mode");assert(cJSON_IsString(mode) && !strcmp(mode->valuestring,"realtime"));listen_starts++; }
+    else { assert(!strcmp(state->valuestring,"stop"));listen_stops++;stop_sent_at=clock_us; }
+  } else if(!strcmp(type->valuestring,"abort"))aborts++;
+  else assert(!strcmp(type->valuestring,"hello"));
+  cJSON_Delete(json);return true;
+}
+static cJSON *wait_type(const char *type,int wait) { assert(!strcmp(type,"hello") && wait==10000);cJSON *hello=cJSON_CreateObject();cJSON_AddStringToObject(hello,"session_id","synthetic-session");cJSON_AddStringToObject(hello,"transport","websocket");return hello; }
+static int codec_call(codec_job_t *job) {
+  switch(job->operation) {
+    case CODEC_ENCODER_OPEN: *(void **)job->output=(void *)2;break;
+    case CODEC_ENCODER_SIZE: *(int *)job->input=1920;*(int *)job->output=4000;break;
+    case CODEC_ENCODE: { esp_audio_enc_out_frame_t *out=job->output;out->encoded_bytes=8;memset(out->buffer,0,8);break; }
+    case CODEC_ENCODER_CLOSE: break;
+    default: assert(!"transcription must never open/decode assistant audio");
+  }
+  return ESP_AUDIO_ERR_OK;
+}
+static int esp_websocket_client_send_bin(void *ws,const char *data,int bytes,int wait) { assert(ws && data && bytes==8 && wait==3000);binary_frames++;return bytes; }
+static void esp_websocket_client_stop(void *ws) { assert(ws);connected=false; }
+static void esp_websocket_client_destroy(void *ws) { assert(ws); }
+static int xQueueReceive(int q,incoming_t *event,int wait) {
+  assert(q==incoming && !wait);if(script_head>=script_count || script[script_head].at>clock_us)return 0;
+  strlcpy(event->json,script[script_head++].key,sizeof(event->json));event->binary=false;return pdTRUE;
+}
+static bool dialogue_audio_params(const cJSON *params) { (void)params;assert(!"dialogue only");return false; }
+static bool dialogue_resume_capture(void) { assert(!"dialogue only");return false; }
+static bool dialogue_receive_audio(dialogue_t *state,incoming_t *event,int protocol) { (void)state;(void)event;(void)protocol;assert(!"dialogue only");return false; }
+static bool dialogue_receive_json(dialogue_t *state,const cJSON *json) { (void)state;(void)json;assert(!"dialogue only");return false; }
+static bool dialogue_next_turn(dialogue_t *state,void *ws,const char *session) { (void)state;(void)ws;(void)session;assert(!"dialogue only");return false; }
+`
+    const main = String.raw`
+static void reset(void) {
+  memset(&diagnostics,0,sizeof(diagnostics));stt_stream_init(&stream,pcm,sizeof(pcm));
+  clock_us=0;stop_at=1000000;stop_sent_at=0;script_head=0;script_count=6;
+  listen_starts=listen_stops=aborts=binary_frames=speaker_calls=cleanup_calls=row_count=0;
+  connected=connection_failure=false;heard=true;
+}
+int main(void) {
+  cJSON *provisioning=cJSON_CreateObject();cJSON *config=cJSON_AddObjectToObject(provisioning,"websocket");
+  cJSON_AddStringToObject(config,"url","wss://synthetic");cJSON_AddNumberToObject(config,"version",1);
+  reset();assert(transcribe(provisioning)==STT_FINISHED);
+  assert(clock_us==21000000 && stop_sent_at==1000000 && script_head==5);
+  assert(listen_starts==1 && listen_stops==1 && aborts==1 && binary_frames>=16);
+  assert(row_count==3 && !strcmp(rows[0],"first") && !strcmp(rows[1],"second") && !strcmp(rows[2],"last"));
+  assert(stream.consumed==stream.accepted && diagnostics.sent_bytes==stream.accepted);
+  assert(!speaker_calls && cleanup_calls==1);
+  reset();script_count=0;heard=false;assert(transcribe(provisioning)==STT_EMPTY && !row_count);
+  reset();script_count=0;assert(transcribe(provisioning)==STT_FAILED && !row_count);
+  reset();connection_failure=true;assert(transcribe(provisioning)==STT_FAILED);
+  assert(row_count==2 && !strcmp(rows[0],"first") && !strcmp(rows[1],"second"));
+  assert(!listen_stops && listen_starts==1 && !speaker_calls && cleanup_calls==1);
+  cJSON_Delete(provisioning);puts("continuous transcription session passed");
+}
+`
+    writeFileSync(join(root, 'session.c'), prelude + '\n' + ['listen_frame', 'receive_message', 'transcribe'].map(extract).join('\n') + '\n' + main)
+    execFileSync('cc', ['-std=c11', '-Wall', '-Wextra', '-Werror', '-I', root, '-I', sourceDir,
+      join(root, 'session.c'), join(sourceDir, 'stt_stream.c'), '-o', join(root, 'session')], { encoding: 'utf8' })
+    expect(execFileSync(join(root, 'session'), { encoding: 'utf8' })).toContain('continuous transcription session passed')
   } finally { rmSync(root, { recursive: true, force: true }) }
 })

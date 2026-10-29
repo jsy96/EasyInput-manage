@@ -247,7 +247,7 @@ export class DeviceRoomV2 {
   }
   private async chat(socket: WebSocket, v: Frame, board: boolean, locked = false): Promise<void> {
     if (v.protocol !== CHAT_VERSION) return
-    if (['begin', 'chunk', 'chunks', 'commit', 'read', 'readAll', 'text.put', 'ledger.put', 'ledger.summary'].includes(String(v.op)) && !locked) {
+    if (['begin', 'chunk', 'chunks', 'commit', 'read', 'readAll', 'text.put', 'text.displayed', 'ledger.put', 'ledger.summary'].includes(String(v.op)) && !locked) {
       // Expected upload errors must leave the concurrency gate normally, otherwise the runtime resets the object.
       let failed = false, failure: unknown
       await this.state.blockConcurrencyWhile(async () => {
@@ -263,15 +263,35 @@ export class DeviceRoomV2 {
     }
     const sender = board ? 'board' : a.client!
     const id = v.id
+    if (v.op === 'text.displayed') {
+      if (board || a.role !== 'browser' || !validId(id)) throw new Error('文字显示回执格式错误')
+      const message = this.history.find(m => m.id === id)
+      if (message?.kind !== 'text' || message.sender !== 'board') throw new Error('文字消息不存在')
+      // A cloud save alone is not a display receipt. Browsers send this only
+      // after the chat component has committed the text to its DOM.
+      if (await this.state.storage.get<boolean>(`displayed:${id}`) !== true) await this.state.storage.put(`displayed:${id}`, true)
+      reply('text.displayed', { id })
+      this.toBoard(frame('text.displayed', { id }))
+      return
+    }
     if (v.op === 'text.put') {
-      if (!board || !validId(id) || typeof v.text !== 'string' || !v.text.trim() || v.text.length > CHAT_TEXT_LIMIT) throw new Error('转写文字格式错误')
+      if (!board || !validId(id) || typeof v.text !== 'string' || !v.text.trim() || v.text.length > CHAT_TEXT_LIMIT ||
+        (v.require_display !== undefined && typeof v.require_display !== 'boolean')) throw new Error('转写文字格式错误')
       const items = await this.messages(), existing = items.find(m => m.id === id)
       if (existing) {
         if (existing.kind !== 'text' || existing.text !== v.text.trim()) throw new Error('消息 ID 已占用')
-        reply('text.ack', { id }); return
+        const displayed = await this.state.storage.get<boolean>(`displayed:${id}`) === true
+        reply('text.ack', { id, displayed })
+        // Re-deliver retained text when a display receipt was lost or no chat
+        // component was mounted for the first broadcast. Keep counts unchanged.
+        if (v.require_display === true && !displayed) this.broadcast(frame('message', { message: existing, added: false, display_required: true, ...this.stats() }), true)
+        return
       }
       const delivered = await this.state.storage.get<true | 'text'>(`delivered:${id}`)
-      if (delivered === 'text') { reply('text.ack', { id }); return }
+      if (delivered === 'text') {
+        reply('text.ack', { id, displayed: await this.state.storage.get<boolean>(`displayed:${id}`) === true })
+        return
+      }
       if (delivered) throw new Error('消息 ID 已占用')
       let old: ChatMessage | undefined
       if (items.length >= CHAT_LIMIT) {
@@ -285,7 +305,7 @@ export class DeviceRoomV2 {
       const remove = old ? [`clip:${old.id}`, ...Array.from({ length: Math.ceil(old.samples / AUDIO_CHUNK) }, (_, i) => `audio:${old!.id}:${i}`)] : []
       await this.saveMessages(items, { [`delivered:${id}`]: 'text' }, remove)
       if (old) this.broadcast(frame('pruned', { ids: [old.id], ...this.stats() }), true)
-      reply('text.ack', { id })
+      reply('text.ack', { id, displayed: false })
       this.broadcast(frame('message', { message: m, added: true, ...this.stats() }), true)
       return
     }

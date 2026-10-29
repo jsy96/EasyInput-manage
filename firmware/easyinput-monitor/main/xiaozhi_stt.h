@@ -15,17 +15,20 @@ typedef struct {
     char stage[40];
     int error;
     uint64_t captured_bytes, sent_bytes;
+    // Chat rows, not server utterances: a long utterance can produce many rows.
     unsigned received_texts, acked_texts;
     size_t queued_texts;
 } stt_snapshot_t;
 void xiaozhi_stt_init(void);
-// Bidirectional, auto-turn conversation. STT results stay inside this session;
-// legacy pending texts and their delivery receipts are preserved.
+// S6 bidirectional, auto-turn conversation. STT results stay inside this session;
+// pending transcriptions and their delivery receipts are preserved.
 esp_err_t xiaozhi_dialogue_start(void);
 // Stops microphone/speaker locally before asynchronous network teardown.
 void xiaozhi_dialogue_stop(void);
+// S7 continuous transcription: queue every user STT result without playing replies.
+// Refuses a new session while older text still awaits delivery.
 esp_err_t xiaozhi_stt_start(void);
-// Stop sampling, flush the tail and wait for the final server transcript.
+// Stop sampling immediately, flush the tail, then collect final STT for 20 seconds.
 void xiaozhi_stt_stop(void);
 bool xiaozhi_stt_busy(void);
 void xiaozhi_stt_get_snapshot(stt_snapshot_t *snapshot);

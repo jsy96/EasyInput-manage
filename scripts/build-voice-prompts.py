@@ -76,6 +76,8 @@ TEXTS.extend([
     "开始与小智对话",
     "小智对话已结束",
     "小智对话连接失败，请检查网络后重试",
+    "成功",
+    "失败",
 ])
 
 def load_existing(path: Path) -> list[bytes]:

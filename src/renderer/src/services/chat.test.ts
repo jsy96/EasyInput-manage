@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ChatConnection } from './chat'
 
 function connection() {
@@ -95,4 +95,126 @@ it('keeps text in paginated chat while excluding it from voice exports and downl
   expect(await chat.voiceHistory()).toEqual([voice])
   await expect(chat.download(text)).rejects.toThrow()
   expect(request).toHaveBeenCalledOnce()
+})
+
+describe('displayed text receipts', () => {
+  const text = { id: 'synthetic-text', sender: 'board', name: 'Synthetic test', kind: 'text' as const, text: '测试文字', samples: 0, created: 2, read: true }
+  const voice = { id: 'synthetic-voice', sender: 'board', name: 'Synthetic test', samples: 100, created: 1, read: false }
+  const chats: ChatConnection[] = []
+  class Socket {
+    static OPEN = 1
+    static instances: Socket[] = []
+    readyState = 1
+    onopen: (() => void) | null = null
+    onclose: (() => void) | null = null
+    onerror: (() => void) | null = null
+    onmessage: ((event: { data: string }) => void) | null = null
+    sent: Array<Record<string, unknown>> = []
+    constructor(readonly url: string) { Socket.instances.push(this) }
+    send(data: string): void { this.sent.push(JSON.parse(data) as Record<string, unknown>) }
+    close(): void { this.readyState = 3; this.onclose?.() }
+    receive(value: Record<string, unknown>): void { this.onmessage?.({ data: JSON.stringify({ type: 'chat', protocol: 2, ...value }) }) }
+    snapshot(): void {
+      this.onopen?.()
+      this.receive({ op: 'snapshot', messages: [voice, text], total: 2, unread: 1, next: null, clients: [], self: null })
+    }
+    receipts(): Array<Record<string, unknown>> { return this.sent.filter(frame => frame.op === 'text.displayed') }
+    acknowledge(index = this.receipts().length - 1, patch: Record<string, unknown> = {}): void {
+      this.receive({ ...this.receipts()[index], ...patch })
+    }
+  }
+  function liveConnection(): { chat: ChatConnection; socket: Socket } {
+    vi.useFakeTimers()
+    Socket.instances = []
+    vi.stubGlobal('WebSocket', Socket)
+    vi.stubGlobal('window', { addEventListener: vi.fn(), removeEventListener: vi.fn() })
+    vi.stubGlobal('document', { addEventListener: vi.fn(), removeEventListener: vi.fn() })
+    const chat = new ChatConnection({ state: vi.fn(), telemetry: vi.fn(), bridge: vi.fn(), notice: vi.fn(), realtime: vi.fn() })
+    chats.push(chat)
+    chat.start()
+    const socket = Socket.instances[0]
+    socket.snapshot()
+    return { chat, socket }
+  }
+  afterEach(() => {
+    for (const chat of chats.splice(0)) chat.dispose()
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+  it('waits for the mounted page to report display and deduplicates only confirmed receipts', async () => {
+    const { chat, socket } = liveConnection()
+    expect(socket.receipts()).toEqual([])
+    await expect(chat.textDisplayed(voice.id)).rejects.toThrow('尚未载入')
+    await expect(chat.textDisplayed('unknown')).rejects.toThrow('尚未载入')
+    const first = chat.textDisplayed(text.id)
+    expect(chat.textDisplayed(text.id)).toBe(first)
+    expect(socket.receipts()).toEqual([{ type: 'chat', protocol: 2, op: 'text.displayed', id: text.id, req: expect.any(String) }])
+    socket.acknowledge()
+    await first
+    socket.receive({ op: 'message', message: text, added: false, total: 2, unread: 1 })
+    await chat.textDisplayed(text.id)
+    expect(socket.receipts()).toHaveLength(1)
+  })
+  it('retries a lost acknowledgement with a new request and checks its message ID', async () => {
+    const { chat, socket } = liveConnection()
+    const receipt = chat.textDisplayed(text.id)
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(socket.receipts()).toHaveLength(2)
+    expect(socket.receipts()[1].req).not.toBe(socket.receipts()[0].req)
+    socket.acknowledge(1, { id: 'different-text' })
+    await Promise.resolve()
+    expect(socket.receipts()).toHaveLength(3)
+    socket.acknowledge()
+    await receipt
+  })
+  it('loads a display replay after a lost first broadcast without counting it again', async () => {
+    const { chat, socket } = liveConnection()
+    socket.receive({ op: 'snapshot', messages: [voice], total: 2, unread: 1, next: null, clients: [], self: null })
+    socket.receive({ op: 'message', message: text, added: false, total: 2, unread: 1 })
+    expect(chat.state.messages).toEqual([voice])
+    socket.receive({ op: 'message', message: text, added: false, display_required: true, total: 2, unread: 1 })
+    expect(chat.state.messages).toEqual([voice, text])
+    expect(chat.state.total).toBe(2)
+    const receipt = chat.textDisplayed(text.id)
+    socket.acknowledge()
+    await receipt
+    socket.receive({ op: 'message', message: text, added: false, display_required: true, total: 2, unread: 1 })
+    expect(chat.state.messages).toEqual([voice, text])
+    await chat.textDisplayed(text.id)
+    expect(socket.receipts()).toHaveLength(1)
+  })
+  it('bounds retries and lets a later message replay retry a failed receipt', async () => {
+    const { chat, socket } = liveConnection()
+    const failed = expect(chat.textDisplayed(text.id)).rejects.toThrow('超时')
+    await vi.advanceTimersByTimeAsync(9000)
+    await failed
+    expect(socket.receipts()).toHaveLength(3)
+    socket.receive({ op: 'message', message: text, added: false, total: 2, unread: 1 })
+    const retried = chat.textDisplayed(text.id)
+    expect(socket.receipts()).toHaveLength(4)
+    socket.acknowledge()
+    await retried
+  })
+  it('resends confirmed messages after reconnect and stops retries on disconnect', async () => {
+    const { chat, socket } = liveConnection()
+    const first = chat.textDisplayed(text.id)
+    socket.acknowledge()
+    await first
+    socket.close()
+    await vi.advanceTimersByTimeAsync(1000)
+    const replacement = Socket.instances[1]
+    replacement.snapshot()
+    const receipt = chat.textDisplayed(text.id)
+    expect(replacement.receipts()).toHaveLength(1)
+    const disconnected = expect(receipt).rejects.toThrow('连接中断')
+    replacement.close()
+    await disconnected
+    expect(replacement.receipts()).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(1000)
+    const restored = Socket.instances[2]
+    restored.snapshot()
+    const confirmed = chat.textDisplayed(text.id)
+    restored.acknowledge()
+    await confirmed
+  })
 })

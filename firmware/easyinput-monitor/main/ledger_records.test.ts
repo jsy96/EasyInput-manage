@@ -24,34 +24,33 @@ it('runs the actual ledger and measurement C code against isolated synthetic sto
 #include "voice_prompts.h"
 #define LONG_US 1200000
 #define SETUP_LONG_US 3000000
-#define DOUBLE_CLICK_US 400000LL
 #define PROMPT_SEQUENCE_CAPACITY 128
 ${enums}
 ${timerEvents}
 static job_t job;
 static ui_mode_t mode;
 static prompt_action_t prompt_action;
-static health_edit_t health_edit;
-static ledger_edit_t ledger_edit;
 static bool send_when_saved, prompt_playing, mark_all_read_confirming, realtime_active, setup_waiting, volume_announce_pending;
 static bool key_held[9], key_long_handled[9], key_consumed[9];
-static int64_t key_down[9], settings_commit_at, retry_at, alarm_fired_at_us, setup_deadline;
+static int64_t key_down[9], settings_commit_at, retry_at, alarm_fired_at_us, setup_deadline, input_timestamp;
 static char hold_id[65], discarded_id[65];
 static int alarm_draft, timer_draft, last_prompt;
-static unsigned next_pressure, next_glucose, diag_s5_events, diag_s6_down_events, diag_s6_up_events, diag_s6_actions, diag_s7_events, diag_last_key_mode;
-static unsigned ledger_generation;
-static int64_t summary_retry_at, click_deadline, input_timestamp;
-static int pending_click = -1;
-static bool second_click, stt_busy, stt_pending, stt_s6_pressed, stt_cancel_failed, stt_cancel_announce_pending, text_sent_announce_pending;
-static int stt_stops;
-static bool stt_round_started, stt_start_attempted, stt_end_announced, stt_terminal_received, stt_awaiting_ack;
+static unsigned diag_s5_events, diag_s6_down_events, diag_s6_up_events, diag_s6_actions, diag_s7_events, diag_last_key_mode;
+static bool stt_busy, stt_pending, stt_s6_pressed, stt_s7_pressed, stt_text_session;
+static bool stt_text_result_pending, stt_text_failed, stt_round_started, stt_end_announced, stt_terminal_received;
+static int64_t stt_delivery_deadline;
+static int stt_stops, text_stops;
 static unsigned deferred_timer_events;
-static char summary_request_id[40], text_request_id[40];
+typedef struct { bool capturing; } stt_snapshot_t;
+static bool stt_capturing;
 static bool xiaozhi_stt_busy(void) { return stt_busy; }
-static void xiaozhi_dialogue_stop(void) { stt_stops++; }
+static void xiaozhi_dialogue_stop(void) { stt_stops++; stt_capturing=false; }
+static void xiaozhi_stt_stop(void) { text_stops++; stt_capturing=false; }
+static void xiaozhi_stt_get_snapshot(stt_snapshot_t *s) { *s=(stt_snapshot_t){.capturing=stt_capturing}; }
 static bool xiaozhi_stt_pending(void *t) { (void)t; return stt_pending; }
-static bool xiaozhi_stt_cancel(void) { stt_pending = false; return true; }
 static int diag_last_key, stopped, released, uploads, setup_calls, volume_changes, stop_error, discard_error;
+static unsigned speaker_volume;
+static bool ordinary_recording;
 static void stop_prompt(void) { prompt_playing = false; prompt_action = PROMPT_ACTION_NONE; }
 static void start_prompt(int p, prompt_action_t a) { last_prompt = p; prompt_playing = true; prompt_action = a; }
 static void stt_feedback(const int *ids, int n) { if (n) start_prompt(ids[0], PROMPT_ACTION_NONE); }
@@ -77,44 +76,54 @@ static int timers_countdown_seconds(void) { return 60; }
 static int audio_play_beep(uint16_t ms, bool strong) { (void)ms; (void)strong; return 0; }
 static void network_setup_begin(void) { setup_calls++; }
 typedef struct { unsigned volume; bool recording; } audio_snapshot_t;
-static void audio_get_snapshot(audio_snapshot_t *a) { *a = (audio_snapshot_t){.volume = 20}; }
-static int audio_set_volume(uint8_t v) { (void)v; volume_changes++; return 0; }
+static void audio_get_snapshot(audio_snapshot_t *a) { *a = (audio_snapshot_t){.volume = speaker_volume, .recording = ordinary_recording}; }
+static int audio_set_volume(uint8_t v) { speaker_volume=v; volume_changes++; return 0; }
 static void announce_alarm_draft(void) {}
 static void announce_timer_draft(void) {}
 static void announce_volume(void) {}
 static bool uploading(void) { return job == JOB_UP_BEGIN || job == JOB_UP_CHUNK || job == JOB_UP_COMMIT; }
-static void begin_dialogue(void) { mode = MODE_STT; prompt_action = PROMPT_ACTION_START_STT; }
 static bool on_long_key(int key);
-${['begin_recording_with_prompt', 'append_health_value', 'begin_health_record', 'commit_health_record', 'cancel_recording', 'on_short_key', 'announce_recent_health', 'on_double_key', 'poll_click', 'key_long_threshold', 'on_stt_key', 'on_key', 'on_long_key', 'on_rotate', 'handle_timer_events'].map(extractFunction).join('\n')}
+${['begin_recording_with_prompt', 'begin_dialogue', 'begin_transcription', 'cancel_recording', 'on_short_key', 'key_long_threshold', 'on_stt_key', 'on_key', 'on_long_key', 'on_rotate', 'handle_timer_events'].map(extractFunction).join('\n')}
 static void reset_input(void) {
   mode = MODE_IDLE; job = JOB_IDLE; stop_prompt();
-  pending_click = -1; second_click = stt_busy = stt_pending = false;
-  stt_s6_pressed = stt_cancel_failed = stt_cancel_announce_pending = text_sent_announce_pending = false; stt_stops = 0;
+  stt_busy = stt_pending = stt_capturing = false;
+  stt_s6_pressed = stt_s7_pressed = stt_text_session = stt_text_result_pending = stt_text_failed = false;
+  stt_stops = text_stops = 0; stt_delivery_deadline = 0;
   deferred_timer_events = 0;
-  stt_round_started = stt_start_attempted = stt_end_announced = stt_terminal_received = stt_awaiting_ack = false;
-  health_edit_cancel(&health_edit); ledger_edit_cancel(&ledger_edit);
+  stt_round_started = stt_end_announced = stt_terminal_received = false;
   memset(key_down, 0, sizeof key_down); memset(key_held, 0, sizeof key_held);
   memset(key_long_handled, 0, sizeof key_long_handled); memset(key_consumed, 0, sizeof key_consumed);
   hold_id[0] = discarded_id[0] = 0;
   stopped = released = uploads = setup_calls = volume_changes = stop_error = discard_error = 0;
-  realtime_active = send_when_saved = mark_all_read_confirming = false;
+  realtime_active = send_when_saved = mark_all_read_confirming = ordinary_recording = setup_waiting = volume_announce_pending = false;
+  input_timestamp=0; speaker_volume=20;
 }
 static void press_key(int key, int64_t duration) {
   on_key(key, true); monotonic_us += duration; on_key(key, false);
-  monotonic_us += DOUBLE_CLICK_US + 1; poll_click(monotonic_us);
 }
 static void test_inputs(void) {
+  // Keep a real persisted measurement while exercising the new input routing.
+  // S7/S8 must not create or alter any health or ledger data.
   sizes[0] = sizes[1] = 0; ledger_records_init(); health_records_init();
-  reset_input(); next_pressure = 0; press_key(6, 50000); on_rotate(1);
-  assert(health_edit.value == 140 && health_pending_count() == 0);
-  press_key(8, 50000); assert(health_edit.fine); on_rotate(1); press_key(8, 50000);
-  int latest; assert(health_record_get(HEALTH_MOTHER_HIGH, &latest) && latest == 141);
-  assert(health_pending_count() == 1 && !health_edit.active && volume_changes == 0);
-  reset_input(); press_key(7, 50000); press_key(8, 3000000);
-  assert(!health_edit.active && setup_calls == 0 && health_pending_count() == 1);
+  health_edit_t old_health; health_edit_begin(&old_health, HEALTH_MOTHER_HIGH);
+  health_edit_refine(&old_health); health_edit_rotate(&old_health, 9); assert(health_edit_save(&old_health));
+  const size_t history_bytes=sizes[0]; unsigned char original_health[8192]; memcpy(original_health,disk[0],history_bytes);
+  reset_input(); press_key(6, 50000);
+  assert(mode == MODE_STT && stt_text_session && prompt_action == PROMPT_ACTION_START_STT);
+  press_key(7, 50000); assert(mode == MODE_STT && prompt_action == PROMPT_ACTION_START_STT);
+  assert(health_pending_count() == 1 && ledger_pending_count() == 0);
+  reset_input(); press_key(7, 50000); press_key(7, 3000000);
+  assert(mode == MODE_IDLE && !prompt_playing && setup_calls == 0);
+  assert(sizes[0] == history_bytes && !memcmp(disk[0],original_health,history_bytes));
+  int latest; assert(health_record_get(HEALTH_MOTHER_HIGH,&latest) && latest == 139);
+  reset_input(); mode=MODE_SETTING_ALARM; alarm_draft=600; last_prompt=PROMPT_ALARM_PREFIX;
+  press_key(7,50000); assert(mode==MODE_SETTING_ALARM && alarm_draft==600 && last_prompt==PROMPT_ALARM_PREFIX);
+  reset_input(); mode=MODE_RECORDING; send_when_saved=true; press_key(7,3000000);
+  assert(mode==MODE_RECORDING && send_when_saved && stopped==0 && !prompt_playing);
+
   reset_input(); press_key(4, 50000); assert(prompt_action == PROMPT_ACTION_START_RECORDING);
   press_key(4, 3000000);
-  assert(prompt_action == PROMPT_ACTION_NONE && last_prompt == PROMPT_RECORD_CANCELLED);
+  assert(last_prompt == PROMPT_RECORD_CANCELLED && mode == MODE_IDLE);
   reset_input(); mode = MODE_RECORDING; press_key(4, 50000);
   assert(send_when_saved && stopped == 1 && released == 0);
   reset_input(); mode = MODE_RECORDING; press_key(4, 3000000);
@@ -124,60 +133,49 @@ static void test_inputs(void) {
   reset_input(); mode = MODE_RECORD_READY; strcpy(hold_id, "synthetic-current-draft");
   press_key(4, 3000000);
   assert(hold_id[0] == 0 && strcmp(discarded_id, "synthetic-current-draft") == 0 && uploads == 0);
+  reset_input(); mode = MODE_RECORD_READY; strcpy(hold_id, "synthetic-current-draft"); discard_error=1;
+  press_key(4,3000000); assert(!strcmp(hold_id,"synthetic-current-draft") && last_prompt==PROMPT_RECORD_CANCEL_FAILED);
+  assert(mode==MODE_RECORD_READY && released==0 && uploads==0);
   reset_input(); mode = MODE_RECORD_READY; strcpy(hold_id, "synthetic-current-draft");
   press_key(4, 50000); assert(hold_id[0] == 0 && uploads == 1 && send_when_saved);
-  reset_input(); realtime_active = true; press_key(6, 50000); assert(health_edit.active);
-  reset_input(); press_key(8, 3000000); assert(setup_calls == 1);
-  reset_input(); press_key(6, 50000); on_key(8, true); monotonic_us += 10000;
-  press_key(7, 50000); on_key(8, false);
-  assert(health_edit.active && !health_edit.fine);
-  // Only S7/S8 keep the first-release to second-press <=400 ms boundary.
-  for (int key = 6; key <= 7; key++) {
-    for (int boundary = 0; boundary < 3; boundary++) {
-      reset_input(); next_pressure = next_glucose = 0;
-      on_key(key, true); monotonic_us += 50000; on_key(key, false);
-      assert(mode == MODE_IDLE && !health_edit.active);
-      monotonic_us += DOUBLE_CLICK_US + boundary - 1;
-      if (boundary == 2) poll_click(monotonic_us);
-      on_key(key, true); monotonic_us += 50000; on_key(key, false);
-      if (boundary <= 1) {
-        assert(!health_edit.active && next_pressure == 0 && next_glucose == 0);
-      } else {
-        poll_click(monotonic_us + DOUBLE_CLICK_US + 1);
-        assert(health_edit.active && (key == 6 ? next_pressure : next_glucose) == 2);
-      }
-      assert(ledger_pending_count() == 0);
-    }
-  }
-  // Scanner timestamps remain authoritative if the voice task handles them later.
-  reset_input(); next_pressure = 0;
-  input_timestamp = monotonic_us; on_key(6, true);
-  input_timestamp += 50000; on_key(6, false);
-  input_timestamp += DOUBLE_CLICK_US; monotonic_us = input_timestamp + 1000000;
-  on_key(6, true); input_timestamp += 50000; on_key(6, false); input_timestamp = 0;
-  assert(!health_edit.active && next_pressure == 0 && pending_click == -1);
-  // A knob turn resolves the pending S7 single press before changing its draft.
-  reset_input(); next_pressure = 0;
-  on_key(6, true); monotonic_us += 50000; on_key(6, false);
-  on_rotate(1); assert(health_edit.active && health_edit.value == 151 && volume_changes == 0);
-  // Conversation controls neither create measurements nor resurrect a released key.
-  reset_input(); mode = MODE_STT; stt_busy = true;
-  press_key(6, 50000); press_key(4, 50000);
-  assert(!health_edit.active && stt_stops == 0);
-  on_rotate(1); assert(volume_changes == 1 && !prompt_playing);
-  reset_input(); mode = MODE_STT; stt_busy = true;
-  on_key(6, true); monotonic_us += 50000; mode = MODE_IDLE; stt_busy = false;
-  on_key(6, false); poll_click(monotonic_us + DOUBLE_CLICK_US + 1);
-  assert(!health_edit.active && pending_click == -1);
-  reset_input(); mode = MODE_STT; stt_busy = true;
-  on_key(8, true); monotonic_us += 3000000; mode = MODE_IDLE; stt_busy = false;
-  on_key(8, false); assert(setup_calls == 0 && prompt_action == PROMPT_ACTION_NONE);
+  // A short/long press outside the current unsent slot never discards an upload.
+  reset_input(); job=JOB_UP_CHUNK; mode=MODE_IDLE; on_long_key(4);
+  assert(job==JOB_UP_CHUNK && !discarded_id[0] && !released && !uploads);
+  reset_input(); job=JOB_CACHE; mode=MODE_RECORD_READY; press_key(4,3000000);
+  assert(job==JOB_IDLE && mode==MODE_IDLE && released==1 && uploads==0);
+
+  reset_input(); realtime_active=true; press_key(6,50000);
+  assert(!stt_text_session && realtime_active && last_prompt==PROMPT_TRANSCRIPT_FAILURE);
+  reset_input(); on_rotate(1); assert(volume_changes==1 && speaker_volume==30);
+  on_rotate(-5); assert(speaker_volume==10); on_rotate(20); assert(speaker_volume==100);
+  reset_input(); ordinary_recording=true; mode=MODE_RECORDING; on_rotate(1);
+  assert(volume_announce_pending && speaker_volume==30 && !prompt_playing);
+  reset_input(); press_key(8,3000000); assert(setup_calls==1 && setup_waiting);
+
+  // Conversation controls neither alter legacy records nor resurrect a held key.
+  reset_input(); mode=MODE_STT; stt_busy=stt_capturing=true;
+  press_key(6,50000); press_key(4,50000); press_key(7,50000);
+  assert(stt_stops==0 && text_stops==0 && health_pending_count()==1);
+  on_rotate(1); assert(volume_changes==1 && speaker_volume==30 && !prompt_playing);
+  reset_input(); mode=MODE_STT; stt_busy=true;
+  on_key(6,true); monotonic_us+=50000; mode=MODE_IDLE; stt_busy=false;
+  on_key(6,false); assert(mode==MODE_IDLE && !stt_text_session);
+  reset_input(); mode=MODE_STT; stt_busy=true;
+  on_key(8,true); monotonic_us+=3000000; mode=MODE_IDLE; stt_busy=false;
+  on_key(8,false); assert(setup_calls==0 && prompt_action==PROMPT_ACTION_NONE);
   // Timers wait until the conversation exits before any speaker prompt.
-  reset_input(); mode = MODE_STT; stt_busy = true;
-  handle_timer_events(TIMER_EVENT_ALARM, monotonic_us);
-  assert(deferred_timer_events == TIMER_EVENT_ALARM && !prompt_playing && mode == MODE_STT);
-  stt_busy = false; mode = MODE_IDLE; handle_timer_events(TIMER_EVENT_NONE, monotonic_us);
-  assert(!deferred_timer_events && prompt_playing && last_prompt == PROMPT_ALARM_DUE);
+  reset_input(); mode=MODE_STT; stt_busy=true;
+  handle_timer_events(TIMER_EVENT_ALARM,monotonic_us);
+  assert(deferred_timer_events==TIMER_EVENT_ALARM && !prompt_playing && mode==MODE_STT);
+  stt_busy=false; mode=MODE_IDLE; handle_timer_events(TIMER_EVENT_NONE,monotonic_us);
+  assert(!deferred_timer_events && prompt_playing && last_prompt==PROMPT_ALARM_DUE);
+  reset_input(); mode=MODE_STT; stt_busy=true; stt_text_session=true;
+  handle_timer_events(TIMER_EVENT_DONE|TIMER_EVENT_MINUTE,monotonic_us);
+  assert(deferred_timer_events==TIMER_EVENT_DONE && !prompt_playing && mode==MODE_STT);
+  stt_busy=false; mode=MODE_IDLE; handle_timer_events(TIMER_EVENT_NONE,monotonic_us);
+  assert(!deferred_timer_events && last_prompt==PROMPT_COUNTDOWN_DONE);
+  health_records_init(); assert(health_pending_count()==1 && health_record_get(HEALTH_MOTHER_HIGH,&latest) && latest==139);
+  assert(sizes[0]==history_bytes && !memcmp(disk[0],original_health,history_bytes));
   puts("synthetic input routing and long press checks passed");
 }
 `)

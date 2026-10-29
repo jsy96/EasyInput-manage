@@ -1,5 +1,5 @@
 // Protocol adapted from the verified xiaozhi-waytoagi OTA/WebSocket client.
-// S6 uses bidirectional auto-turn conversation; legacy text delivery is retained.
+// S6 uses bidirectional conversation; S7 continuously delivers recognized text.
 #include "xiaozhi_stt.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -591,6 +591,14 @@ static bool enqueue_text(const char *value)
             text_count++;
         }
     }
+    if (ok) {
+        // Count the actual chat rows, including long utterance fragments. Keep
+        // this atomic with publication so a fast browser receipt cannot get
+        // ahead of the received count used to decide the session result.
+        portENTER_CRITICAL(&capture_lock);
+        diagnostics.received_texts += (unsigned)count;
+        portEXIT_CRITICAL(&capture_lock);
+    }
     xSemaphoreGive(guard);
     free(text);
     if (ok) notify(STT_DONE, NULL);
@@ -609,11 +617,6 @@ static bool receive_message(const cJSON *json, bool *had_text)
         const int count = text_slices(value->valuestring, slices);
         if (count < 0 || !enqueue_text(value->valuestring)) { log_failure("receive.text", ESP_FAIL); return false; }
         *had_text = count > 0;
-        if (*had_text) {
-            portENTER_CRITICAL(&capture_lock);
-            diagnostics.received_texts++;
-            portEXIT_CRITICAL(&capture_lock);
-        }
     } else if (cJSON_IsString(type) && (!strcmp(type->valuestring, "error") || !strcmp(type->valuestring, "goodbye"))) {
         log_failure(!strcmp(type->valuestring, "error") ? "receive.server_error" : "receive.goodbye", ESP_ERR_INVALID_RESPONSE);
         return false;
@@ -1137,7 +1140,7 @@ void xiaozhi_stt_stop(void)
 {
     if (!guard || !microphone_guard) return;
     xSemaphoreTake(guard, portMAX_DELAY);
-    const bool active = busy && !cancelled && !stop_intent;
+    const bool active = busy && !dialogue_session && !cancelled && !stop_intent;
     if (active) stop_intent = true;
     xSemaphoreGive(guard);
     if (!active) return;

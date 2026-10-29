@@ -36,6 +36,13 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
   const unread = room.unread
   const alarmMinute = board?.voice?.alarm_minute
   const countdownSeconds = board?.voice?.countdown_seconds ?? 0
+  useEffect(() => {
+    if (!connection || !room.connected) return
+    // Effects run after the text nodes have been committed to the mounted chat page.
+    for (const message of room.messages) if (message.kind === 'text' && message.sender === 'board') {
+      void connection.textDisplayed(message.id).catch(() => { /* A later message replay or reconnect can retry. */ })
+    }
+  }, [connection, room.connected, room.messages])
   useEffect(() => { busyChanged(recording || sending || !!loading || playing || batchDownloading || sequencePlaying); return () => busyChanged(false) }, [recording, sending, loading, playing, batchDownloading, sequencePlaying, busyChanged])
   useEffect(() => {
     alive.current = true
@@ -237,9 +244,9 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
           <div><dt>S4</dt><dd><Timer size={13} />设置倒计时</dd></div>
           <div><dt>S5</dt><dd>短按开始录音，再短按结束并发送；长按 3 秒取消本次未发送录音，无双击功能</dd></div>
           <div><dt>S6</dt><dd>短按开始与小智实时语音对话，再短按结束；小智回答后自动继续听。需 Wi-Fi 联网并完成小智绑定，与网页实时监听互斥</dd></div>
-          <div><dt>S7</dt><dd>记录血压：妈妈高压 → 妈妈低压 → 爸爸高压 → 爸爸低压；双击播报四项最近值。高压 80～220，低压 50～120</dd></div>
-          <div><dt>S8</dt><dd>记录血糖：爸爸 → 妈妈；双击播报两人最近值，范围 3.0～20.0</dd></div>
-          <div><dt>旋钮</dt><dd>记录时血压每格 ±10，血糖每格 ±1；第一次短按进入精细调整（±1 / ±0.1），第二次短按保存，长按 3 秒取消。小智对话中旋转可调音量</dd></div>
+          <div><dt>S7</dt><dd>短按开始持续语音转文字，小智识别后可分多条写入聊天记录；再短按结束，等待网页送达确认后播报“成功”或“失败”。需打开本聊天页</dd></div>
+          <div><dt>S8</dt><dd>已停用</dd></div>
+          <div><dt>旋钮</dt><dd>旋转调整音量，小智对话和语音转文字期间也可调节；仍可调整闹钟与倒计时</dd></div>
         </dl>
       </section>
     </aside>

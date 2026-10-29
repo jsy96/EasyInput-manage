@@ -37,6 +37,8 @@ export class ChatConnection {
   private historyLoading = false
   private generation = 0
   private pruned = new Set<string>()
+  private displayedTexts = new Set<string>()
+  private displayingTexts = new Map<string, Promise<void>>()
   readonly identity = clientIdentity()
   constructor(private readonly callbacks: {
     state(s: RoomState): void
@@ -78,6 +80,8 @@ export class ChatConnection {
       if (v.op === 'snapshot') {
         this.generation++
         this.pruned.clear()
+        this.displayedTexts.clear()
+        this.displayingTexts.clear()
         this.update({
         connected: true,
         online: Boolean(v.online),
@@ -102,7 +106,8 @@ export class ChatConnection {
       if (v.op === 'message' && isChatMessage(v.message)) {
         const m = v.message
         const loaded = this.state.messages.some(x => x.id === m.id)
-        const messages = loaded || v.added === true ? sortMessages([...this.state.messages.filter(x => x.id !== m.id), m]).slice(-CHAT_LIMIT) : this.state.messages
+        const displayReplay = v.display_required === true && m.kind === 'text' && m.sender === 'board'
+        const messages = loaded || v.added === true || displayReplay ? sortMessages([...this.state.messages.filter(x => x.id !== m.id), m]).slice(-CHAT_LIMIT) : this.state.messages
         this.update({ messages, total: Number(v.total ?? this.state.total), unread: Number(v.unread ?? this.state.unread) })
       }
       if (v.op === 'readAll') this.update({ messages: this.state.messages.map(m => ({ ...m, read: true })), unread: 0 })
@@ -118,6 +123,8 @@ export class ChatConnection {
     socket.onclose = () => {
       if (this.socket !== socket) return
       this.generation++
+      this.displayedTexts.clear()
+      this.displayingTexts.clear()
       this.socket = null; if (this.heartbeat) clearInterval(this.heartbeat); this.heartbeat = null
       this.update({ connected: false, online: false, via: null, healthPending: null, ledgerPending: null })
       for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error('群聊连接中断，请重新发送')) } this.pending.clear()
@@ -136,13 +143,37 @@ export class ChatConnection {
   }
   bridge(payload: Frame): void { this.send({ type: 'gateway', payload }) }
   gatewayOff(): void { this.send({ type: 'chat', protocol: CHAT_VERSION, op: 'gateway.off' }) }
-  private request(op: string, data: Frame): Promise<Frame> {
+  private request(op: string, data: Frame, timeoutMs = 20000): Promise<Frame> {
     if (this.socket?.readyState !== WebSocket.OPEN) return Promise.reject(new Error('正在连接群聊，请稍后重试'))
     const req = crypto.randomUUID()
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.pending.delete(req); reject(new Error('等待语音传输超时，请重试')) }, 20000)
+      const timer = setTimeout(() => { this.pending.delete(req); reject(new Error('等待语音传输超时，请重试')) }, timeoutMs)
       this.pending.set(req, { resolve, reject, timer }); this.send({ type: 'chat', protocol: CHAT_VERSION, op, req, ...data })
     })
+  }
+  textDisplayed(id: string): Promise<void> {
+    if (this.stopped || !this.state.connected || !this.state.messages.some(m => m.id === id && m.kind === 'text' && m.sender === 'board')) {
+      return Promise.reject(new Error('转写文字尚未载入聊天记录'))
+    }
+    if (this.displayedTexts.has(id)) return Promise.resolve()
+    const pending = this.displayingTexts.get(id)
+    if (pending) return pending
+    const generation = this.generation
+    const receipt = (async () => {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const ack = await this.request('text.displayed', { id }, 3000)
+          if (this.stopped || generation !== this.generation || !this.state.connected) throw new Error('群聊连接已变更')
+          if (ack.op !== 'text.displayed' || ack.id !== id) throw new Error('文字送达确认异常')
+          this.displayedTexts.add(id)
+          return
+        } catch (error) {
+          if (this.stopped || generation !== this.generation || !this.state.connected || attempt === 2) throw error
+        }
+      }
+    })().finally(() => { if (this.displayingTexts.get(id) === receipt) this.displayingTexts.delete(id) })
+    this.displayingTexts.set(id, receipt)
+    return receipt
   }
   async upload(bytes: Uint8Array, progress?: (p: number) => void): Promise<void> {
     if (this.uploadBusy) throw new Error('上一条语音仍在发送')
@@ -256,6 +287,7 @@ export class ChatConnection {
     return out
   }
   dispose(): void {
+    this.displayedTexts.clear(); this.displayingTexts.clear()
     this.stopped = true; if (this.timer) clearTimeout(this.timer); if (this.heartbeat) clearInterval(this.heartbeat)
     const socket = this.socket; this.socket = null
     if (socket) { socket.onopen = socket.onclose = socket.onmessage = socket.onerror = null; socket.close() }
