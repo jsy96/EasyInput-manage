@@ -199,7 +199,7 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
       {board?.voice && <p className="chat-board-state" role="status">{alarmMinute === null || alarmMinute === undefined ? '未设置闹钟' : `闹钟 ${String(Math.floor(alarmMinute / 60)).padStart(2, '0')}:${String(alarmMinute % 60).padStart(2, '0')}`} · {countdownSeconds ? `倒计时 ${Math.ceil(countdownSeconds / 60)} 分钟` : '无倒计时'}{board.voice.pending > 0 ? ` · ${board.voice.sending ? '发送中' : '待发送'} ${board.voice.pending} 条` : ''}{board.voice.storage_error ? ' · 录音存储异常' : ''}</p>}
       <div className="chat-messages" aria-live="polite">
         {room.next && <button className="button button-subtle full-button" disabled={historyLoading || busy || !room.connected} onClick={() => void loadOlder()}>{historyLoading ? '正在加载历史…' : `加载更早消息 · 已加载 ${messages.length} / ${room.total}`}</button>}
-        {!messages.length && <div className="empty-state"><Mic size={30} /><strong>还没有消息</strong><p>网页语音、开发板语音及转写文字<br />都会进入同一条时间线</p></div>}
+        {!messages.length && <div className="empty-state"><Mic size={30} /><strong>还没有消息</strong><p>网页和开发板录音共用一条时间线<br />已有转写文字仍可查看</p></div>}
         {messages.map(m => <div key={m.id} className={`chat-message ${m.sender === room.self?.id ? 'chat-mine' : ''}`}>
           <div className="chat-message-meta"><strong>{m.sender === 'board' ? '开发板' : m.name}</strong><span>{m.kind === 'text' ? '语音转文字' : m.sender === 'board' ? '录音' : '网页'}</span><time>{new Date(m.created).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</time></div>
           {m.kind === 'text' ? <p style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{m.text}</p> : urls[m.id] ? <audio controls autoPlay preload="metadata" ref={element => { players.current[m.id] = element }} onPlay={() => { stopSequence(); Object.entries(players.current).forEach(([id, player]) => { if (id !== m.id) player?.pause() }); setPlaying(true) }} onPause={() => setPlaying(false)} onEnded={() => setPlaying(false)} src={urls[m.id]} aria-label={`${m.name}的语音留言`} /> : <button className="button button-subtle chat-play" disabled={!room.connected || !!loading || busy} onClick={() => void load(m)}><Volume2 size={16} />{loading === m.id ? '加载语音…' : '播放语音'}<span>{Math.ceil(m.samples / 8000)}″</span></button>}
@@ -235,11 +235,11 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
           <div><dt>S2</dt><dd>播放第一条未读，并重设 S1 回听起点；播放中可按 S1 回听</dd></div>
           <div><dt>S3</dt><dd><Bell size={13} />设置每日闹钟，长按取消</dd></div>
           <div><dt>S4</dt><dd><Timer size={13} />设置倒计时</dd></div>
-          <div><dt>S5</dt><dd>单击录音，再单击发送语音；双击开始连续语音转文字，由小智断句并逐条发送，停顿后仍可继续说。转写中再单击停止并处理尾句，长按 3 秒取消；空闲单击等待约 0.4 秒</dd></div>
-          <div><dt>S6</dt><dd>记账（1～999 元）：先输入百十位，短按旋钮后输入个位，再短按保存；例如 27 → 短按 → 3 → 短按，保存 273 元；双击播报最近一笔及今天、昨天、前天总额</dd></div>
+          <div><dt>S5</dt><dd>短按开始录音，再短按结束并发送；长按 3 秒取消本次未发送录音，无双击功能</dd></div>
+          <div><dt>S6</dt><dd>短按开始与小智实时语音对话，再短按结束；小智回答后自动继续听。需 Wi-Fi 联网并完成小智绑定，与网页实时监听互斥</dd></div>
           <div><dt>S7</dt><dd>记录血压：妈妈高压 → 妈妈低压 → 爸爸高压 → 爸爸低压；双击播报四项最近值。高压 80～220，低压 50～120</dd></div>
           <div><dt>S8</dt><dd>记录血糖：爸爸 → 妈妈；双击播报两人最近值，范围 3.0～20.0</dd></div>
-          <div><dt>旋钮</dt><dd>记录时血压每格 ±10，血糖每格 ±1；第一次短按进入精细调整（±1 / ±0.1），第二次短按保存。记账和测量记录中长按 3 秒取消本次记录</dd></div>
+          <div><dt>旋钮</dt><dd>记录时血压每格 ±10，血糖每格 ±1；第一次短按进入精细调整（±1 / ±0.1），第二次短按保存，长按 3 秒取消。小智对话中旋转可调音量</dd></div>
         </dl>
       </section>
     </aside>

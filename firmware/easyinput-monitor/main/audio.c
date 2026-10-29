@@ -1,10 +1,12 @@
 #include "audio.h"
 
 #include <math.h>
+#include <string.h>
 #include "lights.h"
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -19,6 +21,7 @@
 #define TONE_FADE_FRAMES (AUDIO_SAMPLE_RATE / 50)
 #define LIVE_FRAME_FRAMES (AUDIO_SAMPLE_RATE / 50)
 #define LIVE_FRAME_BYTES (LIVE_FRAME_FRAMES * sizeof(int16_t))
+#define PCM_BUFFER_FRAMES (AUDIO_SAMPLE_RATE * 4)
 // Six DMA blocks can still be in flight after the last write returns.
 #define TONE_DRAIN_US (6LL * AUDIO_BLOCK_FRAMES * 1000000 / AUDIO_SAMPLE_RATE + 20000)
 
@@ -66,6 +69,10 @@ static int64_t tone_drain_until_us;
 static audio_microphone_sink_t live_sink;
 static int16_t live_chunk[LIVE_FRAME_FRAMES];
 static size_t live_chunk_frames;
+// Owned by audio_mutex. Kept for subsequent replies, with a fixed memory bound.
+static int16_t *pcm_buffer;
+static size_t pcm_head, pcm_size;
+static bool pcm_active, pcm_finished;
 
 // Called only with audio_mutex held, after the current I2S block has been
 // delivered. Preserve the final short block before detaching the consumer.
@@ -113,6 +120,8 @@ static esp_err_t stop_channel(bool microphone)
         voice_until_us = 0;
     } else {
         state.speaker_playing = false;
+        pcm_active = pcm_finished = false;
+        pcm_head = pcm_size = 0;
     }
     if (*channel && *enabled) {
         const esp_err_t result = i2s_channel_disable(*channel);
@@ -189,6 +198,38 @@ static void update_microphone(size_t frames, int64_t now)
     state.vad = now < voice_until_us;
 }
 
+// Called with audio_mutex held. A temporary network underrun keeps the session
+// open; only EOF plus an empty queue and drained DMA is a successful playback.
+static bool pcm_playback_step(void)
+{
+    if (!pcm_active || !state.speaker_playing) return false;
+    if (pcm_size) {
+        const size_t frames = pcm_size < AUDIO_BLOCK_FRAMES ? pcm_size : AUDIO_BLOCK_FRAMES;
+        for (size_t i = 0; i < frames; i++) {
+            const int16_t sample = (int32_t)pcm_buffer[(pcm_head + i) % PCM_BUFFER_FRAMES] * state.volume / 100;
+            speaker_samples[i * 2] = speaker_samples[i * 2 + 1] = sample;
+        }
+        size_t written = 0;
+        const esp_err_t result = i2s_channel_write(speaker_channel, speaker_samples,
+            frames * 2 * sizeof(int16_t), &written, AUDIO_IO_TIMEOUT_MS);
+        if (result != ESP_OK || written != frames * 2 * sizeof(int16_t)) {
+            state.speaker_error = result != ESP_OK ? result : ESP_ERR_TIMEOUT;
+            (void)stop_channel(false);
+        } else {
+            pcm_head = (pcm_head + frames) % PCM_BUFFER_FRAMES;
+            pcm_size -= frames;
+            tone_drain_until_us = esp_timer_get_time() + TONE_DRAIN_US;
+        }
+        return true;
+    }
+    if (pcm_finished && esp_timer_get_time() >= tone_drain_until_us) {
+        const esp_err_t result = stop_channel(false);
+        if (result != ESP_OK) state.speaker_error = result;
+        else state.voice_completed = true;
+    }
+    return false;
+}
+
 static void audio_task(void *arg)
 {
     (void)arg;
@@ -248,7 +289,9 @@ static void audio_task(void *arg)
                 (void)stop_channel(true);
             }
         }
-        if (state.speaker_playing && voice_buffer != NULL && voice_frame < voice_available * 2) {
+        if (pcm_active) {
+            did_io = pcm_playback_step() || did_io;
+        } else if (state.speaker_playing && voice_buffer != NULL && voice_frame < voice_available * 2) {
             state.stage = 5;
             did_io = true;
             size_t frames = voice_length * 2 - voice_frame;
@@ -471,6 +514,72 @@ esp_err_t audio_voice_stream_extend(size_t available)
     xSemaphoreGive(audio_mutex);
     return ESP_OK;
 }
+
+static esp_err_t start_pcm(void *arg)
+{
+    (void)arg;
+    xSemaphoreTake(audio_mutex, portMAX_DELAY);
+    if (state.recording || state.speaker_playing) {
+        xSemaphoreGive(audio_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!pcm_buffer) pcm_buffer = heap_caps_malloc(PCM_BUFFER_FRAMES * sizeof(int16_t),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!pcm_buffer) {
+        state.speaker_error = ESP_ERR_NO_MEM;
+        xSemaphoreGive(audio_mutex);
+        return ESP_ERR_NO_MEM;
+    }
+    const esp_err_t result = start_channel(false);
+    state.speaker_error = result;
+    if (result == ESP_OK) {
+        pcm_head = pcm_size = 0;
+        pcm_active = true;
+        pcm_finished = false;
+        voice_buffer = NULL;
+        state.voice_completed = false;
+        state.speaker_playing = true;
+        tone_drain_until_us = 0;
+    }
+    xSemaphoreGive(audio_mutex);
+    return result;
+}
+
+esp_err_t audio_pcm_start(void)
+{
+    if (!audio_mutex || !state.ready) return ESP_ERR_INVALID_STATE;
+    return lights_with_shared_power(start_pcm, NULL);
+}
+
+esp_err_t audio_pcm_write(const int16_t *samples, size_t frames)
+{
+    if (!samples || !frames || frames > PCM_BUFFER_FRAMES) return ESP_ERR_INVALID_ARG;
+    if (!audio_mutex || !state.ready) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(audio_mutex, portMAX_DELAY);
+    esp_err_t result = ESP_OK;
+    if (!pcm_active || pcm_finished || !state.speaker_playing) result = ESP_ERR_INVALID_STATE;
+    else if (frames > PCM_BUFFER_FRAMES - pcm_size) result = ESP_ERR_NO_MEM;
+    else {
+        const size_t tail = (pcm_head + pcm_size) % PCM_BUFFER_FRAMES;
+        const size_t first = frames < PCM_BUFFER_FRAMES - tail ? frames : PCM_BUFFER_FRAMES - tail;
+        memcpy(pcm_buffer + tail, samples, first * sizeof(int16_t));
+        if (frames > first) memcpy(pcm_buffer, samples + first, (frames - first) * sizeof(int16_t));
+        pcm_size += frames;
+    }
+    xSemaphoreGive(audio_mutex);
+    return result;
+}
+
+esp_err_t audio_pcm_finish(void)
+{
+    if (!audio_mutex || !state.ready) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(audio_mutex, portMAX_DELAY);
+    const esp_err_t result = pcm_active && state.speaker_playing ? ESP_OK : ESP_ERR_INVALID_STATE;
+    if (result == ESP_OK) pcm_finished = true;
+    xSemaphoreGive(audio_mutex);
+    return result;
+}
+
 esp_err_t audio_set_volume(uint8_t volume)
 {
     if (!audio_mutex || volume > 100) return ESP_ERR_INVALID_ARG;

@@ -42,6 +42,13 @@ esp_err_t audio_record_stop(void);
 esp_err_t audio_play_voice(const uint8_t *buffer, size_t length);
 esp_err_t audio_play_voice_stream(const uint8_t *buffer, size_t length, size_t available);
 esp_err_t audio_voice_stream_extend(size_t available);
+// Bounded 16 kHz mono PCM16 playback. Writes accept the whole block or return
+// ESP_ERR_NO_MEM without consuming it; callers may retry after a short delay.
+esp_err_t audio_pcm_start(void);
+esp_err_t audio_pcm_write(const int16_t *samples, size_t frames);
+// End input. speaker_playing stays true until buffered PCM and DMA have drained;
+// voice_completed then distinguishes successful completion from stop/error.
+esp_err_t audio_pcm_finish(void);
 esp_err_t audio_live_start(audio_microphone_sink_t sink);
 // Stops at an audio-task boundary and delivers the final partial PCM block
 // before detaching the sink. The callback must remain short and nonblocking.

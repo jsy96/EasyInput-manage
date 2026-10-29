@@ -19,6 +19,11 @@ typedef struct {
     size_t queued_texts;
 } stt_snapshot_t;
 void xiaozhi_stt_init(void);
+// Bidirectional, auto-turn conversation. STT results stay inside this session;
+// legacy pending texts and their delivery receipts are preserved.
+esp_err_t xiaozhi_dialogue_start(void);
+// Stops microphone/speaker locally before asynchronous network teardown.
+void xiaozhi_dialogue_stop(void);
 esp_err_t xiaozhi_stt_start(void);
 // Stop sampling, flush the tail and wait for the final server transcript.
 void xiaozhi_stt_stop(void);
