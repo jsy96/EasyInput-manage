@@ -790,6 +790,8 @@ static void emit_status(void)
     if (voice_state.alarm_minute >= 0) cJSON_AddNumberToObject(voice, "alarm_minute", voice_state.alarm_minute);
     else cJSON_AddNullToObject(voice, "alarm_minute");
     cJSON_AddNumberToObject(voice, "countdown_seconds", voice_state.countdown_seconds);
+    cJSON_AddBoolToObject(voice, "stopwatch_running", voice_state.stopwatch_running);
+    cJSON_AddNumberToObject(voice, "stopwatch_seconds", voice_state.stopwatch_seconds);
     cJSON_AddBoolToObject(voice, "realtime_active", voice_state.realtime_active);
     cJSON_AddBoolToObject(voice, "realtime_enabled", voice_state.realtime_enabled);
     cJSON *voice_debug = cJSON_AddObjectToObject(voice, "debug");

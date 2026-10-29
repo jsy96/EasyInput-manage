@@ -41,9 +41,10 @@
 #define INPUT_QUEUE_DEPTH 16
 #define SLOW_BLINK_ON_US 500000LL
 #define SLOW_BLINK_PERIOD_US 2500000LL
-#define FLASH_ON_US 150000LL
+#define FLASH_ON_US 500000LL
 #define FLASH_PERIOD_US 1000000LL
-#define ALARM_SOLID_US 60000000LL
+#define ALARM_FLASH_US 60000000LL
+#define STOPWATCH_RESULT_CAPACITY 8
 #define TOKEN_VALID_FROM 1735689600LL
 #define REALTIME_HEADER_BYTES 12
 #define REALTIME_FRAME_BYTES (AUDIO_SAMPLE_RATE / 50 * (int)sizeof(int16_t))
@@ -162,6 +163,10 @@ static int network_via;
 static int alarm_draft = 12 * 60;
 static int timer_draft = 30;
 static int64_t alarm_fired_at_us;
+static int64_t receiving_until_us;
+static uint32_t stopwatch_results[STOPWATCH_RESULT_CAPACITY];
+static unsigned stopwatch_result_head, stopwatch_result_count;
+static bool stopwatch_start_pending, stopwatch_busy_pending;
 static bool volume_announce_pending;
 static int prompt_ids[PROMPT_SEQUENCE_CAPACITY];
 static bool stt_s6_pressed;
@@ -381,6 +386,7 @@ static void add_item(cJSON *value)
         samples->valuedouble > MAX_AUDIO) return;
     message_t *message = find_message(id->valuestring);
     if (message == NULL) {
+        receiving_until_us = esp_timer_get_time() + SLOW_BLINK_PERIOD_US;
         if (message_count >= MAX_MESSAGES) {
             // A retained message can arrive before the following index sync removes the evicted ID.
             memmove(&messages[0], &messages[1], sizeof(messages[0]) * (MAX_MESSAGES - 1));
@@ -639,9 +645,26 @@ static void cancel_countdown(bool prompt)
 {
     if (!timers_countdown_active() && mode != MODE_COUNTDOWN) return;
     timers_cancel_countdown();
+    deferred_timer_events &= ~TIMER_EVENT_DONE;
     stop_prompt();
     mode = MODE_IDLE;
     if (prompt) start_prompt(PROMPT_COUNTDOWN_DONE, PROMPT_ACTION_NONE);
+}
+
+static void toggle_stopwatch(int64_t now)
+{
+    if (timers_stopwatch_active()) {
+        const uint32_t elapsed = timers_stop_stopwatch(now);
+        stopwatch_results[(stopwatch_result_head + stopwatch_result_count) % STOPWATCH_RESULT_CAPACITY] = elapsed;
+        stopwatch_result_count++;
+        stopwatch_start_pending = false;
+    } else if (stopwatch_result_count < STOPWATCH_RESULT_CAPACITY) {
+        timers_start_stopwatch(now);
+        stopwatch_start_pending = true;
+    } else {
+        // Bound deferred speech without losing a completed measurement.
+        stopwatch_busy_pending = true;
+    }
 }
 
 // Auto-driven indicator semantics are mirrored to Studio through compact
@@ -670,27 +693,29 @@ static void queue_light_modes(const char *const modes[LIGHT_PIXEL_COUNT])
 static void refresh_lights(int64_t now)
 {
     const bool unread = earliest_unread() != NULL;
+    const bool receiving = now < receiving_until_us || job == JOB_DOWNLOAD ||
+        (job == JOB_PLAYING && !stream_complete);
     const bool recording = mode == MODE_RECORDING || mode == MODE_STT || xiaozhi_stt_busy();
     const bool sending = uploading() || job == JOB_CACHE || voice_outbox_count() > 0 || xiaozhi_stt_pending(NULL);
-    const bool realtime = realtime_active;
     const bool alarm_set = timers_alarm_minute() >= 0;
     const bool alarm_fired = alarm_set && alarm_fired_at_us != 0 &&
-        now - alarm_fired_at_us < ALARM_SOLID_US;
-    const bool timer_running = timers_countdown_active();
+        now - alarm_fired_at_us < ALARM_FLASH_US;
+    const bool timer_running = timers_countdown_active() || timers_stopwatch_active();
     const bool slow_blink = (now % SLOW_BLINK_PERIOD_US) < SLOW_BLINK_ON_US;
     const bool second_flash = (now % FLASH_PERIOD_US) < FLASH_ON_US;
     const char *modes[LIGHT_PIXEL_COUNT];
     int color[LIGHT_PIXEL_COUNT] = {0};
-    modes[0] = mark_all_read_confirming ? "solid" : unread ? "blink" : "off";
-    modes[1] = alarm_fired ? "solid" : alarm_set ? "blink" : "off";
-    modes[2] = timer_running ? "flash" : "off";
-    modes[3] = recording ? "solid" : sending ? "blink" : "off";
-    modes[4] = realtime ? "solid" : "off";
-    if (mark_all_read_confirming || (unread && slow_blink)) color[0] = 0xff0000;
-    if (alarm_fired || (alarm_set && slow_blink)) color[1] = 0xff0000;
-    if (timer_running && second_flash) color[2] = 0xff0000;
-    if (recording || (sending && slow_blink)) color[3] = 0xff0000;
-    if (realtime) color[4] = 0xff0000;
+    modes[0] = receiving ? "blink" : unread ? "solid" : "off";
+    modes[1] = alarm_fired ? "blink" : timer_running ? "flash" : alarm_set ? "solid" : "off";
+    modes[2] = recording ? "solid" : sending ? "blink" : "off";
+    modes[3] = realtime_active ? "blink" : "off";
+    modes[4] = network_fresh(now) ? "blink" : "solid";
+    for (int index = 0; index < LIGHT_PIXEL_COUNT; index++) {
+        const bool on = strcmp(modes[index], "solid") == 0 ||
+            (strcmp(modes[index], "blink") == 0 && slow_blink) ||
+            (strcmp(modes[index], "flash") == 0 && second_flash);
+        if (on) color[index] = 0xff0000;
+    }
     bool changed = false;
     for (int index = 0; index < LIGHT_PIXEL_COUNT; index++) {
         if (strcmp(pushed_modes[index], modes[index]) != 0) {
@@ -1199,8 +1224,19 @@ static bool on_stt_key(int key, bool down, int64_t now)
 
 static void on_key(int key, bool down)
 {
-    if (key < 0 || key > 8 || key == 7) return;
+    if (key < 0 || key > 8) return;
     const int64_t now = input_timestamp ? input_timestamp : esp_timer_get_time();
+    if (key == 7) {
+        // S8 is independent of audio and never cancels a countdown or session.
+        if (down) {
+            if (!key_down[key]) key_down[key] = now;
+        } else if (key_down[key]) {
+            key_down[key] = 0;
+            key_held[key] = key_long_handled[key] = key_consumed[key] = false;
+            toggle_stopwatch(now);
+        }
+        return;
+    }
     diag_last_key = key;
     diag_last_key_mode = mode;
     if (down && key == 4) diag_s5_events++;
@@ -1210,7 +1246,7 @@ static void on_key(int key, bool down)
     }
     if (down && key == 6) diag_s7_events++;
     if (on_stt_key(key, down, now)) return;
-    // S5/S6/S7 act immediately on each valid release; S8 is unused.
+    // S5/S6/S7 act immediately on each valid release; S8 is handled above.
     if (key >= 4 && key <= 6) {
         if (down) {
             if (key_down[key]) return;
@@ -1319,10 +1355,13 @@ static bool on_long_key(int key)
         return true;
     } else if (key == 2) {
         const bool removed = timers_set_alarm_minute(-1);
-        if (removed) alarm_fired_at_us = 0;
+        if (removed) {
+            alarm_fired_at_us = 0;
+            deferred_timer_events &= ~TIMER_EVENT_ALARM;
+        }
         mode = MODE_IDLE;
         stop_prompt();
-        start_prompt(removed ? PROMPT_ALARM_CANCEL : PROMPT_SAVE_FAILED, PROMPT_ACTION_NONE);
+        start_prompt(removed ? PROMPT_ALARM_CANCEL : PROMPT_TRANSCRIPT_FAILURE, PROMPT_ACTION_NONE);
         return true;
     } else if (key == 4) {
         cancel_recording();
@@ -1386,7 +1425,7 @@ static void commit_settings(int64_t now)
         const bool saved = timers_set_alarm_minute(alarm_draft);
         mode = MODE_IDLE;
         if (!saved) {
-            start_prompt(PROMPT_SAVE_FAILED, PROMPT_ACTION_NONE);
+            start_prompt(PROMPT_TRANSCRIPT_FAILURE, PROMPT_ACTION_NONE);
             return;
         }
         append_prompt(ids, &length, PROMPT_ALARM_PREFIX);
@@ -1401,36 +1440,63 @@ static void commit_settings(int64_t now)
     }
 }
 
+static void append_duration(int *ids, int *length, uint32_t seconds)
+{
+    const uint32_t quantities[] = {seconds / 3600, seconds / 60 % 60, seconds % 60};
+    const int units[] = {PROMPT_HOURS, PROMPT_MINUTES, PROMPT_SECONDS};
+    for (int i = 0; i < 3; i++) {
+        if (!quantities[i] && (i != 2 || seconds != 0)) continue;
+        if (quantities[i] <= 999) append_number(ids, length, (int)quantities[i]);
+        else {
+            char digits[11];
+            snprintf(digits, sizeof(digits), "%lu", (unsigned long)quantities[i]);
+            for (const char *p = digits; *p; p++) append_prompt(ids, length, PROMPT_DIGIT_0 + *p - '0');
+        }
+        append_prompt(ids, length, units[i]);
+    }
+}
+
 static void handle_timer_events(unsigned timer_events, int64_t now)
 {
-    if (mode == MODE_STT || xiaozhi_stt_busy()) {
-        // Do not cancel or speak over a continuous transcription session.
-        deferred_timer_events |= timer_events & (TIMER_EVENT_ALARM | TIMER_EVENT_DONE);
-        return;
-    }
-    timer_events |= deferred_timer_events;
-    deferred_timer_events = 0;
-    if (timer_events & TIMER_EVENT_ALARM) {
-        alarm_fired_at_us = now;
-        stop_message_playback();
-        stop_prompt();
-        mode = MODE_IDLE;
-        start_prompt(PROMPT_ALARM_DUE, PROMPT_ACTION_NONE);
-    }
-    if (timer_events & TIMER_EVENT_DONE) {
-        stop_prompt();
-        mode = MODE_IDLE;
+    if (timer_events & TIMER_EVENT_ALARM) alarm_fired_at_us = now;
+    deferred_timer_events |= timer_events & (TIMER_EVENT_ALARM | TIMER_EVENT_DONE);
+    audio_snapshot_t audio;
+    audio_get_snapshot(&audio);
+    // Keep all microphone paths and in-progress prompts/playback undisturbed.
+    if (mode == MODE_STT || xiaozhi_stt_busy() || realtime_active || audio.recording ||
+        mode == MODE_RECORDING || mode == MODE_PLAYING || job == JOB_DOWNLOAD || job == JOB_PLAYING ||
+        mode == MODE_SETTING_ALARM || mode == MODE_SETTING_TIMER ||
+        prompt_length || prompt_playing || audio.speaker_playing || mark_all_read_confirming) return;
+    if (deferred_timer_events & TIMER_EVENT_ALARM) {
+        deferred_timer_events &= ~TIMER_EVENT_ALARM;
+        const int ids[] = {PROMPT_ALARM_DUE, PROMPT_ALARM_MELODY};
+        start_prompt_sequence(ids, 2, PROMPT_ACTION_NONE);
+    } else if (deferred_timer_events & TIMER_EVENT_DONE) {
+        deferred_timer_events &= ~TIMER_EVENT_DONE;
+        if (mode == MODE_COUNTDOWN) mode = MODE_IDLE;
         start_prompt(PROMPT_COUNTDOWN_DONE, PROMPT_ACTION_NONE);
+    } else if (stopwatch_result_count) {
+        int ids[PROMPT_SEQUENCE_CAPACITY], length = 0;
+        append_prompt(ids, &length, PROMPT_STOPWATCH_TOTAL);
+        append_duration(ids, &length, stopwatch_results[stopwatch_result_head]);
+        stopwatch_result_head = (stopwatch_result_head + 1) % STOPWATCH_RESULT_CAPACITY;
+        stopwatch_result_count--;
+        start_prompt_sequence(ids, length, PROMPT_ACTION_NONE);
+    } else if (stopwatch_busy_pending) {
+        stopwatch_busy_pending = false;
+        start_prompt(PROMPT_STOPWATCH_BUSY, PROMPT_ACTION_NONE);
+    } else if (stopwatch_start_pending) {
+        stopwatch_start_pending = false;
+        if (timers_stopwatch_active()) start_prompt(PROMPT_STOPWATCH_START, PROMPT_ACTION_NONE);
     } else if (timer_events & TIMER_EVENT_MINUTE) {
-        if (!prompt_playing && mode == MODE_COUNTDOWN) {
+        if (mode == MODE_COUNTDOWN) {
             int ids[PROMPT_SEQUENCE_CAPACITY], length = 0;
             append_prompt(ids, &length, PROMPT_REMAINING);
             append_number(ids, &length, timers_countdown_seconds() / 60);
             append_prompt(ids, &length, PROMPT_MINUTES);
             start_prompt_sequence(ids, length, PROMPT_ACTION_NONE);
         }
-    } else if ((timer_events & TIMER_EVENT_SECOND) && !prompt_playing && mode == MODE_COUNTDOWN &&
-               !(timer_events & TIMER_EVENT_MINUTE)) {
+    } else if ((timer_events & TIMER_EVENT_SECOND) && mode == MODE_COUNTDOWN) {
         (void)audio_play_beep(55, false);
     }
 }
@@ -1894,6 +1960,8 @@ static void task(void *argument)
             .storage_error = !outbox_ready || job == JOB_CACHE,
             .alarm_minute = timers_alarm_minute(),
             .countdown_seconds = timers_countdown_seconds(),
+            .stopwatch_running = timers_stopwatch_active(),
+            .stopwatch_seconds = timers_stopwatch_seconds(now),
             .realtime_active = realtime_active,
             .realtime_enabled = realtime_enabled,
             .network_via = network_fresh(now) ? network_via : 0,

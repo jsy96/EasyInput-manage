@@ -8,11 +8,11 @@ import { LiveVoicePlayer } from './services/live-audio'
 import { VoiceRecorder, VoiceSequencePlayer, voiceWav } from './services/voice'
 import { downloadFile, voiceZip, voiceZipBatches } from './services/downloads'
 const BOARD_LIGHTS = [
-  { label: '灯 1', hint: '未读慢闪 · 批量已读确认常亮' },
-  { label: '灯 2', hint: '闹钟到点常亮 1 分钟' },
-  { label: '灯 3', hint: '倒计时每 1 秒闪 1 次' },
-  { label: '灯 4', hint: '录音常亮 · 发送慢闪' },
-  { label: '灯 5', hint: '实时录音常亮' },
+  { label: '灯 1', hint: '接收信息慢闪；有未读语音常亮；其余熄灭' },
+  { label: '灯 2', hint: '闹钟到点慢闪 1 分钟；正／倒计时 1 Hz；已设闹钟常亮' },
+  { label: '灯 3', hint: 'S5／S6／S7 常亮；有待发送内容慢闪；其余熄灭' },
+  { label: '灯 4', hint: '网页实时监听采集中慢闪；其余熄灭' },
+  { label: '灯 5', hint: '语音服务网络正常慢闪；未连接或故障常亮' },
 ]
 export function VoiceChat({ room, board, lights, connection, busyChanged, disabled }: { room: RoomState; board: BoardStatus | null; lights: BoardLights | null; connection: ChatConnection | null; busyChanged(busy: boolean): void; disabled: boolean }): React.JSX.Element {
   const [recording, setRecording] = useState(false), [seconds, setSeconds] = useState(0)
@@ -206,11 +206,11 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
       {board?.voice && <p className="chat-board-state" role="status">{alarmMinute === null || alarmMinute === undefined ? '未设置闹钟' : `闹钟 ${String(Math.floor(alarmMinute / 60)).padStart(2, '0')}:${String(alarmMinute % 60).padStart(2, '0')}`} · {countdownSeconds ? `倒计时 ${Math.ceil(countdownSeconds / 60)} 分钟` : '无倒计时'}{board.voice.pending > 0 ? ` · ${board.voice.sending ? '发送中' : '待发送'} ${board.voice.pending} 条` : ''}{board.voice.storage_error ? ' · 录音存储异常' : ''}</p>}
       <div className="chat-messages" aria-live="polite">
         {room.next && <button className="button button-subtle full-button" disabled={historyLoading || busy || !room.connected} onClick={() => void loadOlder()}>{historyLoading ? '正在加载历史…' : `加载更早消息 · 已加载 ${messages.length} / ${room.total}`}</button>}
-        {!messages.length && <div className="empty-state"><Mic size={30} /><strong>还没有消息</strong><p>网页和开发板录音共用一条时间线<br />已有转写文字仍可查看</p></div>}
+        {!messages.length && <div className="empty-state"><Mic size={30} /><strong>还没有消息</strong><p>网页、开发板录音和 S7 转写文字共用一条时间线</p></div>}
         {messages.map(m => <div key={m.id} className={`chat-message ${m.sender === room.self?.id ? 'chat-mine' : ''}`}>
           <div className="chat-message-meta"><strong>{m.sender === 'board' ? '开发板' : m.name}</strong><span>{m.kind === 'text' ? '语音转文字' : m.sender === 'board' ? '录音' : '网页'}</span><time>{new Date(m.created).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</time></div>
           {m.kind === 'text' ? <p style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{m.text}</p> : urls[m.id] ? <audio controls autoPlay preload="metadata" ref={element => { players.current[m.id] = element }} onPlay={() => { stopSequence(); Object.entries(players.current).forEach(([id, player]) => { if (id !== m.id) player?.pause() }); setPlaying(true) }} onPause={() => setPlaying(false)} onEnded={() => setPlaying(false)} src={urls[m.id]} aria-label={`${m.name}的语音留言`} /> : <button className="button button-subtle chat-play" disabled={!room.connected || !!loading || busy} onClick={() => void load(m)}><Volume2 size={16} />{loading === m.id ? '加载语音…' : '播放语音'}<span>{Math.ceil(m.samples / 8000)}″</span></button>}
-          {m.kind !== 'text' && <small className={m.read ? 'is-live' : 'is-muted'}>{m.read ? '开发板已播放' : '开发板未读'}</small>}
+          {m.kind !== 'text' && <small className={m.read ? 'is-live' : 'is-muted'}>{m.read ? '开发板已读' : '开发板未读'}</small>}
         </div>)}
       </div>
       <div className="chat-compose">
@@ -225,10 +225,11 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
         <ul className="board-lights">
           {BOARD_LIGHTS.map(({ label, hint }, index) => {
             const pixel = board?.lights.pixels[index]
-            const mode = lights?.modes?.[index] ?? (pixel === 'on' ? 'solid' : pixel === 'off' ? 'off' : 'unknown')
+            const mode = board || room.online ? lights?.modes?.[index] ?? (pixel === 'on' ? 'solid' : pixel === 'off' ? 'off' : 'unknown') : 'unknown'
             return <li className="board-light-row" key={label}><i className={`board-light-dot is-${mode}`} /><span>{label}</span><small>{hint}</small></li>
           })}
         </ul>
+        <p className="light-note">适用固件 0.4.20 起。红灯均为 1% 亮度；慢闪：亮 0.5 秒、灭 2 秒；1 Hz：亮灭各 0.5 秒。灯 2 按表中顺序优先显示，其他计时继续运行。</p>
       </section>
       <section className={`realtime-card ${room.realtimeActive ? 'is-active' : ''}`}>
         <div className="side-title"><span><Radio size={17} />实时监听状态</span><span>{room.realtimeActive ? '监听中' : room.realtimeEnabled ? '开启中' : '关闭'}<i className={room.realtimeActive ? 'live-dot active' : 'live-dot'} /></span></div>
@@ -238,16 +239,32 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
       <section className="key-map">
         <div className="side-title"><span><Keyboard size={17} />开发板按键</span></div>
         <dl>
-          <div><dt>S1</dt><dd>播放前一条历史语音，连续按继续往前；长按进入批量已读确认</dd></div>
-          <div><dt>S2</dt><dd>播放第一条未读，并重设 S1 回听起点；播放中可按 S1 回听</dd></div>
-          <div><dt>S3</dt><dd><Bell size={13} />设置每日闹钟，长按取消</dd></div>
-          <div><dt>S4</dt><dd><Timer size={13} />设置倒计时</dd></div>
-          <div><dt>S5</dt><dd>短按开始录音，再短按结束并发送；长按 3 秒取消本次未发送录音，无双击功能</dd></div>
-          <div><dt>S6</dt><dd>短按开始与小智实时语音对话，再短按结束；小智回答后自动继续听。需 Wi-Fi 联网并完成小智绑定，与网页实时监听互斥</dd></div>
-          <div><dt>S7</dt><dd>短按开始持续语音转文字，小智识别后可分多条写入聊天记录；再短按结束，等待网页送达确认后播报“成功”或“失败”。需打开本聊天页</dd></div>
-          <div><dt>S8</dt><dd>已停用</dd></div>
-          <div><dt>旋钮</dt><dd>旋转调整音量，小智对话和语音转文字期间也可调节；仍可调整闹钟与倒计时</dd></div>
+          <div><dt>S1</dt><dd>短按回听前一条历史语音，连续按继续往前，到最早不循环。长按 3 秒，进入全部已读确认。</dd></div>
+          <div><dt>S2</dt><dd>短按播放最早未读，并重设 S1 回听起点。全部已读确认中，长按 3 秒执行，短按取消。</dd></div>
+          <div><dt>S3</dt><dd><Bell size={13} />短按设置每日闹钟，旋钮每格调 30 分钟（00:00～23:30）；数字播完静置 3 秒保存。长按 1.2 秒取消闹钟。</dd></div>
+          <div><dt>S4</dt><dd><Timer size={13} />短按设置倒计时，默认 30 分钟；旋钮每格调 1 分钟（1～60 分钟），数字播完静置 3 秒开始。运行中按 S1～S7 或旋钮可取消；S8 独立计时。</dd></div>
+          <div><dt>S5</dt><dd>短按，等开始提示结束后录音；再短按结束并发送。满 20 秒暂存，需再按发送；长按 3 秒取消本次未发送录音。开始提示未播完就再按，会取消开始。</dd></div>
+          <div><dt>S6</dt><dd>短按开始小智对话，再按立即结束。回答时暂停收音，播完自动继续听；请等回答结束再说。对话不写入聊天记录。</dd></div>
+          <div><dt>S7</dt><dd>短按开始持续语音转文字，再按停止收音。最多等 20 秒尾句，再等 12 秒网页显示回执；本轮有文字且全部显示才播报“成功”。需打开本“语音”页，等待期间再按不会另开一轮。</dd></div>
+          <div><dt>S8</dt><dd>短按开始正计时，再按停止并播报总时长，下次从零开始。与倒计时独立；收音或播放忙时先记下停止时刻，等空闲再播报。断网可用，重启归零。</dd></div>
+          <div><dt>旋钮</dt><dd>设置闹钟／倒计时时调整数值；其余状态每格调音量 10%，范围 10%～100%。空闲时长按 3 秒开启手机配网热点。</dd></div>
         </dl>
+      </section>
+      <section className="key-map">
+        <details className="board-help">
+          <summary>全部已读怎么操作</summary>
+          <p>长按 S1 3 秒后松开，听到确认提示，再长按 S2 3 秒。云端确认后播报成功；失败或 12 秒超时会提示失败。历史和音频保留。</p>
+          <p>确认中短按 S2，或按 S3／S4／旋钮可取消；S5～S7 暂不响应，S8 仍独立计时。灯 1 继续按未读／接收状态显示。</p>
+        </details>
+        <details className="board-help">
+          <summary>操作限制与失败处理</summary>
+          <p>S5 录音、S6 对话、S7 转写和网页实时监听互斥。S6／S7 期间仅当前功能键、S8 和旋钮旋转有效。实时监听需在网页关闭，板端 S1～S5 暂停操作。</p>
+          <p>S6／S7 需开发板直接连接 2.4 GHz Wi-Fi，并在小智官方平台绑定；蓝牙网关可转发历史语音和状态，不能代替小智连接或实时监听。</p>
+          <p>正计时、停止结果和待播报提示不跨重启保存。音频忙时最多排队 8 次正计时结果，满后需等播报腾出位置再开始。闹钟音乐约 10 秒、播放一次，收音期间延后。</p>
+          <p>S7 失败后文字仍可能补传，后来送达不补播成功。待发文字队列未满时可开始下一轮；本轮音频不保存，只有已持久化的队首文字有断电保留保证。</p>
+          <p>普通录音最多离线缓存 8 条，每条 20 秒，满后拒绝新录音；已开始发送的录音不受 S5 长按取消影响。保存失败时保持供电。网页播放不会改变开发板未读状态。</p>
+          <p>闹钟使用北京时间 UTC+8，每次开机需有效网络校时；设置可跨重启保存。倒计时和正计时断网继续，重启后清零。S5／S6／S7 在松手时执行，没有双击功能。</p>
+        </details>
       </section>
     </aside>
   </article>

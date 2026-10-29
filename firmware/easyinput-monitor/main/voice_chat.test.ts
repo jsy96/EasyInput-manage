@@ -75,6 +75,9 @@ static int played[100], played_count, requested_prompt, interrupted;
 static stt_event_t queued[20];
 static int queued_count;
 static int64_t esp_timer_get_time(void) { return clock_us; }
+static unsigned stopwatch_toggles;
+static int64_t stopwatch_toggled_at;
+static void toggle_stopwatch(int64_t now) { stopwatch_toggles++; stopwatch_toggled_at=now; }
 bool xiaozhi_stt_busy(void) { return worker_busy; }
 void xiaozhi_stt_get_snapshot(stt_snapshot_t *s) { *s=(stt_snapshot_t){.busy=worker_busy,.capturing=capturing,.received_texts=received_texts,.acked_texts=acked_texts,.queued_texts=queued_texts,.session_queued_texts=received_texts-acked_texts}; }
 esp_err_t xiaozhi_dialogue_start(void) { starts++; if(start_error) return start_error; worker_busy=capturing=true; return ESP_OK; }
@@ -124,6 +127,7 @@ static void reset(void) {
   stt_engine_started=delivery_success=delivery_network=false; prior_texts=delivery_results=0;
   received_texts=acked_texts=queued_texts=0; text_request_id[0]=text_inflight_id[0]=0;
   text_sends=0; text_retry_at=0; network_available=true;
+  stopwatch_toggles=0; stopwatch_toggled_at=0; input_timestamp=0;
   realtime_active=mark_all_read_confirming=send_when_saved=false;
   memset(key_down,0,sizeof key_down); memset(key_held,0,sizeof key_held);
   memset(key_long_handled,0,sizeof key_long_handled); memset(key_consumed,0,sizeof key_consumed);
@@ -138,6 +142,15 @@ static void begin(void) {
   finish_prompts(); assert(starts==previous_starts+1 && capturing && worker_busy && mode==MODE_STT);
 }
 int main(void) {
+  // S8 uses the release timestamp and cannot cancel audio or a countdown.
+  reset(); mode=MODE_COUNTDOWN; on_key(7,false); assert(!stopwatch_toggles);
+  on_key(7,true); on_key(7,true); input_timestamp=clock_us+2300000;
+  on_key(7,false); on_key(7,false);
+  assert(stopwatch_toggles==1 && stopwatch_toggled_at==input_timestamp && mode==MODE_COUNTDOWN);
+  reset(); begin(); press(7,50000);
+  assert(stopwatch_toggles==1 && capturing && stops==0 && mode==MODE_STT);
+  reset(); realtime_active=true; press(7,50000);
+  assert(stopwatch_toggles==1 && realtime_active);
   // Each S5 release is immediately an ordinary recording action; no double-click mode.
   reset(); press(4,50000); assert(prompt_action==PROMPT_ACTION_START_RECORDING);
   finish_prompts(); assert(ordinary_recordings==1 && mode==MODE_RECORDING);

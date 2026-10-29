@@ -61,6 +61,8 @@ export interface BoardStatus {
     setup_active: boolean
     alarm_minute?: number | null
     countdown_seconds?: number
+    stopwatch_running?: boolean
+    stopwatch_seconds?: number
     realtime_active?: boolean
     realtime_enabled?: boolean
   }
@@ -185,6 +187,9 @@ export function parseBoardMessage(line: string): BoardMessage | null {
         Number.isInteger(record.voice.alarm_minute) && record.voice.alarm_minute >= 0 && record.voice.alarm_minute < 1440))) ||
       (record.voice.countdown_seconds !== undefined && (!isFiniteNumber(record.voice.countdown_seconds) ||
         !Number.isInteger(record.voice.countdown_seconds) || record.voice.countdown_seconds < 0 || record.voice.countdown_seconds > 3600)) ||
+      (record.voice.stopwatch_running !== undefined && typeof record.voice.stopwatch_running !== 'boolean') ||
+      (record.voice.stopwatch_seconds !== undefined && (!isFiniteNumber(record.voice.stopwatch_seconds) ||
+        !Number.isInteger(record.voice.stopwatch_seconds) || record.voice.stopwatch_seconds < 0 || record.voice.stopwatch_seconds > 4294967295)) ||
       (record.voice.realtime_active !== undefined && typeof record.voice.realtime_active !== 'boolean') ||
       (record.voice.realtime_enabled !== undefined && typeof record.voice.realtime_enabled !== 'boolean'))) return null
     if (record.audio !== undefined && (!isRecord(record.audio) || typeof record.audio.ready !== 'boolean' ||

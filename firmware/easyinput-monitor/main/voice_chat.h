@@ -14,6 +14,8 @@ typedef struct {
     bool storage_error;
     int alarm_minute;
     int countdown_seconds;
+    bool stopwatch_running;
+    uint32_t stopwatch_seconds;
     bool realtime_active;
     bool realtime_enabled;
     int network_via;

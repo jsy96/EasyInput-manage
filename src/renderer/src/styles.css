@@ -131,8 +131,9 @@ p, h1, h2, h3, h4 { margin: 0; }
 .live-dot { width: 7px; height: 7px; border-radius: 50%; background: #c6cdc7; }
 .live-dot.active { background: var(--red); animation: blink .7s steps(1) infinite; }
 .board-lights { list-style: none; display: flex; flex-direction: column; gap: 7px; margin: 11px 0 0; padding: 0; }
-.board-light-row { display: flex; align-items: center; gap: 9px; color: #52645a; font-size: 10px; }
-.board-light-row small { margin-left: auto; color: #97a29b; font-size: 9px; }
+.board-light-row { display: grid; grid-template-columns: 10px 30px minmax(0, 1fr); align-items: start; gap: 9px; color: #52645a; font-size: 10px; line-height: 1.7; }
+.board-light-row small { color: #6b7870; font-size: 10px; overflow-wrap: anywhere; }
+.board-light-row .board-light-dot { margin-top: 4px; }
 .board-light-dot { flex: 0 0 auto; width: 10px; height: 10px; border-radius: 50%; background: #d2d9d3; }
 .board-light-dot.is-solid { background: var(--red); }
 .board-light-dot.is-blink { background: var(--red); animation: light-blink 2.5s linear infinite; }
@@ -143,6 +144,10 @@ p, h1, h2, h3, h4 { margin: 0; }
 .key-map dl > div { display: grid; grid-template-columns: 51px minmax(0, 1fr); gap: 7px; padding: 8px 0; border-top: 1px solid #eef1e9; }
 .key-map dt { color: #395b4d; font: 650 10px var(--mono); }
 .key-map dd { display: flex; align-items: flex-start; gap: 5px; margin: 0; color: #6b7870; font-size: 10px; line-height: 1.55; }
+.key-map dd svg { flex: 0 0 auto; margin-top: 2px; }
+.board-help + .board-help { margin-top: 12px; padding-top: 12px; border-top: 1px solid #eef1e9; }
+.board-help summary { color: #395b4d; font-size: 12px; font-weight: 600; cursor: pointer; }
+.board-help p { margin: 10px 0 0; color: #6b7870; font-size: 11px; line-height: 1.8; overflow-wrap: anywhere; }
 
 .device-page { overflow-y: auto; padding: 24px 25px; }
 .device-summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -195,7 +200,7 @@ p, h1, h2, h3, h4 { margin: 0; }
 
 @keyframes blink { 50% { opacity: .16; } }
 @keyframes light-blink { 0%, 19.9% { opacity: 1; } 20%, 100% { opacity: .14; } }
-@keyframes light-flash { 0%, 14.9% { opacity: 1; } 15%, 100% { opacity: .14; } }
+@keyframes light-flash { 0%, 49.9% { opacity: 1; } 50%, 100% { opacity: .14; } }
 
 @media (max-width: 860px) {
   .voice-page { grid-template-columns: 1fr; overflow-y: auto; }

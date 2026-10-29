@@ -41,6 +41,13 @@ describe('board protocol', () => {
     expect(parseBoardMessage(JSON.stringify({ ...audioStatus, voice }))).toEqual({ ...audioStatus, voice })
     expect(parseBoardMessage(JSON.stringify({ ...audioStatus, voice: { ...voice, sending: true, pending: 1 } }))).not.toBeNull()
     expect(parseBoardMessage(JSON.stringify({ ...audioStatus, voice: { ...voice, ledger_pending: 64 } }))).not.toBeNull()
+    for (const stopwatch_seconds of [0, 59, 3601, 4294967295]) {
+      expect(parseBoardMessage(JSON.stringify({ ...audioStatus, voice: { ...voice, stopwatch_running: true, stopwatch_seconds } }))).not.toBeNull()
+    }
+    for (const stopwatch_seconds of [-1, 0.5, '1', 4294967296]) {
+      expect(parseBoardMessage(JSON.stringify({ ...audioStatus, voice: { ...voice, stopwatch_seconds } }))).toBeNull()
+    }
+    expect(parseBoardMessage(JSON.stringify({ ...audioStatus, voice: { ...voice, stopwatch_running: 1 } }))).toBeNull()
     for (const ledger_pending of [-1, 65, 0.5, '1']) {
       expect(parseBoardMessage(JSON.stringify({ ...audioStatus, voice: { ...voice, ledger_pending } }))).toBeNull()
     }

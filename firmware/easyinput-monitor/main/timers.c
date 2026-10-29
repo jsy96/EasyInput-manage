@@ -17,9 +17,15 @@ static int countdown_seconds;
 static int64_t next_countdown_tick_us;
 static int64_t last_alarm_day_minute = -1;
 static int64_t last_alarm_check_us;
+static bool stopwatch_active;
+static int64_t stopwatch_started_at_us;
+static uint32_t stopwatch_elapsed_seconds;
 
 void timers_init(void)
 {
+    stopwatch_active = false;
+    stopwatch_started_at_us = 0;
+    stopwatch_elapsed_seconds = 0;
     setenv("TZ", "CST-8", 1);
     tzset();
     nvs_handle_t handle;
@@ -38,15 +44,28 @@ int timers_alarm_minute(void)
 bool timers_set_alarm_minute(int minute)
 {
     if (minute < -1 || minute >= ALARM_NONE) return false;
-    alarm_minute = minute < 0 ? ALARM_NONE : minute;
-    last_alarm_day_minute = -1;
+    const uint16_t next_alarm = minute < 0 ? ALARM_NONE : minute;
     nvs_handle_t handle;
-    if (nvs_open("schedule", NVS_READWRITE, &handle) != ESP_OK) return false;
-    const esp_err_t result = nvs_set_u16(handle, "alarm", (uint16_t)alarm_minute);
-    const esp_err_t commit = result == ESP_OK ? nvs_commit(handle) : result;
+    esp_err_t result = nvs_open("schedule", NVS_READWRITE, &handle);
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "Alarm nvs_open failed: %s (0x%x)", esp_err_to_name(result), (unsigned)result);
+        return false;
+    }
+    result = nvs_set_u16(handle, "alarm", next_alarm);
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "Alarm nvs_set_u16 failed: %s (0x%x)", esp_err_to_name(result), (unsigned)result);
+        nvs_close(handle);
+        return false;
+    }
+    result = nvs_commit(handle);
     nvs_close(handle);
-    if (commit != ESP_OK) ESP_LOGE(TAG, "Unable to persist alarm: %s", esp_err_to_name(commit));
-    return commit == ESP_OK;
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "Alarm nvs_commit failed: %s (0x%x)", esp_err_to_name(result), (unsigned)result);
+        return false;
+    }
+    alarm_minute = next_alarm;
+    last_alarm_day_minute = -1;
+    return true;
 }
 
 bool timers_countdown_active(void)
@@ -72,6 +91,33 @@ void timers_cancel_countdown(void)
     countdown_active = false;
     countdown_seconds = 0;
     next_countdown_tick_us = 0;
+}
+
+bool timers_stopwatch_active(void)
+{
+    return stopwatch_active;
+}
+
+uint32_t timers_stopwatch_seconds(int64_t now_us)
+{
+    if (!stopwatch_active) return stopwatch_elapsed_seconds;
+    if (now_us <= stopwatch_started_at_us) return 0;
+    const uint64_t seconds = (uint64_t)(now_us - stopwatch_started_at_us) / 1000000;
+    return seconds > UINT32_MAX ? UINT32_MAX : (uint32_t)seconds;
+}
+
+void timers_start_stopwatch(int64_t now_us)
+{
+    stopwatch_started_at_us = now_us;
+    stopwatch_elapsed_seconds = 0;
+    stopwatch_active = true;
+}
+
+uint32_t timers_stop_stopwatch(int64_t now_us)
+{
+    stopwatch_elapsed_seconds = timers_stopwatch_seconds(now_us);
+    stopwatch_active = false;
+    return stopwatch_elapsed_seconds;
 }
 
 unsigned timers_poll(int64_t now_us)

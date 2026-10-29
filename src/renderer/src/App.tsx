@@ -558,6 +558,8 @@ export default function App(): React.JSX.Element {
   }
   const alarmMinute = currentStatus.voice?.alarm_minute
   const countdownSeconds = currentStatus.voice?.countdown_seconds ?? 0
+  const stopwatchSeconds = currentStatus.voice?.stopwatch_seconds
+  const stopwatchTime = stopwatchSeconds === undefined ? '等待设备状态' : `${Math.floor(stopwatchSeconds / 3600)}:${String(Math.floor(stopwatchSeconds / 60) % 60).padStart(2, '0')}:${String(stopwatchSeconds % 60).padStart(2, '0')}`
   return <main className="app-shell">
     <div className="workspace">
       <header className="topbar">
@@ -592,8 +594,9 @@ export default function App(): React.JSX.Element {
               <span className={`status-chip ${boardOnline ? 'is-live' : 'is-muted'}`}>{boardOnline ? '在线' : '离线'}</span>
             </div>
             <div className="device-status-grid">
-              <div><Bell size={17} /><span>每日闹钟</span><strong>{formatTime(alarmMinute)}</strong><small>{alarmMinute === null || alarmMinute === undefined ? '短按 S3 设置' : '按住 S3 取消'}</small></div>
-              <div><Timer size={17} /><span>倒计时</span><strong>{countdownSeconds ? `${Math.ceil(countdownSeconds / 60)} 分钟` : '未运行'}</strong><small>{countdownSeconds ? '任意键取消' : '短按 S4 设置'}</small></div>
+              <div><Bell size={17} /><span>每日闹钟</span><strong>{formatTime(alarmMinute)}</strong><small>{alarmMinute === null || alarmMinute === undefined ? '短按 S3，旋钮调节后静置保存' : '北京时间 · 长按 S3 1.2 秒取消'}</small></div>
+              <div><Timer size={17} /><span>倒计时</span><strong>{countdownSeconds ? `${Math.ceil(countdownSeconds / 60)} 分钟` : '未运行'}</strong><small>{countdownSeconds ? 'S1～S7／旋钮取消，S8 独立计时' : '短按 S4，旋钮调整 1～60 分钟'}</small></div>
+              <div><Timer size={17} /><span>正计时{currentStatus.voice?.stopwatch_running ? ' · 运行中' : ''}</span><strong>{stopwatchTime}</strong><small>短按 S8 开始／停止；停止后播报总时长，重启归零。数值随设备状态更新。</small></div>
               <div><Radio size={17} /><span>实时监听状态</span><strong>{room.realtimeActive ? '监听中' : room.realtimeEnabled ? '开启中' : '关闭'}</strong><small>在语音页打开或关闭</small></div>
               <div><Download size={17} /><span>血压血糖记录</span><button className="text-button" disabled={!room.connected || healthDownloading || deviceBusy} onClick={() => void downloadHealth()}>{healthDownloading ? '正在下载…' : '下载历史 CSV'}</button><small>{room.healthPending ? `板端还有 ${room.healthPending} 条待同步` : '导出云端已同步的全部历史'}</small></div>
               <div><Download size={17} /><span>记账记录</span><button className="text-button" disabled={!room.connected || ledgerDownloading || deviceBusy} onClick={() => void downloadLedger()}>{ledgerDownloading ? '正在下载…' : '下载记账 CSV'}</button><small>{room.ledgerPending ? `板端还有 ${room.ledgerPending} 笔待同步` : '导出云端已同步的全部记账'}</small></div>
@@ -603,6 +606,8 @@ export default function App(): React.JSX.Element {
             <details className="setup-section">
               <summary><Wifi size={16} />连接 Wi-Fi 与语音服务<ChevronDown size={15} /></summary>
               <p className="light-note">Wi-Fi：{stateLabel(currentStatus.wifi.state)} · {currentStatus.wifi.ssid || '尚未配置'}；USB：{usbProtocolOnline ? '已连接' : serialConnecting ? '连接中' : '未连接'}；蓝牙：{bleConnecting ? '连接中' : bleConnected ? '已连接' : '未连接'}{bleRetrying ? '（等待自动重连）' : ''}</p>
+              <p className="light-note">S6 小智对话、S7 转写和实时监听需开发板 Wi-Fi 直连；蓝牙网关可转发历史语音和状态。首次使用 S6／S7，按播报的验证码在小智官方平台绑定。</p>
+              <p className="light-note">手机配网：空闲时长按旋钮 3 秒，连接 EasyInput-Setup- 加设备地址后四位的热点（密码 easyinput），打开 http://192.168.4.1，保存 2.4 GHz Wi-Fi。热点开放 2 分钟；小智验证码与云端配对码用途不同。</p>
               <div className="device-actions">
                 <button className="button button-subtle" disabled={deviceBusy} onClick={() => void connectBoard()}>{serialConnecting ? <LoaderCircle className="spin" size={15} /> : <Usb size={15} />}{serialOpen ? '重新选择 USB' : '连接 USB'}</button>
                 <button className="button button-subtle" disabled={deviceBusy} onClick={() => void (bleConnected ? bleConnectionRef.current?.disconnect() : bleConnectionRef.current?.connect())}><Bluetooth size={15} />{bleConnected ? '断开蓝牙' : '连接蓝牙'}</button>
@@ -628,6 +633,7 @@ export default function App(): React.JSX.Element {
             <details className="setup-section">
               <summary><Download size={16} />固件升级<ChevronDown size={15} /></summary>
               <div className="firmware-current"><span>当前固件</span><strong>{hello?.firmware ?? '未读取'}</strong><span>{manifest ? `已导入 ${manifest.version}` : '尚未导入固件包'}</span></div>
+              <p className="light-note">选择包含 firmware.json 和三个镜像的完整固件包目录。识别芯片及设备地址后确认写入；写入期间保持供电。自动进入下载模式失败时，保持开机，短按并松开一次 BOOT 后重试；完成后关机再开机，恢复正常使用。</p>
               <input ref={flashFolderRef} type="file" multiple hidden disabled={deviceBusy} {...{ webkitdirectory: '', directory: '' }} onChange={(event) => void importFirmware(event)} />
               <div className="firmware-actions">
                 <button className="button button-subtle" disabled={deviceBusy} onClick={() => flashFolderRef.current?.click()}><FileUp size={15} />{manifest ? '重新选择固件包' : '选择固件包'}</button>

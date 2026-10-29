@@ -25,6 +25,7 @@ it('runs the actual ledger and measurement C code against isolated synthetic sto
 #define LONG_US 1200000
 #define SETUP_LONG_US 3000000
 #define PROMPT_SEQUENCE_CAPACITY 128
+#define STOPWATCH_RESULT_CAPACITY 8
 ${enums}
 ${timerEvents}
 static job_t job;
@@ -41,6 +42,14 @@ static bool stt_text_result_pending, stt_text_failed, stt_engine_started, stt_ro
 static int64_t stt_delivery_deadline;
 static int stt_stops, text_stops;
 static unsigned deferred_timer_events;
+static uint32_t stopwatch_results[STOPWATCH_RESULT_CAPACITY];
+static unsigned stopwatch_result_head, stopwatch_result_count;
+static bool stopwatch_start_pending, stopwatch_busy_pending, stopwatch_active;
+static int64_t stopwatch_started_at;
+static int prompt_length;
+static bool timers_stopwatch_active(void) { return stopwatch_active; }
+static void timers_start_stopwatch(int64_t now) { stopwatch_active=true; stopwatch_started_at=now; }
+static uint32_t timers_stop_stopwatch(int64_t now) { stopwatch_active=false; return (uint32_t)((now-stopwatch_started_at)/1000000); }
 typedef struct { bool capturing; } stt_snapshot_t;
 static bool stt_capturing;
 static bool xiaozhi_stt_busy(void) { return stt_busy; }
@@ -75,7 +84,7 @@ static bool timers_set_alarm_minute(int n) { (void)n; return true; }
 static int timers_countdown_seconds(void) { return 60; }
 static int audio_play_beep(uint16_t ms, bool strong) { (void)ms; (void)strong; return 0; }
 static void network_setup_begin(void) { setup_calls++; }
-typedef struct { unsigned volume; bool recording; } audio_snapshot_t;
+typedef struct { unsigned volume; bool recording, speaker_playing; } audio_snapshot_t;
 static void audio_get_snapshot(audio_snapshot_t *a) { *a = (audio_snapshot_t){.volume = speaker_volume, .recording = ordinary_recording}; }
 static int audio_set_volume(uint8_t v) { speaker_volume=v; volume_changes++; return 0; }
 static void announce_alarm_draft(void) {}
@@ -83,13 +92,15 @@ static void announce_timer_draft(void) {}
 static void announce_volume(void) {}
 static bool uploading(void) { return job == JOB_UP_BEGIN || job == JOB_UP_CHUNK || job == JOB_UP_COMMIT; }
 static bool on_long_key(int key);
-${['begin_recording_with_prompt', 'begin_dialogue', 'begin_transcription', 'cancel_recording', 'on_short_key', 'key_long_threshold', 'on_stt_key', 'on_key', 'on_long_key', 'on_rotate', 'handle_timer_events'].map(extractFunction).join('\n')}
+${['toggle_stopwatch', 'begin_recording_with_prompt', 'begin_dialogue', 'begin_transcription', 'cancel_recording', 'on_short_key', 'key_long_threshold', 'on_stt_key', 'on_key', 'on_long_key', 'on_rotate', 'append_duration', 'handle_timer_events'].map(extractFunction).join('\n')}
 static void reset_input(void) {
   mode = MODE_IDLE; job = JOB_IDLE; stop_prompt();
   stt_busy = stt_pending = stt_capturing = false;
   stt_s6_pressed = stt_s7_pressed = stt_text_session = stt_text_result_pending = stt_text_failed = stt_engine_started = false;
   stt_stops = text_stops = 0; stt_delivery_deadline = 0;
   deferred_timer_events = 0;
+  stopwatch_active=stopwatch_start_pending=stopwatch_busy_pending=false;
+  stopwatch_result_head=stopwatch_result_count=0;
   stt_round_started = stt_end_announced = stt_terminal_received = false;
   memset(key_down, 0, sizeof key_down); memset(key_held, 0, sizeof key_held);
   memset(key_long_handled, 0, sizeof key_long_handled); memset(key_consumed, 0, sizeof key_consumed);
