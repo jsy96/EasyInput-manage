@@ -65,6 +65,7 @@ void ble_store_config_init(void);
 #define USB_LINE_MAX 2048
 #define PARTITION_COUNT_MAX 24
 #define BLE_TX_QUEUE_DEPTH 16
+#define INPUT_MONITOR_QUEUE_DEPTH 32
 #define WIFI_STARTED_BIT (1U << 0)
 #define WIFI_STOPPED_BIT (1U << 1)
 #define WIFI_DISCONNECTED_BIT (1U << 2)
@@ -82,6 +83,8 @@ static SemaphoreHandle_t usb_tx_mutex;
 static SemaphoreHandle_t ble_notify_tx_done;
 static QueueHandle_t ble_tx_queue;
 static QueueHandle_t board_command_queue;
+static QueueHandle_t input_monitor_queue;
+static uint32_t input_monitor_dropped;
 static EventGroupHandle_t wifi_lifecycle_events;
 static httpd_handle_t wifi_websocket_server;
 static unsigned wifi_websocket_peers;
@@ -191,6 +194,13 @@ typedef struct {
     bool stable_pressed;
     int64_t changed_at_us;
 } debounced_input_t;
+
+typedef struct {
+    int64_t at_us;
+    int key;
+    int delta;
+    bool pressed;
+} input_monitor_event_t;
 
 static void wifi_websocket_broadcast(void *arg)
 {
@@ -488,24 +498,49 @@ static void clear_command_secret(cJSON *command, const char *name)
     }
 }
 
-static void send_input_event(const char *source, const char *action, const char *key, int delta)
+static void send_input_event(const input_monitor_event_t *event)
 {
     char line[160];
-    const int64_t uptime_ms = esp_timer_get_time() / 1000;
-    if (key != NULL) {
+    const char *source = event->key < KEY_COUNT ? "key" : "encoder";
+    const char *action = event->delta ? "rotate" : event->pressed ? "down" : "up";
+    const int64_t uptime_ms = event->at_us / 1000;
+    if (event->key < KEY_COUNT) {
         snprintf(line, sizeof(line),
-                 "{\"type\":\"event\",\"protocol\":%d,\"source\":\"%s\",\"key\":\"%s\",\"action\":\"%s\",\"uptime_ms\":%lld}",
-                 PROTOCOL_VERSION, source, key, action, (long long)uptime_ms);
-    } else if (strcmp(action, "rotate") == 0) {
+                 "{\"type\":\"event\",\"protocol\":%d,\"source\":\"%s\",\"key\":\"S%d\",\"action\":\"%s\",\"uptime_ms\":%lld}",
+                 PROTOCOL_VERSION, source, event->key + 1, action, (long long)uptime_ms);
+    } else if (event->delta) {
         snprintf(line, sizeof(line),
                  "{\"type\":\"event\",\"protocol\":%d,\"source\":\"%s\",\"action\":\"rotate\",\"delta\":%d,\"uptime_ms\":%lld}",
-                 PROTOCOL_VERSION, source, delta, (long long)uptime_ms);
+                 PROTOCOL_VERSION, source, event->delta, (long long)uptime_ms);
     } else {
         snprintf(line, sizeof(line),
                  "{\"type\":\"event\",\"protocol\":%d,\"source\":\"%s\",\"action\":\"%s\",\"uptime_ms\":%lld}",
                  PROTOCOL_VERSION, source, action, (long long)uptime_ms);
     }
     send_line(line);
+}
+
+static void input_monitor_task(void *arg)
+{
+    (void)arg;
+    input_monitor_event_t event;
+    for (;;) {
+        if (xQueueReceive(input_monitor_queue, &event, portMAX_DELAY) == pdTRUE) send_input_event(&event);
+    }
+}
+
+static void dispatch_input_event(int key, bool pressed, int delta, int64_t now_us)
+{
+    // Local controls must not wait for USB/BLE/network telemetry. The scanner
+    // only copies a small event; a stalled monitor may lose telemetry, never keys.
+    if (delta) voice_chat_rotate(delta);
+    else voice_chat_key(key, pressed);
+    const input_monitor_event_t event = {.at_us = now_us, .key = key, .delta = delta, .pressed = pressed};
+    if (input_monitor_queue == NULL || xQueueSend(input_monitor_queue, &event, 0) != pdTRUE) {
+        portENTER_CRITICAL(&state_lock);
+        input_monitor_dropped++;
+        portEXIT_CRITICAL(&state_lock);
+    }
 }
 
 static void emit_hello(void)
@@ -615,7 +650,7 @@ static void emit_status(void)
     char wifi_state_copy[16], wifi_ssid_copy[33], wifi_ip_copy[16], wifi_netmask_copy[16];
     char wifi_gateway_copy[16], wifi_dns_copy[16], ble_state_copy[16];
     int wifi_rssi_copy, wifi_channel_copy, wifi_disconnect_code_copy, ble_peers_copy;
-    uint32_t wifi_disconnects_copy, wifi_retries_copy;
+    uint32_t wifi_disconnects_copy, wifi_retries_copy, input_monitor_dropped_copy;
     bool wifi_configured_copy;
     portENTER_CRITICAL(&state_lock);
     strlcpy(wifi_state_copy, wifi_state, sizeof(wifi_state_copy));
@@ -632,6 +667,7 @@ static void emit_status(void)
     wifi_retries_copy = wifi_retries;
     wifi_configured_copy = wifi_configured;
     ble_peers_copy = ble_peers;
+    input_monitor_dropped_copy = input_monitor_dropped;
     portEXIT_CRITICAL(&state_lock);
 
     const uint64_t now_us = esp_timer_get_time();
@@ -781,6 +817,9 @@ static void emit_status(void)
     cJSON_AddNumberToObject(voice_debug, "realtime_sink_calls", voice_state.realtime_sink_calls);
     cJSON_AddNumberToObject(voice_debug, "realtime_sink_bytes", voice_state.realtime_sink_bytes);
     cJSON_AddNumberToObject(voice_debug, "input_dropped", voice_state.input_dropped);
+    cJSON_AddNumberToObject(voice_debug, "input_monitor_dropped", input_monitor_dropped_copy);
+    cJSON_AddNumberToObject(voice_debug, "input_monitor_waiting", input_monitor_queue ? uxQueueMessagesWaiting(input_monitor_queue) : 0);
+    cJSON_AddBoolToObject(voice_debug, "input_monitor_ready", input_monitor_queue != NULL);
     cJSON_AddNumberToObject(voice_debug, "control_dropped", voice_state.control_dropped);
     cJSON_AddNumberToObject(voice_debug, "input_waiting", voice_state.input_waiting);
     cJSON_AddNumberToObject(voice_debug, "control_waiting", voice_state.control_waiting);
@@ -957,7 +996,7 @@ static bool read_pressed(gpio_num_t pin)
 }
 
 static void update_debounced_input(debounced_input_t *input, bool pressed, int64_t now_us,
-                                   const char *source, const char *key)
+                                   int key)
 {
     if (pressed != input->raw_pressed) {
         input->raw_pressed = pressed;
@@ -965,9 +1004,7 @@ static void update_debounced_input(debounced_input_t *input, bool pressed, int64
     }
     if (input->stable_pressed != input->raw_pressed && now_us - input->changed_at_us >= DEBOUNCE_US) {
         input->stable_pressed = input->raw_pressed;
-        send_input_event(source, input->stable_pressed ? "down" : "up", key, 0);
-        if (key != NULL && strcmp(source, "key") == 0) voice_chat_key(atoi(key + 1) - 1, input->stable_pressed);
-        else if (strcmp(source, "encoder") == 0) voice_chat_key(8, input->stable_pressed);
+        dispatch_input_event(key, input->stable_pressed, 0, now_us);
     }
 }
 
@@ -979,7 +1016,6 @@ static void input_task(void *arg)
     static const int8_t quadrature[16] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
     int previous_ab = ((gpio_get_level(encoder_a_gpio) != 0) << 1) | (gpio_get_level(encoder_b_gpio) != 0);
     int detent = 0;
-    char key_name[4];
 
     for (size_t index = 0; index < KEY_COUNT; index++) {
         keys[index].raw_pressed = read_pressed(key_gpios[index]);
@@ -990,20 +1026,17 @@ static void input_task(void *arg)
     while (true) {
         const int64_t now_us = esp_timer_get_time();
         for (size_t index = 0; index < KEY_COUNT; index++) {
-            snprintf(key_name, sizeof(key_name), "S%u", (unsigned)(index + 1));
-            update_debounced_input(&keys[index], read_pressed(key_gpios[index]), now_us, "key", key_name);
+            update_debounced_input(&keys[index], read_pressed(key_gpios[index]), now_us, index);
         }
-        update_debounced_input(&encoder_button, read_pressed(encoder_button_gpio), now_us, "encoder", NULL);
+        update_debounced_input(&encoder_button, read_pressed(encoder_button_gpio), now_us, KEY_COUNT);
         const int current_ab = ((gpio_get_level(encoder_a_gpio) != 0) << 1) | (gpio_get_level(encoder_b_gpio) != 0);
         detent += quadrature[(previous_ab << 2) | current_ab];
         previous_ab = current_ab;
         if (detent >= 4) {
-            send_input_event("encoder", "rotate", NULL, 1);
-            voice_chat_rotate(1);
+            dispatch_input_event(KEY_COUNT, false, 1, now_us);
             detent = 0;
         } else if (detent <= -4) {
-            send_input_event("encoder", "rotate", NULL, -1);
-            voice_chat_rotate(-1);
+            dispatch_input_event(KEY_COUNT, false, -1, now_us);
             detent = 0;
         }
         vTaskDelay(pdMS_TO_TICKS(INPUT_SCAN_MS));
@@ -1826,6 +1859,15 @@ void app_main(void)
     xTaskCreateWithCaps(ble_tx_task, "ble_tx", 4096, NULL, 6, NULL,
                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     emit_hello();
+    input_monitor_queue = xQueueCreateWithCaps(INPUT_MONITOR_QUEUE_DEPTH, sizeof(input_monitor_event_t),
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (input_monitor_queue != NULL &&
+        xTaskCreateWithCaps(input_monitor_task, "input_monitor", 4096, NULL, 3, NULL,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        vQueueDeleteWithCaps(input_monitor_queue);
+        input_monitor_queue = NULL;
+    }
+    if (input_monitor_queue == NULL) ESP_LOGE(TAG, "Input telemetry unavailable; local controls remain active");
     xTaskCreate(input_task, "input_scan", 4096, NULL, 8, NULL);
     xTaskCreate(usb_task, "usb_command", 12288, NULL, 6, NULL);
     xTaskCreateWithCaps(status_task, "status_stream", 6144, NULL, 5, NULL,

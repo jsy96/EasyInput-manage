@@ -46,11 +46,27 @@ static stt_text_t *text_queue;
 static size_t text_head, text_count;
 static char device[18], client[37];
 // Owned by the WebSocket task. Never put a 16 KiB assembly copy on its stack.
-static char ws_json[STT_JSON_BYTES];
+static char *ws_json;
 static size_t ws_used, ws_expected, ws_frame_start;
 static bool ws_accepting, ws_binary;
 typedef struct { char json[STT_JSON_BYTES]; } incoming_t;
 typedef struct { size_t offset, length; } text_slice_t;
+
+static void log_failure(const char *stage, int code)
+{
+    // Report only fixed stage names, numeric codes and sizes, never credentials
+    // or server payloads (which may contain the user's transcription).
+    ESP_LOGW(TAG, "STT failure: stage=%s code=%d internal_free=%u internal_largest=%u psram_free=%u",
+        stage, code, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+}
+static void *psram_alloc(size_t bytes, const char *stage)
+{
+    void *buffer = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buffer) log_failure(stage, ESP_ERR_NO_MEM);
+    return buffer;
+}
 
 static bool is_cancelled(void)
 {
@@ -140,9 +156,16 @@ static bool stop_capture(void)
 static bool persist_text(const stt_text_t *text)
 {
     nvs_handle_t h;
-    if (nvs_open("stt", NVS_READWRITE, &h) != ESP_OK) return false;
+    const esp_err_t opened = nvs_open("stt", NVS_READWRITE, &h);
+    if (opened != ESP_OK) { log_failure("persist.open", opened); return false; }
     const esp_err_t result = text ? nvs_set_blob(h, "pending", text, sizeof(*text)) : nvs_erase_key(h, "pending");
-    const bool ok = (result == ESP_OK || (!text && result == ESP_ERR_NVS_NOT_FOUND)) && nvs_commit(h) == ESP_OK;
+    bool ok = result == ESP_OK || (!text && result == ESP_ERR_NVS_NOT_FOUND);
+    if (!ok) log_failure("persist.write", result);
+    else {
+        const esp_err_t committed = nvs_commit(h);
+        ok = committed == ESP_OK;
+        if (!ok) log_failure("persist.commit", committed);
+    }
     nvs_close(h);
     return ok;
 }
@@ -177,13 +200,21 @@ static bool identity(void)
     }
     nvs_close(h); return true;
 }
+static void http_failure(esp_http_client_handle_t http, const char *stage, int code)
+{
+    int tls_code = 0, tls_flags = 0;
+    const esp_err_t tls_error = esp_http_client_get_and_clear_last_tls_error(http, &tls_code, &tls_flags);
+    log_failure(stage, code);
+    ESP_LOGW(TAG, "STT HTTP detail: tls_error=%d tls_code=%d cert_flags=%d socket_errno=%d",
+        (int)tls_error, tls_code, tls_flags, esp_http_client_get_errno(http));
+}
 static cJSON *http_post(const char *url, const char *body, int *status)
 {
     *status = 0;
     esp_http_client_config_t config = {.url=url, .crt_bundle_attach=esp_crt_bundle_attach, .timeout_ms=12000,
         .disable_auto_redirect=true, .buffer_size=2048};
     esp_http_client_handle_t h = esp_http_client_init(&config);
-    if (!h) return NULL;
+    if (!h) { log_failure("http.init", ESP_ERR_NO_MEM); return NULL; }
     esp_http_client_set_method(h, HTTP_METHOD_POST);
     esp_http_client_set_header(h, "Activation-Version", "1");
     esp_http_client_set_header(h, "Device-Id", device);
@@ -192,16 +223,30 @@ static cJSON *http_post(const char *url, const char *body, int *status)
     esp_http_client_set_header(h, "Accept-Language", "zh-CN");
     esp_http_client_set_header(h, "Content-Type", "application/json");
     cJSON *result = NULL;
-    char *buffer = malloc(JSON_BYTES);
+    char *buffer = psram_alloc(JSON_BYTES, "http.buffer");
     const int body_length = strlen(body);
-    if (buffer && esp_http_client_open(h, body_length) == ESP_OK && esp_http_client_write(h, body, body_length) == body_length) {
-        esp_http_client_fetch_headers(h);
-        *status = esp_http_client_get_status_code(h);
-        size_t used = 0;
-        int n;
-        while (!is_cancelled() && used < JSON_BYTES - 1 && (n = esp_http_client_read(h, buffer + used, JSON_BYTES - 1 - used)) > 0) used += n;
-        buffer[used] = 0;
-        if (esp_http_client_is_complete_data_received(h)) result = cJSON_ParseWithLength(buffer, used);
+    if (buffer) {
+        const esp_err_t opened = esp_http_client_open(h, body_length);
+        if (opened != ESP_OK) http_failure(h, "http.open", opened);
+        else {
+            const int written = esp_http_client_write(h, body, body_length);
+            if (written != body_length) http_failure(h, "http.write", written);
+            else {
+                const int64_t headers = esp_http_client_fetch_headers(h);
+                *status = esp_http_client_get_status_code(h);
+                if (headers < 0) http_failure(h, "http.headers", (int)headers);
+                else {
+                    size_t used = 0;
+                    int n = 0;
+                    while (!is_cancelled() && used < JSON_BYTES - 1 && (n = esp_http_client_read(h, buffer + used, JSON_BYTES - 1 - used)) > 0) used += n;
+                    buffer[used] = 0;
+                    if (esp_http_client_is_complete_data_received(h)) {
+                        result = cJSON_ParseWithLength(buffer, used);
+                        if (!result && !is_cancelled()) log_failure("http.json", ESP_ERR_INVALID_RESPONSE);
+                    } else if (!is_cancelled()) http_failure(h, used == JSON_BYTES - 1 ? "http.capacity" : "http.read", n);
+                }
+            }
+        }
     }
     free(buffer); esp_http_client_close(h); esp_http_client_cleanup(h); return result;
 }
@@ -210,6 +255,7 @@ static cJSON *provision(void)
     const esp_app_desc_t *app = esp_app_get_description();
     esp_chip_info_t chip; esp_chip_info(&chip);
     cJSON *root = cJSON_CreateObject();
+    if (!root) { log_failure("provision.json", ESP_ERR_NO_MEM); return NULL; }
     cJSON_AddNumberToObject(root, "version", 2);
     cJSON_AddStringToObject(root, "language", "zh-CN");
     uint32_t flash_size = 0;
@@ -230,16 +276,27 @@ static cJSON *provision(void)
     cJSON_AddStringToObject(info, "type", "easyinput-v2");
     cJSON_AddStringToObject(info, "name", "easyinput-v2");
     char *body = cJSON_PrintUnformatted(root); cJSON_Delete(root);
+    if (!body) { log_failure("provision.body", ESP_ERR_NO_MEM); return NULL; }
     int status; cJSON *response = body ? http_post(OTA_URL, body, &status) : NULL;
     free(body);
-    if (status != 200) { cJSON_Delete(response); return NULL; }
+    if (status != 200) { log_failure("provision.status", status); cJSON_Delete(response); return NULL; }
     return response;
 }
 static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg;
     (void)base;
-    if (id == WEBSOCKET_EVENT_ERROR || id == WEBSOCKET_EVENT_DISCONNECTED) { stream_error(); return; }
+    if (id == WEBSOCKET_EVENT_ERROR || id == WEBSOCKET_EVENT_DISCONNECTED) {
+        const esp_websocket_event_data_t *event = data;
+        if (id == WEBSOCKET_EVENT_ERROR) {
+            log_failure("ws.transport", event ? event->error_handle.esp_tls_last_esp_err : ESP_FAIL);
+            if (event) ESP_LOGW(TAG, "STT WS detail: tls_code=%d cert_flags=%d socket_errno=%d http_status=%d error_type=%d",
+                event->error_handle.esp_tls_stack_err, event->error_handle.esp_tls_cert_verify_flags,
+                event->error_handle.esp_transport_sock_errno, event->error_handle.esp_ws_handshake_status_code,
+                (int)event->error_handle.error_type);
+        } else ESP_LOGI(TAG, "STT websocket disconnected: close_code=%d", event ? event->close_status_code : 0);
+        stream_error(); return;
+    }
     if (id != WEBSOCKET_EVENT_DATA) return;
     const esp_websocket_event_data_t *e = data;
     if (e->op_code >= 8) return;
@@ -256,7 +313,7 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
             stream_error();
             return;
         }
-        if (e->payload_len < 0 || (size_t)e->payload_len >= sizeof(ws_json) - ws_used) {
+        if (e->payload_len < 0 || (size_t)e->payload_len >= STT_JSON_BYTES - ws_used) {
             ws_accepting = false;
             capacity_error();
             return;
@@ -283,13 +340,16 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 static bool send_json(esp_websocket_client_handle_t ws, cJSON *json)
 {
     char *line = cJSON_PrintUnformatted(json); cJSON_Delete(json);
-    const bool ok = line && esp_websocket_client_send_text(ws, line, strlen(line), pdMS_TO_TICKS(3000)) == (int)strlen(line);
+    if (!line) { log_failure("ws.json", ESP_ERR_NO_MEM); return false; }
+    const int sent = esp_websocket_client_send_text(ws, line, strlen(line), pdMS_TO_TICKS(3000));
+    const bool ok = sent == (int)strlen(line);
+    if (!ok) log_failure("ws.send_json", sent);
     free(line); return ok;
 }
 static cJSON *wait_type(const char *type, int timeout_ms)
 {
     const int64_t end = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
-    incoming_t *event = malloc(sizeof(*event));
+    incoming_t *event = psram_alloc(sizeof(*event), "ws.hello_buffer");
     if (!event) return NULL;
     cJSON *result = NULL;
     while (!is_cancelled() && esp_timer_get_time() < end) {
@@ -299,6 +359,7 @@ static cJSON *wait_type(const char *type, int timeout_ms)
         if (cJSON_IsString(t) && strcmp(t->valuestring, type) == 0) { result = json; break; }
         cJSON_Delete(json);
     }
+    if (!result && !is_cancelled()) log_failure("ws.hello_wait", ESP_ERR_TIMEOUT);
     free(event); return result;
 }
 static cJSON *listen_frame(const char *session, const char *state)
@@ -416,16 +477,17 @@ static bool enqueue_text(const char *value)
 static bool receive_message(const cJSON *json, bool *had_text)
 {
     *had_text = false;
-    if (!json) return false;
+    if (!json) { log_failure("receive.json", ESP_ERR_INVALID_RESPONSE); return false; }
     const cJSON *type = cJSON_GetObjectItemCaseSensitive(json, "type");
     if (cJSON_IsString(type) && !strcmp(type->valuestring, "stt")) {
         const cJSON *value = cJSON_GetObjectItemCaseSensitive(json, "text");
-        if (!cJSON_IsString(value)) return false;
+        if (!cJSON_IsString(value)) { log_failure("receive.stt", ESP_ERR_INVALID_RESPONSE); return false; }
         text_slice_t slices[TEXT_BATCH_MAX];
         const int count = text_slices(value->valuestring, slices);
-        if (count < 0 || !enqueue_text(value->valuestring)) return false;
+        if (count < 0 || !enqueue_text(value->valuestring)) { log_failure("receive.text", ESP_FAIL); return false; }
         *had_text = count > 0;
     } else if (cJSON_IsString(type) && (!strcmp(type->valuestring, "error") || !strcmp(type->valuestring, "goodbye"))) {
+        log_failure(!strcmp(type->valuestring, "error") ? "receive.server_error" : "receive.goodbye", ESP_ERR_INVALID_RESPONSE);
         return false;
     }
     // TTS/LLM events never change microphone, session or listening state.
@@ -439,12 +501,12 @@ static stt_event_kind_t transcribe(cJSON *provisioning)
     const cJSON *version = cJSON_GetObjectItemCaseSensitive(config, "version");
     int protocol = cJSON_IsNumber(version) ? version->valueint : 1;
     if (!cJSON_IsString(url) || strncmp(url->valuestring,"wss://",6) || protocol < 1 || protocol > 3) {
-        ESP_LOGW(TAG,"Provisioning has no supported secure WebSocket transport"); return STT_FAILED;
+        log_failure("provision.transport", ESP_ERR_NOT_SUPPORTED); return STT_FAILED;
     }
     esp_websocket_client_config_t cfg = {.uri=url->valuestring,.crt_bundle_attach=esp_crt_bundle_attach,
         .disable_auto_reconnect=true,.network_timeout_ms=5000,.buffer_size=2048,.task_stack=8192};
     esp_websocket_client_handle_t ws = esp_websocket_client_init(&cfg);
-    if (!ws) return STT_FAILED;
+    if (!ws) { log_failure("ws.init", ESP_ERR_NO_MEM); return STT_FAILED; }
     char pv[4]; snprintf(pv,sizeof(pv),"%d",protocol);
     esp_websocket_client_append_header(ws,"Protocol-Version",pv);
     esp_websocket_client_append_header(ws,"Device-Id",device);
@@ -455,7 +517,9 @@ static stt_event_kind_t transcribe(cJSON *provisioning)
     }
     xQueueReset(incoming); ws_used=ws_expected=ws_frame_start=0; ws_accepting=false; ws_binary=false;
     esp_websocket_register_events(ws, WEBSOCKET_EVENT_ANY, ws_event, NULL);
-    bool ok = esp_websocket_client_start(ws) == ESP_OK;
+    const esp_err_t started = esp_websocket_client_start(ws);
+    bool ok = started == ESP_OK;
+    if (!ok) log_failure("ws.start", started);
     const int64_t deadline=esp_timer_get_time()+12000000;
     while(ok && !is_cancelled() && !stream_failed() && !esp_websocket_client_is_connected(ws) && esp_timer_get_time()<deadline) vTaskDelay(pdMS_TO_TICKS(50));
     cJSON *hello=cJSON_CreateObject();
@@ -465,21 +529,31 @@ static stt_event_kind_t transcribe(cJSON *provisioning)
     cJSON_AddStringToObject(params,"format","opus"); cJSON_AddNumberToObject(params,"sample_rate",16000);
     cJSON_AddNumberToObject(params,"channels",1); cJSON_AddNumberToObject(params,"frame_duration",60);
     ok = ok && !is_cancelled() && esp_websocket_client_is_connected(ws);
+    if (!ok && !is_cancelled()) log_failure("ws.connect", ESP_ERR_TIMEOUT);
     if (ok) ok=send_json(ws,hello); else cJSON_Delete(hello);
     cJSON *reply=ok ? wait_type("hello",10000) : NULL;
     const cJSON *sid=cJSON_GetObjectItemCaseSensitive(reply,"session_id"), *transport=cJSON_GetObjectItemCaseSensitive(reply,"transport");
     char session[128]={0};
     ok=reply && cJSON_IsString(sid) && strlen(sid->valuestring)<sizeof(session) && cJSON_IsString(transport) && !strcmp(transport->valuestring,"websocket");
+    if (!ok && reply) log_failure("ws.hello_fields", ESP_ERR_INVALID_RESPONSE);
     if(ok) strlcpy(session,sid->valuestring,sizeof(session));
     cJSON_Delete(reply);
     void *encoder=NULL; uint8_t *encoded=NULL;
     esp_opus_enc_config_t enc=ESP_OPUS_ENC_CONFIG_DEFAULT();
     enc.sample_rate=16000; enc.channel=1; enc.bitrate=24000; enc.frame_duration=ESP_OPUS_ENC_FRAME_DURATION_60_MS;
     int input_size=0,output_size=0;
-    if(ok) ok=esp_opus_enc_open(&enc,sizeof(enc),&encoder)==ESP_AUDIO_ERR_OK;
-    if(ok) ok=esp_opus_enc_get_frame_size(encoder,&input_size,&output_size)==ESP_AUDIO_ERR_OK && input_size==1920 && output_size>0 && output_size<=4000;
-    if(ok) { encoded=malloc(output_size+16); ok=encoded && send_json(ws,listen_frame(session,"start")); }
-    incoming_t *event = heap_caps_malloc(sizeof(*event), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if(ok) {
+        const esp_audio_err_t result = esp_opus_enc_open(&enc,sizeof(enc),&encoder);
+        ok=result==ESP_AUDIO_ERR_OK;
+        if (!ok) log_failure("opus.open", result);
+    }
+    if(ok) {
+        const esp_audio_err_t result = esp_opus_enc_get_frame_size(encoder,&input_size,&output_size);
+        ok=result==ESP_AUDIO_ERR_OK && input_size==1920 && output_size>0 && output_size<=4000;
+        if (!ok) log_failure("opus.frame_size", result);
+    }
+    if(ok) { encoded=psram_alloc(output_size+16, "opus.buffer"); ok=encoded && send_json(ws,listen_frame(session,"start")); }
+    incoming_t *event = psram_alloc(sizeof(*event), "receive.buffer");
     uint8_t input[1920];
     uint64_t sent_bytes = 0;
     unsigned encoded_frames = 0;
@@ -501,7 +575,7 @@ static stt_event_kind_t transcribe(cJSON *provisioning)
             if (!ok) break;
         }
         if (!ok) break;
-        if (!esp_websocket_client_is_connected(ws)) { ok = false; break; }
+        if (!esp_websocket_client_is_connected(ws)) { log_failure("ws.connection_lost", ESP_ERR_INVALID_STATE); ok = false; break; }
         const bool stopping = is_stopping();
         portENTER_CRITICAL(&capture_lock);
         const size_t available = stream.size;
@@ -512,8 +586,9 @@ static stt_event_kind_t transcribe(cJSON *provisioning)
             const int header = protocol == 2 ? 16 : protocol == 3 ? 4 : 0;
             esp_audio_enc_in_frame_t in = {.buffer = input, .len = sizeof(input)};
             esp_audio_enc_out_frame_t out = {.buffer = encoded + header, .len = output_size};
-            ok = esp_opus_enc_process(encoder, &in, &out) == ESP_AUDIO_ERR_OK && out.encoded_bytes > 0 && out.encoded_bytes <= (unsigned)output_size;
-            if (!ok) break;
+            const esp_audio_err_t processed = esp_opus_enc_process(encoder, &in, &out);
+            ok = processed == ESP_AUDIO_ERR_OK && out.encoded_bytes > 0 && out.encoded_bytes <= (unsigned)output_size;
+            if (!ok) { log_failure("opus.process", processed); break; }
             memset(encoded, 0, header);
             if (protocol == 2) {
                 encoded[1] = 2;
@@ -521,7 +596,9 @@ static stt_event_kind_t transcribe(cJSON *provisioning)
                 for (int i = 0; i < 4; i++) { encoded[8+i] = (timestamp >> (24-i*8)) & 255; encoded[12+i] = (size >> (24-i*8)) & 255; }
             } else if (protocol == 3) { encoded[2] = out.encoded_bytes >> 8; encoded[3] = out.encoded_bytes & 255; }
             const int bytes = header + out.encoded_bytes;
-            ok = esp_websocket_client_send_bin(ws, (char *)encoded, bytes, pdMS_TO_TICKS(3000)) == bytes;
+            const int sent = esp_websocket_client_send_bin(ws, (char *)encoded, bytes, pdMS_TO_TICKS(3000));
+            ok = sent == bytes;
+            if (!ok) log_failure("ws.send_audio", sent);
             if (ok) {
                 portENTER_CRITICAL(&capture_lock);
                 ok = stt_stream_consume(&stream, length);
@@ -543,7 +620,7 @@ static stt_event_kind_t transcribe(cJSON *provisioning)
         if (!stopping && now >= audio_check_at) {
             audio_snapshot_t audio; audio_get_snapshot(&audio);
             if (audio.vad) heard = true;
-            if (!microphone_healthy(&audio)) { ok = false; break; }
+            if (!microphone_healthy(&audio)) { log_failure("mic.capture", audio.microphone_error); ok = false; break; }
             audio_check_at = now + 200000;
         }
         if (!length) vTaskDelay(pdMS_TO_TICKS(10));
@@ -555,6 +632,7 @@ static stt_event_kind_t transcribe(cJSON *provisioning)
     free(encoded); free(event);
     const bool failed = !ok || stream_failed();
     const bool full = capacity_exhausted();
+    if (full) log_failure("stream.full", ESP_ERR_NO_MEM);
     ESP_LOGI(TAG, "Realtime upload ended: frames=%u bytes=%llu clean=%d", encoded_frames, (unsigned long long)sent_bytes, !failed);
     // No abort/relisten on individual STT events: keep one realtime listen session.
     // abort is only sent on cancellation/cleanup, after audio transmission has ended.
@@ -595,7 +673,7 @@ static void run(void *arg)
         }
         if (provisioning && !activation[0] && !is_cancelled() && !stream_failed()) outcome = transcribe(provisioning);
         cJSON_Delete(provisioning);
-        if (!stop_capture() && outcome != STT_CANCELLED) outcome = STT_FAILED;
+        if (!stop_capture() && outcome != STT_CANCELLED) { log_failure("mic.stop", ESP_FAIL); outcome = STT_FAILED; }
         if (!persist_pending_head()) outcome = STT_FAILED;
         portENTER_CRITICAL(&capture_lock);
         const uint64_t accepted = stream.accepted, consumed = stream.consumed;
@@ -621,9 +699,10 @@ void xiaozhi_stt_init(void)
     guard = xSemaphoreCreateMutex(); microphone_guard = xSemaphoreCreateMutex();
     notifications = xQueueCreate(8, sizeof(stt_event_t));
     incoming = xQueueCreateWithCaps(8, sizeof(incoming_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    pcm = heap_caps_malloc(PCM_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ws_json = psram_alloc(STT_JSON_BYTES, "init.ws_buffer");
+    pcm = psram_alloc(PCM_BYTES, "init.pcm");
     text_queue = heap_caps_calloc(TEXT_QUEUE_CAPACITY, sizeof(*text_queue), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!guard || !microphone_guard || !notifications || !incoming || !pcm || !text_queue) return;
+    if (!guard || !microphone_guard || !notifications || !incoming || !ws_json || !pcm || !text_queue) { log_failure("init.resources", ESP_ERR_NO_MEM); return; }
     stt_stream_init(&stream, pcm, PCM_BYTES);
     nvs_handle_t h;
     if (nvs_open("stt", NVS_READWRITE, &h) == ESP_OK) {
@@ -634,14 +713,14 @@ void xiaozhi_stt_init(void)
     pending_durable = storage_ready && pending.id[0];
     // UUID creation/NVS commits happen before any session starts sampling.
     identity_ready = identity();
-    if (xTaskCreate(run, "xiaozhi_stt", 16384, NULL, 4, &worker) != pdPASS) worker = NULL;
+    if (xTaskCreate(run, "xiaozhi_stt", 16384, NULL, 4, &worker) != pdPASS) { worker = NULL; log_failure("init.worker", ESP_ERR_NO_MEM); }
 }
 esp_err_t xiaozhi_stt_start(void)
 {
-    if (!guard || !worker || !storage_ready || !identity_ready) return ESP_ERR_INVALID_STATE;
+    if (!guard || !worker || !storage_ready || !identity_ready) { log_failure("start.unavailable", ESP_ERR_INVALID_STATE); return ESP_ERR_INVALID_STATE; }
     xSemaphoreTake(microphone_guard, portMAX_DELAY);
     xSemaphoreTake(guard, portMAX_DELAY);
-    if (busy || pending.id[0] || text_count) { xSemaphoreGive(guard); xSemaphoreGive(microphone_guard); return ESP_ERR_INVALID_STATE; }
+    if (busy || pending.id[0] || text_count) { xSemaphoreGive(guard); xSemaphoreGive(microphone_guard); log_failure("start.busy_or_pending", ESP_ERR_INVALID_STATE); return ESP_ERR_INVALID_STATE; }
     xQueueReset(notifications);
     cancelled = stop_requested = stop_intent = cancel_storage_failed = cancel_preparing = false;
     busy = true;
@@ -653,6 +732,7 @@ esp_err_t xiaozhi_stt_start(void)
     const esp_err_t result = audio_live_start(sink);
     if (result == ESP_OK) xTaskNotifyGive(worker);
     else {
+        log_failure("mic.start", result);
         portENTER_CRITICAL(&capture_lock); capturing = false; portEXIT_CRITICAL(&capture_lock);
         xSemaphoreTake(guard, portMAX_DELAY); busy = false; xSemaphoreGive(guard);
     }

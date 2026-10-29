@@ -32,12 +32,17 @@ it('runs actual streaming STT UTF-8, FIFO, receive and stop boundaries against i
 #define WEBSOCKET_EVENT_DATA 1
 #define WEBSOCKET_EVENT_ERROR 2
 #define WEBSOCKET_EVENT_DISCONNECTED 3
+#define ESP_FAIL -1
+#define ESP_ERR_INVALID_RESPONSE 0x108
+#define ESP_LOGW(...) ((void)0)
+#define ESP_LOGI(...) ((void)0)
 #define portMAX_DELAY 0
 #define pdTRUE 1
 #define portENTER_CRITICAL(p) ((void)(p))
 #define portEXIT_CRITICAL(p) ((void)(p))
 typedef const char *esp_event_base_t;
-typedef struct { int payload_offset, op_code, payload_len, data_len; bool fin; const char *data_ptr; } esp_websocket_event_data_t;
+typedef struct { int esp_tls_last_esp_err, esp_tls_stack_err, esp_tls_cert_verify_flags, esp_transport_sock_errno, esp_ws_handshake_status_code, error_type; } ws_errors_t;
+typedef struct { int payload_offset, op_code, payload_len, data_len; bool fin; const char *data_ptr; ws_errors_t error_handle; int close_status_code; } esp_websocket_event_data_t;
 typedef struct { char json[STT_JSON_BYTES]; } incoming_t;
 typedef struct { size_t offset, length; } text_slice_t;
 typedef struct { bool microphone_active; int microphone_error; } audio_snapshot_t;
@@ -47,6 +52,7 @@ static bool cJSON_IsString(const cJSON *j) { return j && j->valuestring; }
 static int guard=1, microphone_guard=2, capture_lock;
 static bool capturing, cancelled, stop_requested, stop_intent, busy, storage_ready = true;
 static bool transport_failed, capacity_failed, pending_durable;
+static void log_failure(const char *stage, int code) { (void)stage; (void)code; }
 static uint8_t data[PCM_BYTES];
 static stt_stream_t stream;
 static stt_text_t pending, queue_storage[TEXT_QUEUE_CAPACITY], *text_queue = queue_storage, durable;
@@ -173,5 +179,107 @@ int main(void) {
     execFileSync('cc', ['-std=c11', '-Wall', '-Wextra', '-Werror', '-I', root, '-I', sourceDir,
       join(root, 'test.c'), join(sourceDir, 'stt_stream.c'), '-o', join(root, 'test')], { encoding: 'utf8' })
     expect(execFileSync(join(root, 'test'), { encoding: 'utf8' })).toContain('streaming STT boundaries passed')
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+it('uses PSRAM for real HTTP and hello buffers when internal blocks are below 16 KiB, and reports allocation failures without payloads', () => {
+  const root = mkdtempSync(join(tmpdir(), 'easyinput-stt-memory-tests-'))
+  try {
+    const source = readFileSync(resolve('firmware/easyinput-monitor/main/xiaozhi_stt.c'), 'utf8')
+    const extract = (name: string) => {
+      const start = source.search(new RegExp(`static [^\\n]+[ *]${name}\\([^;]*?\\)\\n\\{`))
+      if (start < 0) throw new Error(`Missing memory regression function ${name}`)
+      return source.slice(start, source.indexOf('\n}\n', start) + 3)
+    }
+    writeFileSync(join(root, 'memory.c'), `
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <string.h>
+#define ESP_OK 0
+#define ESP_ERR_NO_MEM 0x101
+#define ESP_ERR_INVALID_RESPONSE 0x108
+#define ESP_ERR_TIMEOUT 0x107
+#define MALLOC_CAP_SPIRAM 1
+#define MALLOC_CAP_8BIT 2
+#define MALLOC_CAP_INTERNAL 4
+#define JSON_BYTES 16384
+#define STT_JSON_BYTES 16384
+#define HTTP_METHOD_POST 1
+#define pdMS_TO_TICKS(n) (n)
+#define pdTRUE 1
+#define esp_crt_bundle_attach NULL
+typedef int esp_err_t;
+typedef void *esp_http_client_handle_t;
+typedef struct { const char *url; void *crt_bundle_attach; int timeout_ms; bool disable_auto_redirect; int buffer_size; } esp_http_client_config_t;
+typedef struct { char json[STT_JSON_BYTES]; } incoming_t;
+typedef struct { const char *valuestring; } cJSON;
+typedef struct { const char *version; } app_t;
+static const char *TAG="stt", *device="synthetic-device", *client="synthetic-client";
+static char logs[4096];
+static int external_allocations, internal_attempts, fail_external, opened, receive_hello;
+static size_t maximum_request;
+static int64_t clock_us;
+static int incoming=1;
+static cJSON response={.valuestring="hello"};
+static void record_log(const char *tag, const char *format, ...) {
+  (void)tag; size_t used=strlen(logs); va_list args; va_start(args,format);
+  vsnprintf(logs+used,sizeof(logs)-used,format,args); va_end(args);
+}
+#define ESP_LOGW(...) record_log(__VA_ARGS__)
+static size_t heap_caps_get_free_size(int caps) { return caps & MALLOC_CAP_INTERNAL ? 15000 : 6000000; }
+static size_t heap_caps_get_largest_free_block(int caps) { (void)caps; return 7680; }
+static void *heap_caps_malloc(size_t bytes,int caps) {
+  if(caps & MALLOC_CAP_SPIRAM) { external_allocations++; if(bytes>maximum_request) maximum_request=bytes; return fail_external ? NULL : malloc(bytes); }
+  internal_attempts++; return bytes>7680 ? NULL : malloc(bytes);
+}
+static bool is_cancelled(void) { return false; }
+static const app_t *esp_app_get_description(void) { static const app_t a={.version="synthetic"};return &a; }
+static esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *c) { assert(c->buffer_size==2048);return (void *)1; }
+static void esp_http_client_set_method(void *h,int method) { (void)h;(void)method; }
+static void esp_http_client_set_header(void *h,const char *key,const char *value) { (void)h;(void)key;(void)value; }
+static int esp_http_client_get_errno(void *h) { (void)h;return 12; }
+static int esp_http_client_get_and_clear_last_tls_error(void *h,int *code,int *flags) { (void)h;*code=0x7f00;*flags=0;return 0; }
+static int esp_http_client_open(void *h,int length) { (void)h;(void)length;opened++;return 0; }
+static int esp_http_client_write(void *h,const char *body,int length) { (void)h;(void)body;return length; }
+static int64_t esp_http_client_fetch_headers(void *h) { (void)h;return 2; }
+static int esp_http_client_get_status_code(void *h) { (void)h;return 200; }
+static int esp_http_client_read(void *h,char *buffer,int capacity) {
+  (void)h;assert(capacity>=2);static int calls;if(calls++%2==0) { memcpy(buffer,"{}",2);return 2; }return 0;
+}
+static bool esp_http_client_is_complete_data_received(void *h) { (void)h;return true; }
+static void esp_http_client_close(void *h) { (void)h; }
+static void esp_http_client_cleanup(void *h) { (void)h; }
+static cJSON *cJSON_ParseWithLength(const char *s,size_t n) { assert(n==2 && !memcmp(s,"{}",2));return &response; }
+static cJSON *cJSON_Parse(const char *s) { assert(!strcmp(s,"{}"));return &response; }
+static const cJSON *cJSON_GetObjectItemCaseSensitive(cJSON *j,const char *key) { assert(!strcmp(key,"type"));return j; }
+static bool cJSON_IsString(const cJSON *j) { return j && j->valuestring; }
+static void cJSON_Delete(cJSON *j) { (void)j; }
+static int64_t esp_timer_get_time(void) { clock_us+=100000;return clock_us; }
+static int xQueueReceive(int q,incoming_t *event,int wait) { (void)q;(void)wait;if(!receive_hello) return 0;receive_hello=0;strcpy(event->json,"{}");return 1; }
+${['log_failure', 'psram_alloc', 'http_failure', 'http_post', 'wait_type'].map(extract).join('\n')}
+int main(void) {
+  int status;
+  // Reproduce the observed allocator condition: 7680 internal bytes is too small
+  // for either real 16384-byte buffer, while PSRAM has megabytes available.
+  assert(!heap_caps_malloc(16384,MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT));
+  assert(http_post("https://synthetic.invalid/private-token","private-transcript",&status)==&response);
+  assert(status==200 && opened==1 && external_allocations==1 && maximum_request==16384 && internal_attempts==1);
+  receive_hello=1;assert(wait_type("hello",1000)==&response);
+  assert(external_allocations==2 && !logs[0]);
+  fail_external=1;
+  assert(!http_post("https://synthetic.invalid/private-token","private-transcript",&status));
+  assert(opened==1 && status==0 && strstr(logs,"stage=http.buffer") && strstr(logs,"internal_largest=7680"));
+  assert(!wait_type("hello",1000) && strstr(logs,"stage=ws.hello_buffer"));
+  assert(!strstr(logs,"private-token") && !strstr(logs,"private-transcript") && !strstr(logs,"synthetic-device"));
+  puts("PSRAM HTTP and hello regression passed");
+}
+`)
+    execFileSync('cc', ['-std=c11', '-Wall', '-Wextra', '-Werror', join(root, 'memory.c'), '-o', join(root, 'memory')], { encoding: 'utf8' })
+    expect(execFileSync(join(root, 'memory'), { encoding: 'utf8' })).toContain('PSRAM HTTP and hello regression passed')
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
