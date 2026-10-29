@@ -21,6 +21,7 @@
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -33,10 +34,24 @@
 #define TEXT_BATCH_MAX ((STT_JSON_BYTES + 999) / 1000)
 #define OTA_URL "https://api.tenclass.net/xiaozhi/ota/"
 #define JSON_BYTES 16384
+#define CODEC_STACK_BYTES (48 * 1024)
 static const char *TAG = "xiaozhi_stt";
 static SemaphoreHandle_t guard, microphone_guard;
 static QueueHandle_t notifications, incoming;
 static TaskHandle_t worker;
+static TaskHandle_t codec_worker;
+static QueueHandle_t codec_requests;
+static SemaphoreHandle_t codec_done;
+typedef enum {
+    CODEC_ENCODER_OPEN, CODEC_ENCODER_SIZE, CODEC_ENCODE, CODEC_ENCODER_CLOSE,
+    CODEC_DECODER_OPEN, CODEC_DECODER_RESET, CODEC_DECODE, CODEC_DECODER_CLOSE,
+} codec_operation_t;
+typedef struct {
+    codec_operation_t operation;
+    void *handle, *input, *output, *info;
+    uint32_t config_size;
+    esp_audio_err_t result;
+} codec_job_t;
 static bool busy, cancelled, storage_ready, capturing, stop_requested, stop_intent, cancel_storage_failed;
 static bool transport_failed, capacity_failed, pending_durable, identity_ready, cancel_preparing;
 static bool dialogue_session;
@@ -84,6 +99,82 @@ static void *psram_alloc(size_t bytes, const char *stage)
     void *buffer = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!buffer) log_failure(stage, ESP_ERR_NO_MEM);
     return buffer;
+}
+
+// Opus uses more than 22 KiB of stack in the 16 kHz/60 ms encoding path.
+// Keep all codec calls on this larger PSRAM stack; HTTP, NVS and Flash stay on
+// the original internal-stack worker because they may disable the cache.
+static esp_audio_err_t codec_execute(codec_job_t *job)
+{
+    switch (job->operation) {
+        case CODEC_ENCODER_OPEN:
+            return esp_opus_enc_open(job->input, job->config_size, job->output);
+        case CODEC_ENCODER_SIZE:
+            return esp_opus_enc_get_frame_size(job->handle, job->input, job->output);
+        case CODEC_ENCODE:
+            return esp_opus_enc_process(job->handle, job->input, job->output);
+        case CODEC_ENCODER_CLOSE:
+            esp_opus_enc_close(job->handle);
+            return ESP_AUDIO_ERR_OK;
+        case CODEC_DECODER_OPEN:
+            return esp_opus_dec_open(job->input, job->config_size, job->output);
+        case CODEC_DECODER_RESET:
+            return esp_opus_dec_reset(job->handle);
+        case CODEC_DECODE:
+            return esp_opus_dec_decode(job->handle, job->input, job->output, job->info);
+        case CODEC_DECODER_CLOSE:
+            return esp_opus_dec_close(job->handle);
+        default:
+            return ESP_AUDIO_ERR_INVALID_PARAMETER;
+    }
+}
+
+static void codec_run(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        codec_job_t *job;
+        if (xQueueReceive(codec_requests, &job, portMAX_DELAY) != pdTRUE) continue;
+        job->result = codec_execute(job);
+        // Do not access job after giving completion: its owner may return.
+        xSemaphoreGive(codec_done);
+    }
+}
+
+// Only run() submits jobs, one at a time. The caller's arguments and buffers
+// remain borrowed until completion, including when S6 cancels the conversation.
+static esp_audio_err_t codec_call(codec_job_t *job)
+{
+    if (!codec_worker || !codec_requests || !codec_done) return ESP_AUDIO_ERR_FAIL;
+    job->result = ESP_AUDIO_ERR_FAIL;
+    if (xQueueSend(codec_requests, &job, portMAX_DELAY) != pdTRUE) return ESP_AUDIO_ERR_FAIL;
+    while (xSemaphoreTake(codec_done, portMAX_DELAY) != pdTRUE) {}
+    return job->result;
+}
+
+static void codec_deinit(void)
+{
+    // Initialization failure only: no network worker has submitted a job yet.
+    if (codec_worker) vTaskDeleteWithCaps(codec_worker);
+    if (codec_requests) vQueueDelete(codec_requests);
+    if (codec_done) vSemaphoreDelete(codec_done);
+    codec_worker = NULL;
+    codec_requests = NULL;
+    codec_done = NULL;
+}
+
+static bool codec_init(void)
+{
+    codec_requests = xQueueCreate(1, sizeof(codec_job_t *));
+    codec_done = xSemaphoreCreateBinary();
+    if (!codec_requests || !codec_done ||
+        xTaskCreateWithCaps(codec_run, "xiaozhi_codec", CODEC_STACK_BYTES, NULL, 4,
+                            &codec_worker, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        codec_deinit();
+        log_failure("init.codec_worker", ESP_ERR_NO_MEM);
+        return false;
+    }
+    return true;
 }
 
 static bool is_cancelled(void)
@@ -612,7 +703,8 @@ static bool dialogue_receive_json(dialogue_t *state, const cJSON *json)
         if (!strcmp(value->valuestring, "start")) {
             if (state->replying || !dialogue_pause_capture()) return false;
             xSemaphoreTake(microphone_guard, portMAX_DELAY);
-            const bool started = !is_cancelled() && esp_opus_dec_reset(state->decoder) == ESP_AUDIO_ERR_OK &&
+            const bool started = !is_cancelled() &&
+                codec_call(&(codec_job_t){.operation=CODEC_DECODER_RESET, .handle=state->decoder}) == ESP_AUDIO_ERR_OK &&
                 audio_pcm_start() == ESP_OK;
             xSemaphoreGive(microphone_guard);
             if (!started) {
@@ -658,7 +750,8 @@ static bool dialogue_receive_audio(dialogue_t *state, incoming_t *event, int pro
     esp_audio_dec_in_raw_t input = {.buffer = packet + header, .len = length - header};
     esp_audio_dec_out_frame_t output = {.buffer = (uint8_t *)state->decoded, .len = DECODED_PCM_BYTES};
     esp_audio_dec_info_t info = {0};
-    const esp_audio_err_t result = esp_opus_dec_decode(state->decoder, &input, &output, &info);
+    const esp_audio_err_t result = codec_call(&(codec_job_t){.operation=CODEC_DECODE,
+        .handle=state->decoder, .input=&input, .output=&output, .info=&info});
     if (result != ESP_AUDIO_ERR_OK || input.consumed != length - header ||
         !output.decoded_size || output.decoded_size > DECODED_PCM_BYTES || output.decoded_size % sizeof(int16_t) ||
         info.sample_rate != AUDIO_SAMPLE_RATE || info.channel != 1 || info.bits_per_sample != 16) {
@@ -752,7 +845,8 @@ static stt_event_kind_t transcribe(cJSON *provisioning)
         dec.sample_rate = AUDIO_SAMPLE_RATE;
         dec.channel = 1;
         dec.frame_duration = ESP_OPUS_DEC_FRAME_DURATION_120_MS;
-        const esp_audio_err_t result = esp_opus_dec_open(&dec, sizeof(dec), &dialogue.decoder);
+        const esp_audio_err_t result = codec_call(&(codec_job_t){.operation=CODEC_DECODER_OPEN,
+            .input=&dec, .config_size=sizeof(dec), .output=&dialogue.decoder});
         dialogue.decoded = psram_alloc(DECODED_PCM_BYTES, "dialogue.decode_buffer");
         ok = result == ESP_AUDIO_ERR_OK && dialogue.decoded;
         if (!ok) log_failure("dialogue.decoder_open", result);
@@ -762,12 +856,14 @@ static stt_event_kind_t transcribe(cJSON *provisioning)
     enc.sample_rate=16000; enc.channel=1; enc.bitrate=24000; enc.frame_duration=ESP_OPUS_ENC_FRAME_DURATION_60_MS;
     int input_size=0,output_size=0;
     if(ok) {
-        const esp_audio_err_t result = esp_opus_enc_open(&enc,sizeof(enc),&encoder);
+        const esp_audio_err_t result = codec_call(&(codec_job_t){.operation=CODEC_ENCODER_OPEN,
+            .input=&enc, .config_size=sizeof(enc), .output=&encoder});
         ok=result==ESP_AUDIO_ERR_OK;
         if (!ok) log_failure("opus.open", result);
     }
     if(ok) {
-        const esp_audio_err_t result = esp_opus_enc_get_frame_size(encoder,&input_size,&output_size);
+        const esp_audio_err_t result = codec_call(&(codec_job_t){.operation=CODEC_ENCODER_SIZE,
+            .handle=encoder, .input=&input_size, .output=&output_size});
         ok=result==ESP_AUDIO_ERR_OK && input_size==1920 && output_size>0 && output_size<=4000;
         if (!ok) log_failure("opus.frame_size", result);
     }
@@ -813,7 +909,8 @@ static stt_event_kind_t transcribe(cJSON *provisioning)
             const int header = protocol == 2 ? 16 : protocol == 3 ? 4 : 0;
             esp_audio_enc_in_frame_t in = {.buffer = input, .len = sizeof(input)};
             esp_audio_enc_out_frame_t out = {.buffer = encoded + header, .len = output_size};
-            const esp_audio_err_t processed = esp_opus_enc_process(encoder, &in, &out);
+            const esp_audio_err_t processed = codec_call(&(codec_job_t){.operation=CODEC_ENCODE,
+                .handle=encoder, .input=&in, .output=&out});
             ok = processed == ESP_AUDIO_ERR_OK && out.encoded_bytes > 0 && out.encoded_bytes <= (unsigned)output_size;
             if (!ok) { log_failure("opus.process", processed); break; }
             memset(encoded, 0, header);
@@ -864,8 +961,10 @@ static stt_event_kind_t transcribe(cJSON *provisioning)
         if (!is_cancelled()) (void)audio_stop_speaker();
         xSemaphoreGive(microphone_guard);
     }
-    if (encoder) esp_opus_enc_close(encoder);
-    if (dialogue.decoder) esp_opus_dec_close(dialogue.decoder);
+    if (encoder) (void)codec_call(&(codec_job_t){.operation=CODEC_ENCODER_CLOSE, .handle=encoder});
+    if (dialogue.decoder) (void)codec_call(&(codec_job_t){.operation=CODEC_DECODER_CLOSE, .handle=dialogue.decoder});
+    if (codec_worker) ESP_LOGI(TAG, "Codec minimum free stack: %u of %u bytes",
+        (unsigned)uxTaskGetStackHighWaterMark(codec_worker), (unsigned)CODEC_STACK_BYTES);
     free(dialogue.decoded);
     free(encoded); free(event);
     const bool failed = !ok || stream_failed();
@@ -957,7 +1056,12 @@ void xiaozhi_stt_init(void)
     pending_durable = storage_ready && pending.id[0];
     // UUID creation/NVS commits happen before any session starts sampling.
     identity_ready = identity();
-    if (xTaskCreate(run, "xiaozhi_stt", 16384, NULL, 4, &worker) != pdPASS) { worker = NULL; log_failure("init.worker", ESP_ERR_NO_MEM); }
+    if (!codec_init()) return;
+    if (xTaskCreate(run, "xiaozhi_stt", 16384, NULL, 4, &worker) != pdPASS) {
+        worker = NULL;
+        codec_deinit();
+        log_failure("init.worker", ESP_ERR_NO_MEM);
+    }
 }
 esp_err_t xiaozhi_dialogue_start(void)
 {

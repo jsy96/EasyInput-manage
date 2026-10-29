@@ -58,10 +58,10 @@ npm run typecheck
 ```sh
 cd firmware/easyinput-monitor
 idf.py build
-python3 ../../scripts/export-firmware.py --version 0.4.16
+python3 ../../scripts/export-firmware.py --version 0.4.17
 ```
 
-上例固件包写入 `release/firmware/0.4.16-v2-monitor/`，历史固件包保留。2026-10-29 已发布网页 0.4.6 并核对线上资源与本地构建一致；固件 0.4.16 已烧录，通过版本号和应用启动日志验证。配套云端网关沿用现有部署。S6 小智绑定、回复播放与多轮交谈仍需实板联网试听验收。`build/`、`release/`、`node_modules/`、生成的 `sdkconfig` 和 `managed_components/` 不提交 Git。
+上例固件包写入 `release/firmware/0.4.17-v2-monitor/`，历史固件包保留。2026-10-29 已发布网页 0.4.6 并核对线上资源与本地构建一致；固件 0.4.17 修复小智对话的编解码栈不足和音频锁竞争导致的上传停滞，软件检查已通过，已烧录并由串口确认版本号和应用正常启动。配套云端网关沿用现有部署。`build/`、`release/`、`node_modules/`、生成的 `sdkconfig` 和 `managed_components/` 不提交 Git。
 
 中文提示音由 [scripts/build-voice-prompts.py](scripts/build-voice-prompts.py) 使用 `edge-tts-chinese` 的云健男声生成，再转换为 8 kHz 单声道 μ-law 并打包为 `firmware/easyinput-monitor/main/assets/prompts.bin`。
 
@@ -76,4 +76,4 @@ python3 ../../scripts/export-firmware.py --version 0.4.16
 - 所有红色慢闪状态统一为亮 0.5 秒、熄灭 2 秒；五颗 WS2812 点亮亮度为 1%。
 - 固件编译和自动化测试不能替代板载麦克风、扬声器、GPIO8 共享电源、灯序、按键方向和声音水平/音质的实板验证。
 - 实时麦克风需要开发板通过 Wi-Fi 直连云服务；蓝牙网关继续承载历史语音和状态。网络中断会停止实时采集。
-- 小智对话需真机确认首次绑定、回复播放、播完恢复收音、多轮交谈、连接中和回答中按 S6 结束，以及断网后的退出提示。当前采用轮流说话，回答播放期间暂停收音。
+- 小智对话已由实板日志确认连续上传、两次回答播放、回答后恢复收音及 S6 结束清理，用户试听确认两轮交谈和 S6 结束正常；首次绑定、连接中或回答中取消、断网后的退出提示仍需专项验证。当前采用轮流说话，回答播放期间暂停收音。

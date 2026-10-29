@@ -342,8 +342,11 @@ static void audio_task(void *arg)
             if (result != ESP_OK) state.speaker_error = result;
         }
         xSemaphoreGive(audio_mutex);
-        // DMA blocks active I/O. An extra tick would starve 16 ms audio blocks.
-        if (!did_io) {
+        // DMA paces active I/O. Give equal-priority mutex waiters a chance to
+        // run before reacquiring the lock, without adding a whole tick delay.
+        if (did_io) {
+            taskYIELD();
+        } else {
             state.stage = 7;
             vTaskDelay(pdMS_TO_TICKS(10) + 1);
         }

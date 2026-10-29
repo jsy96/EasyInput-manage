@@ -134,3 +134,148 @@ int main(void) {
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+it('lets a waiting audio snapshot run between active I/O blocks without sleeping a tick', () => {
+  const root = mkdtempSync(join(tmpdir(), 'easyinput-audio-scheduling-'))
+  try {
+    const sourceDir = resolve('firmware/easyinput-monitor/main')
+    const source = readFileSync(join(sourceDir, 'audio.c'), 'utf8')
+    const extract = (name: string): string => {
+      const start = source.search(new RegExp(`(?:static )?void ${name}\\([^;]*?\\)\\n\\{`))
+      if (start < 0) throw new Error(`Missing audio function ${name}`)
+      return source.slice(start, source.indexOf('\n}\n', start) + 3)
+    }
+    const constants = ['AUDIO_BLOCK_FRAMES', 'AUDIO_IO_TIMEOUT_MS', 'MIC_WARMUP_US', 'MIC_STALL_US',
+      'TONE_FADE_FRAMES', 'LIVE_FRAME_FRAMES', 'LIVE_FRAME_BYTES', 'TONE_DRAIN_US']
+      .map(name => source.match(new RegExp(`^#define ${name} .+$`, 'm'))?.[0]).join('\n')
+    writeFileSync(join(root, 'esp_err.h'), `#pragma once
+typedef int esp_err_t;
+#define ESP_OK 0
+#define ESP_ERR_TIMEOUT 4
+`)
+    writeFileSync(join(root, 'test.c'), `
+#include <assert.h>
+#include <math.h>
+#include <setjmp.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "audio.h"
+${constants}
+#define portMAX_DELAY (-1)
+// Model the project's 100 Hz tick. Active I/O must not add this 10 ms sleep.
+#define pdMS_TO_TICKS(ms) ((ms) / 10)
+static int audio_mutex = 1;
+static audio_snapshot_t state, peer_snapshot;
+static bool lock_held, peer_running, peer_pending;
+static unsigned iterations, iteration_limit, peer_runs, yields, delays, delayed_ticks;
+static int read_error, stops;
+static jmp_buf completed;
+static int microphone_channel = 1, speaker_channel = 2;
+static bool mic_stop_requested, pcm_active, pcm_did_io;
+static int microphone_stop_error;
+static uint8_t *record_buffer;
+static size_t record_capacity;
+static const uint8_t *voice_buffer;
+static size_t voice_length, voice_available;
+static uint32_t voice_frame, tone_frame, tone_target_frames;
+static int64_t record_deadline_us, microphone_last_data_us, microphone_started_us, tone_drain_until_us;
+static int32_t microphone_samples[AUDIO_BLOCK_FRAMES * 2];
+static int16_t speaker_samples[AUDIO_BLOCK_FRAMES * 2], live_chunk[LIVE_FRAME_FRAMES];
+static size_t live_chunk_frames;
+static audio_microphone_sink_t live_sink;
+static float tone_frequency;
+static uint8_t tone_volume;
+
+static void xSemaphoreTake(int mutex, int timeout) {
+  assert(mutex == audio_mutex && timeout == portMAX_DELAY && !lock_held);
+  if (!peer_running) {
+    if (iterations == iteration_limit) longjmp(completed, 1);
+    // A release alone does not schedule an equal-priority waiter. The real
+    // task must provide a scheduling point before taking the mutex again.
+    if (iterations && peer_pending) longjmp(completed, 2);
+    iterations++;
+  }
+  lock_held = true;
+}
+static void xSemaphoreGive(int mutex) {
+  assert(mutex == audio_mutex && lock_held);
+  lock_held = false;
+  if (!peer_running) peer_pending = true;
+}
+static void schedule_peer(void) {
+  assert(!lock_held && peer_pending);
+  peer_running = true;
+  audio_get_snapshot(&peer_snapshot);
+  peer_running = false;
+  peer_pending = false;
+  peer_runs++;
+}
+void taskYIELD(void) {
+  yields++;
+  schedule_peer();
+}
+static void vTaskDelay(int ticks) {
+  assert(ticks > 0);
+  delays++;
+  delayed_ticks += ticks;
+  schedule_peer();
+}
+static int64_t esp_timer_get_time(void) { return 200000; }
+static void finish_live_capture(void) { assert(lock_held); live_sink = NULL; live_chunk_frames = 0; }
+static int stop_channel(bool microphone) {
+  assert(lock_held); stops++;
+  if (microphone) state.microphone_active = false;
+  else state.speaker_playing = false;
+  return ESP_OK;
+}
+static int i2s_channel_read(int channel, void *data, size_t size, size_t *bytes, int timeout) {
+  assert(lock_held && channel == microphone_channel && timeout == AUDIO_IO_TIMEOUT_MS);
+  memset(data, 0, size); *bytes = read_error ? 0 : size;
+  return read_error;
+}
+static int i2s_channel_write(int channel, const void *data, size_t size, size_t *written, int timeout) {
+  assert(lock_held && channel == speaker_channel && data && timeout == AUDIO_IO_TIMEOUT_MS);
+  *written = size; return ESP_OK;
+}
+static void update_microphone(size_t frames, int64_t now) { assert(lock_held && frames && now > 0); }
+static uint8_t mulaw_encode(int value) { return (uint8_t)value; }
+static int16_t mulaw_decode(uint8_t value) { return value; }
+static bool pcm_playback_step(void) { assert(lock_held); return pcm_did_io; }
+${extract('audio_get_snapshot')}
+${extract('audio_task')}
+
+static void run_blocks(bool microphone, bool pcm, int error, unsigned blocks) {
+  state = (audio_snapshot_t){.ready = true, .microphone_active = microphone};
+  peer_snapshot = (audio_snapshot_t){0};
+  lock_held = peer_running = peer_pending = false;
+  iterations = peer_runs = yields = delays = delayed_ticks = 0;
+  iteration_limit = blocks; read_error = error; stops = 0;
+  pcm_active = pcm_did_io = pcm;
+  const int reason = setjmp(completed);
+  if (!reason) audio_task(NULL);
+  // Old give/immediate-retake behavior exits with reason 2, before the
+  // snapshot caller can make progress. No host thread timing is involved.
+  assert(reason == 1 && iterations == blocks && peer_runs == blocks);
+  assert(!lock_held && !peer_pending && peer_snapshot.ready);
+}
+int main(void) {
+  run_blocks(true, false, ESP_OK, 4);
+  assert(yields == 4 && delays == 0 && delayed_ticks == 0 && peer_snapshot.microphone_active);
+  run_blocks(false, true, ESP_OK, 4);
+  assert(yields == 4 && delays == 0 && delayed_ticks == 0);
+  run_blocks(true, false, 29, 1);
+  assert(yields == 1 && delays == 0 && stops == 1 && state.microphone_error == 29);
+  assert(!peer_snapshot.microphone_active);
+  run_blocks(false, false, ESP_OK, 4);
+  assert(yields == 0 && delays == 4 && delayed_ticks == 4 * (pdMS_TO_TICKS(10) + 1));
+  puts("Audio scheduling checks passed");
+}
+`)
+    execFileSync('cc', ['-std=c11', '-Wall', '-Wextra', '-Werror', '-I', root, '-I', sourceDir, join(root, 'test.c'), '-o', join(root, 'test')])
+    expect(execFileSync(join(root, 'test'), { encoding: 'utf8' })).toContain('Audio scheduling checks passed')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})

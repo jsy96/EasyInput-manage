@@ -471,6 +471,9 @@ it('runs ordered conversation TTS, PCM decode and microphone resume only after l
       if (start < 0) throw new Error('Missing dialogue function ' + name)
       return source.slice(start, source.indexOf('\n}\n', start) + 3)
     }
+    const codecTypeStart = source.indexOf('typedef enum {\n    CODEC_ENCODER_OPEN')
+    const codecTypeEnd = source.indexOf('} codec_job_t;') + '} codec_job_t;'.length
+    const codecTypes = source.slice(codecTypeStart, codecTypeEnd)
     const typeEnd = source.indexOf('} dialogue_t;') + '} dialogue_t;'.length
     const type = source.slice(source.lastIndexOf('typedef struct {', typeEnd), typeEnd)
     writeFileSync(join(root, 'turns.c'), `
@@ -516,6 +519,7 @@ static const cJSON *cJSON_GetObjectItemCaseSensitive(const cJSON *j,const char *
 static bool cJSON_IsString(const cJSON *j) { return j && j->valuestring; }
 static bool cJSON_IsNumber(const cJSON *j) { return j && j->number; }
 ${type}
+${codecTypes}
 static int guard=1, microphone_guard=2, capture_lock;
 static bool busy=true, cancelled, stop_intent, capturing=true, transport_failed;
 static int capture_stops, capture_starts, pcm_starts, pcm_finishes, pcm_writes, decoder_resets, send_starts;
@@ -541,9 +545,14 @@ static int audio_live_start(void (*callback)(const uint8_t *,size_t)) { assert(c
 static int audio_pcm_start(void) { assert(!capturing);pcm_starts++;audio=(audio_snapshot_t){.speaker_playing=true};return start_result; }
 static int audio_pcm_finish(void) { pcm_finishes++;return finish_result; }
 static int audio_pcm_write(const int16_t *samples,size_t frames) { assert(samples==decoded && frames==4);pcm_writes++;return write_result; }
-static int esp_opus_dec_reset(void *decoder) { assert(decoder==(void *)1);decoder_resets++;return 0; }
-static int esp_opus_dec_decode(void *decoder,esp_audio_dec_in_raw_t *input,esp_audio_dec_out_frame_t *output,esp_audio_dec_info_t *info) {
-  assert(decoder==(void *)1 && input->len==3 && !memcmp(input->buffer,"abc",3));
+static esp_audio_err_t codec_call(codec_job_t *job) {
+  assert(job->handle==(void *)1);
+  if(job->operation==CODEC_DECODER_RESET) { decoder_resets++;return 0; }
+  assert(job->operation==CODEC_DECODE);
+  esp_audio_dec_in_raw_t *input=job->input;
+  esp_audio_dec_out_frame_t *output=job->output;
+  esp_audio_dec_info_t *info=job->info;
+  assert(input->len==3 && !memcmp(input->buffer,"abc",3));
   assert(output->len==DECODED_PCM_BYTES);
   input->consumed=partial_decode?input->len-1:input->len;output->decoded_size=8;
   *info=(esp_audio_dec_info_t){.sample_rate=bad_decode?24000:AUDIO_SAMPLE_RATE,.channel=1,.bits_per_sample=16};
@@ -625,5 +634,151 @@ int main(void) {
 `)
     execFileSync('cc', ['-std=c11', '-Wall', '-Wextra', '-Werror', '-I', sourceDir, join(root, 'turns.c'), join(sourceDir, 'stt_stream.c'), '-o', join(root, 'turns')])
     expect(execFileSync(join(root, 'turns'), { encoding: 'utf8' })).toContain('ordered dialogue audio and automatic turns passed')
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+it('dispatches all codec operations to the dedicated task and preserves borrowed job lifetime through completion', () => {
+  const root = mkdtempSync(join(tmpdir(), 'easyinput-codec-dispatch-'))
+  try {
+    const source = readFileSync(resolve('firmware/easyinput-monitor/main/xiaozhi_stt.c'), 'utf8')
+    const extract = (name: string) => {
+      const start = source.search(new RegExp('static [^\\n]+[ *]' + name + '\\([^;]*?\\)\\n\\{'))
+      if (start < 0) throw new Error('Missing codec function ' + name)
+      return source.slice(start, source.indexOf('\n}\n', start) + 3)
+    }
+    const codecTypeStart = source.indexOf('typedef enum {\n    CODEC_ENCODER_OPEN')
+    const codecTypeEnd = source.indexOf('} codec_job_t;') + '} codec_job_t;'.length
+    const codecTypes = source.slice(codecTypeStart, codecTypeEnd)
+    const stackDefinition = source.match(/^#define CODEC_STACK_BYTES .+$/m)?.[0]
+    if (!stackDefinition) throw new Error('Missing codec stack configuration')
+    writeFileSync(join(root, 'dispatch.c'), `
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <setjmp.h>
+#define ESP_AUDIO_ERR_OK 0
+#define ESP_AUDIO_ERR_FAIL -1
+#define ESP_AUDIO_ERR_INVALID_PARAMETER -2
+#define ESP_ERR_NO_MEM 0x101
+#define pdTRUE 1
+#define pdPASS 1
+#define portMAX_DELAY -1
+#define MALLOC_CAP_SPIRAM 1
+#define MALLOC_CAP_8BIT 2
+${stackDefinition}
+typedef int esp_audio_err_t;
+${codecTypes}
+static void *codec_worker, *codec_requests, *codec_done;
+static void (*created_task)(void *);
+static codec_job_t *borrowed_job, *executing_job;
+static int failure_stage, create_queue_calls, create_semaphore_calls, create_task_calls;
+static int delete_queue_calls, delete_semaphore_calls, delete_task_calls;
+static int submit_calls, sdk_calls, gives, waits, early_wakes, sdk_result;
+static bool in_codec_task, completed, submit_fails;
+static char failure[40];
+static jmp_buf scheduler_return;
+static void *const encoder=(void *)11;
+static void *const decoder=(void *)12;
+static unsigned char configuration[16], input_data[16], encoded_data[16], decoded_data[16];
+static int input_size, output_size, decoder_info;
+static void *opened_handle;
+static void log_failure(const char *stage,int error) { assert(error==ESP_ERR_NO_MEM);snprintf(failure,sizeof failure,"%s",stage); }
+static void *xQueueCreate(unsigned depth,size_t item_size) { create_queue_calls++;assert(depth==1 && item_size==sizeof(codec_job_t *));return failure_stage==1?NULL:(void *)1; }
+static void *xSemaphoreCreateBinary(void) { create_semaphore_calls++;return failure_stage==2?NULL:(void *)2; }
+static int xTaskCreateWithCaps(void (*task)(void *),const char *name,unsigned stack_bytes,void *arg,unsigned priority,void **handle,unsigned caps) {
+  create_task_calls++;assert(!strcmp(name,"xiaozhi_codec") && stack_bytes==48*1024 && !arg && priority==4);
+  assert(caps==(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));
+  if(failure_stage==3)return 0;*handle=(void *)3;created_task=task;return pdPASS;
+}
+static void vTaskDeleteWithCaps(void *task) { assert(task==(void *)3);delete_task_calls++; }
+static void vQueueDelete(void *queue) { assert(queue==(void *)1);delete_queue_calls++; }
+static void vSemaphoreDelete(void *semaphore) { assert(semaphore==(void *)2);delete_semaphore_calls++; }
+static int xQueueSend(void *queue,const void *item,int wait) {
+  assert(!in_codec_task && queue==codec_requests && wait==portMAX_DELAY && !borrowed_job);
+  submit_calls++;if(submit_fails)return 0;borrowed_job=*(codec_job_t *const *)item;
+  assert(borrowed_job->result==ESP_AUDIO_ERR_FAIL);completed=false;return pdTRUE;
+}
+static int xQueueReceive(void *queue,void *item,int wait) {
+  assert(in_codec_task && queue==codec_requests && wait==portMAX_DELAY);
+  if(!borrowed_job)longjmp(scheduler_return,1);
+  executing_job=borrowed_job;*(codec_job_t **)item=borrowed_job;return pdTRUE;
+}
+static void xSemaphoreGive(void *semaphore) {
+  assert(in_codec_task && semaphore==codec_done && executing_job==borrowed_job);
+  assert(executing_job->result==sdk_result || executing_job->operation==CODEC_ENCODER_CLOSE || executing_job->operation==(codec_operation_t)99);
+  completed=true;gives++;borrowed_job=NULL;executing_job=NULL;
+}
+static int xSemaphoreTake(void *semaphore,int wait) {
+  assert(!in_codec_task && semaphore==codec_done && wait==portMAX_DELAY);waits++;
+  if(early_wakes) { early_wakes--;assert(borrowed_job && !completed);return 0; }
+  assert(borrowed_job && !completed && created_task);
+  in_codec_task=true;
+  if(!setjmp(scheduler_return))created_task(NULL);
+  in_codec_task=false;assert(completed && !borrowed_job && !executing_job);return pdTRUE;
+}
+static void check_sdk(codec_operation_t operation) {
+  assert(in_codec_task && executing_job && executing_job->operation==operation);
+  assert(!completed);sdk_calls++;
+}
+static int esp_opus_enc_open(void *config,uint32_t size,void **handle) { check_sdk(CODEC_ENCODER_OPEN);assert(config==configuration && size==sizeof configuration && handle==&opened_handle);*handle=encoder;return sdk_result; }
+static int esp_opus_enc_get_frame_size(void *handle,int *in,int *out) { check_sdk(CODEC_ENCODER_SIZE);assert(handle==encoder && in==&input_size && out==&output_size);*in=1920;*out=400;return sdk_result; }
+static int esp_opus_enc_process(void *handle,void *in,void *out) { check_sdk(CODEC_ENCODE);assert(handle==encoder && in==input_data && out==encoded_data);encoded_data[0]=42;return sdk_result; }
+static void esp_opus_enc_close(void *handle) { check_sdk(CODEC_ENCODER_CLOSE);assert(handle==encoder); }
+static int esp_opus_dec_open(void *config,uint32_t size,void **handle) { check_sdk(CODEC_DECODER_OPEN);assert(config==configuration && size==sizeof configuration && handle==&opened_handle);*handle=decoder;return sdk_result; }
+static int esp_opus_dec_reset(void *handle) { check_sdk(CODEC_DECODER_RESET);assert(handle==decoder);return sdk_result; }
+static int esp_opus_dec_decode(void *handle,void *in,void *out,void *info) { check_sdk(CODEC_DECODE);assert(handle==decoder && in==encoded_data && out==decoded_data && info==&decoder_info);decoded_data[0]=17;decoder_info=16000;return sdk_result; }
+static int esp_opus_dec_close(void *handle) { check_sdk(CODEC_DECODER_CLOSE);assert(handle==decoder);return sdk_result; }
+${['codec_execute', 'codec_run', 'codec_call', 'codec_deinit', 'codec_init'].map(extract).join('\n')}
+static void reset(void) {
+  assert(!codec_worker && !codec_requests && !codec_done);
+  failure_stage=create_queue_calls=create_semaphore_calls=create_task_calls=0;
+  delete_queue_calls=delete_semaphore_calls=delete_task_calls=0;
+  submit_calls=sdk_calls=gives=waits=early_wakes=sdk_result=0;
+  in_codec_task=completed=submit_fails=false;failure[0]=0;borrowed_job=executing_job=NULL;created_task=NULL;
+}
+int main(void) {
+  codec_job_t job={.operation=CODEC_ENCODE,.handle=encoder,.input=input_data,.output=encoded_data};
+  // Resource absence and queue submission failure return safely without SDK calls.
+  reset();assert(codec_call(&job)==ESP_AUDIO_ERR_FAIL && !submit_calls && !sdk_calls);
+  for(int stage=1;stage<=3;stage++) {
+    reset();failure_stage=stage;assert(!codec_init());
+    assert(!codec_worker && !codec_requests && !codec_done && !strcmp(failure,"init.codec_worker"));
+    assert(delete_queue_calls==(stage!=1) && delete_semaphore_calls==(stage!=2) && !delete_task_calls);
+    assert(create_task_calls==(stage==3));
+    assert(codec_call(&job)==ESP_AUDIO_ERR_FAIL && !submit_calls && !sdk_calls);
+  }
+  reset();assert(codec_init());assert(create_queue_calls==1 && create_semaphore_calls==1 && create_task_calls==1);
+  submit_fails=true;assert(codec_call(&job)==ESP_AUDIO_ERR_FAIL && !sdk_calls && !gives && !waits);
+  submit_fails=false;
+  // Callers retain stack-owned arguments through a transient wake and completion.
+  early_wakes=1;assert(codec_call(&job)==ESP_AUDIO_ERR_OK && encoded_data[0]==42);
+  assert(waits==2 && sdk_calls==1 && gives==1 && !borrowed_job);
+  job=(codec_job_t){.operation=CODEC_ENCODER_OPEN,.input=configuration,.config_size=sizeof configuration,.output=&opened_handle};
+  assert(codec_call(&job)==ESP_AUDIO_ERR_OK && opened_handle==encoder);
+  job=(codec_job_t){.operation=CODEC_ENCODER_SIZE,.handle=encoder,.input=&input_size,.output=&output_size};
+  assert(codec_call(&job)==ESP_AUDIO_ERR_OK && input_size==1920 && output_size==400);
+  sdk_result=-37;job=(codec_job_t){.operation=CODEC_ENCODER_CLOSE,.handle=encoder};
+  assert(codec_call(&job)==ESP_AUDIO_ERR_OK);sdk_result=0;
+  job=(codec_job_t){.operation=CODEC_DECODER_OPEN,.input=configuration,.config_size=sizeof configuration,.output=&opened_handle};
+  assert(codec_call(&job)==ESP_AUDIO_ERR_OK && opened_handle==decoder);
+  job=(codec_job_t){.operation=CODEC_DECODER_RESET,.handle=decoder};assert(codec_call(&job)==ESP_AUDIO_ERR_OK);
+  job=(codec_job_t){.operation=CODEC_DECODE,.handle=decoder,.input=encoded_data,.output=decoded_data,.info=&decoder_info};
+  assert(codec_call(&job)==ESP_AUDIO_ERR_OK && decoded_data[0]==17 && decoder_info==16000);
+  // Codec errors return after completion too, preserving the vendor error code.
+  sdk_result=-37;assert(codec_call(&job)==-37 && completed && !borrowed_job);
+  job=(codec_job_t){.operation=CODEC_DECODER_CLOSE,.handle=decoder};assert(codec_call(&job)==-37);
+  job=(codec_job_t){.operation=(codec_operation_t)99};assert(codec_call(&job)==ESP_AUDIO_ERR_INVALID_PARAMETER);
+  assert(sdk_calls==9 && gives==10 && waits==11);
+  codec_deinit();assert(!codec_worker && !codec_requests && !codec_done);
+  assert(delete_task_calls==1 && delete_queue_calls==1 && delete_semaphore_calls==1);
+  assert(codec_call(&job)==ESP_AUDIO_ERR_FAIL);
+  puts("codec task dispatch, completion and initialization checks passed");
+}
+`)
+    execFileSync('cc', ['-std=c11', '-Wall', '-Wextra', '-Werror', join(root, 'dispatch.c'), '-o', join(root, 'dispatch')])
+    expect(execFileSync(join(root, 'dispatch'), { encoding: 'utf8' })).toContain('codec task dispatch, completion and initialization checks passed')
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
