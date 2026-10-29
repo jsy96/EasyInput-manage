@@ -41,6 +41,9 @@ static bool transport_failed, capacity_failed, pending_durable, identity_ready, 
 static uint8_t *pcm;
 static stt_stream_t stream;
 static portMUX_TYPE capture_lock = portMUX_INITIALIZER_UNLOCKED;
+// The capture spinlock also protects diagnostics, including before guard exists.
+static stt_snapshot_t diagnostics = {.stage = "idle"};
+static bool diagnostic_failed, capture_stopped_pending;
 static stt_text_t pending;
 static stt_text_t *text_queue;
 static size_t text_head, text_count;
@@ -52,8 +55,21 @@ static bool ws_accepting, ws_binary;
 typedef struct { char json[STT_JSON_BYTES]; } incoming_t;
 typedef struct { size_t offset, length; } text_slice_t;
 
+static void set_stage(const char *stage)
+{
+    portENTER_CRITICAL(&capture_lock);
+    if (!diagnostic_failed) strlcpy(diagnostics.stage, stage, sizeof(diagnostics.stage));
+    portEXIT_CRITICAL(&capture_lock);
+}
 static void log_failure(const char *stage, int code)
 {
+    portENTER_CRITICAL(&capture_lock);
+    if (!diagnostic_failed) {
+        strlcpy(diagnostics.stage, stage, sizeof(diagnostics.stage));
+        diagnostics.error = code;
+        diagnostic_failed = true;
+    }
+    portEXIT_CRITICAL(&capture_lock);
     // Report only fixed stage names, numeric codes and sizes, never credentials
     // or server payloads (which may contain the user's transcription).
     ESP_LOGW(TAG, "STT failure: stage=%s code=%d internal_free=%u internal_largest=%u psram_free=%u",
@@ -145,11 +161,17 @@ static bool stop_capture(void)
     const bool active = capturing;
     portEXIT_CRITICAL(&capture_lock);
     // audio_live_stop flushes the last partial 20 ms block while sink is still active.
-    const bool ok = !active || audio_live_stop() == ESP_OK;
+    const esp_err_t result = active ? audio_live_stop() : ESP_OK;
+    const bool ok = result == ESP_OK;
     portENTER_CRITICAL(&capture_lock);
-    capturing = false;
+    if (active && ok) {
+        capturing = false;
+        // Separate latch survives a full progress queue and its terminal reset.
+        capture_stopped_pending = true;
+    }
     if (!ok) transport_failed = true;
     portEXIT_CRITICAL(&capture_lock);
+    if (!ok) log_failure("mic.stop", result);
     xSemaphoreGive(microphone_guard);
     return ok;
 }
@@ -210,6 +232,7 @@ static void http_failure(esp_http_client_handle_t http, const char *stage, int c
 }
 static cJSON *http_post(const char *url, const char *body, int *status)
 {
+    set_stage("http");
     *status = 0;
     esp_http_client_config_t config = {.url=url, .crt_bundle_attach=esp_crt_bundle_attach, .timeout_ms=12000,
         .disable_auto_redirect=true, .buffer_size=2048};
@@ -252,6 +275,7 @@ static cJSON *http_post(const char *url, const char *body, int *status)
 }
 static cJSON *provision(void)
 {
+    set_stage("provision");
     const esp_app_desc_t *app = esp_app_get_description();
     esp_chip_info_t chip; esp_chip_info(&chip);
     cJSON *root = cJSON_CreateObject();
@@ -486,6 +510,11 @@ static bool receive_message(const cJSON *json, bool *had_text)
         const int count = text_slices(value->valuestring, slices);
         if (count < 0 || !enqueue_text(value->valuestring)) { log_failure("receive.text", ESP_FAIL); return false; }
         *had_text = count > 0;
+        if (*had_text) {
+            portENTER_CRITICAL(&capture_lock);
+            diagnostics.received_texts++;
+            portEXIT_CRITICAL(&capture_lock);
+        }
     } else if (cJSON_IsString(type) && (!strcmp(type->valuestring, "error") || !strcmp(type->valuestring, "goodbye"))) {
         log_failure(!strcmp(type->valuestring, "error") ? "receive.server_error" : "receive.goodbye", ESP_ERR_INVALID_RESPONSE);
         return false;
@@ -496,6 +525,7 @@ static bool receive_message(const cJSON *json, bool *had_text)
 
 static stt_event_kind_t transcribe(cJSON *provisioning)
 {
+    set_stage("ws");
     const cJSON *config = cJSON_GetObjectItemCaseSensitive(provisioning, "websocket");
     const cJSON *url = cJSON_GetObjectItemCaseSensitive(config, "url"), *token = cJSON_GetObjectItemCaseSensitive(config, "token");
     const cJSON *version = cJSON_GetObjectItemCaseSensitive(config, "version");
@@ -522,6 +552,7 @@ static stt_event_kind_t transcribe(cJSON *provisioning)
     if (!ok) log_failure("ws.start", started);
     const int64_t deadline=esp_timer_get_time()+12000000;
     while(ok && !is_cancelled() && !stream_failed() && !esp_websocket_client_is_connected(ws) && esp_timer_get_time()<deadline) vTaskDelay(pdMS_TO_TICKS(50));
+    set_stage("hello");
     cJSON *hello=cJSON_CreateObject();
     cJSON_AddStringToObject(hello,"type","hello"); cJSON_AddNumberToObject(hello,"version",protocol);
     cJSON_AddStringToObject(hello,"transport","websocket");
@@ -552,7 +583,11 @@ static stt_event_kind_t transcribe(cJSON *provisioning)
         ok=result==ESP_AUDIO_ERR_OK && input_size==1920 && output_size>0 && output_size<=4000;
         if (!ok) log_failure("opus.frame_size", result);
     }
-    if(ok) { encoded=psram_alloc(output_size+16, "opus.buffer"); ok=encoded && send_json(ws,listen_frame(session,"start")); }
+    if(ok) {
+        encoded=psram_alloc(output_size+16, "opus.buffer");
+        ok=encoded && send_json(ws,listen_frame(session,"start"));
+        if (ok) set_stage("listening");
+    }
     incoming_t *event = psram_alloc(sizeof(*event), "receive.buffer");
     uint8_t input[1920];
     uint64_t sent_bytes = 0;
@@ -601,8 +636,10 @@ static stt_event_kind_t transcribe(cJSON *provisioning)
             if (!ok) log_failure("ws.send_audio", sent);
             if (ok) {
                 portENTER_CRITICAL(&capture_lock);
+                diagnostics.sent_bytes += length;
                 ok = stt_stream_consume(&stream, length);
                 portEXIT_CRITICAL(&capture_lock);
+                if (!ok) log_failure("stream.consume", ESP_ERR_INVALID_STATE);
                 sent_bytes += length;
                 encoded_frames++;
             }
@@ -633,6 +670,7 @@ static stt_event_kind_t transcribe(cJSON *provisioning)
     const bool failed = !ok || stream_failed();
     const bool full = capacity_exhausted();
     if (full) log_failure("stream.full", ESP_ERR_NO_MEM);
+    if (failed && !is_cancelled()) log_failure("stream.failed", ESP_FAIL);
     ESP_LOGI(TAG, "Realtime upload ended: frames=%u bytes=%llu clean=%d", encoded_frames, (unsigned long long)sent_bytes, !failed);
     // No abort/relisten on individual STT events: keep one realtime listen session.
     // abort is only sent on cancellation/cleanup, after audio transmission has ended.
@@ -644,7 +682,10 @@ static stt_event_kind_t transcribe(cJSON *provisioning)
     if (is_cancelled()) return STT_CANCELLED;
     if (full) return STT_FULL;
     if (failed) return STT_FAILED;
-    if (!got_text) return heard ? STT_FAILED : STT_EMPTY;
+    if (!got_text) {
+        if (heard) log_failure("receive.no_text", ESP_ERR_INVALID_RESPONSE);
+        return heard ? STT_FAILED : STT_EMPTY;
+    }
     return STT_FINISHED;
 }
 static void run(void *arg)
@@ -687,6 +728,7 @@ static void run(void *arg)
             xSemaphoreTake(guard, portMAX_DELAY);
             if (cancel_preparing) { xSemaphoreGive(guard); vTaskDelay(pdMS_TO_TICKS(10)); continue; }
             if (cancelled) outcome = cancel_storage_failed ? STT_FAILED : STT_CANCELLED;
+            set_stage(outcome == STT_CANCELLED ? "cancelled" : "finished");
             busy = false;
             notify(outcome, activation);
             xSemaphoreGive(guard);
@@ -720,13 +762,16 @@ esp_err_t xiaozhi_stt_start(void)
     if (!guard || !worker || !storage_ready || !identity_ready) { log_failure("start.unavailable", ESP_ERR_INVALID_STATE); return ESP_ERR_INVALID_STATE; }
     xSemaphoreTake(microphone_guard, portMAX_DELAY);
     xSemaphoreTake(guard, portMAX_DELAY);
-    if (busy || pending.id[0] || text_count) { xSemaphoreGive(guard); xSemaphoreGive(microphone_guard); log_failure("start.busy_or_pending", ESP_ERR_INVALID_STATE); return ESP_ERR_INVALID_STATE; }
+    if (busy || capture_running() || pending.id[0] || text_count) { xSemaphoreGive(guard); xSemaphoreGive(microphone_guard); log_failure("start.busy_or_pending", ESP_ERR_INVALID_STATE); return ESP_ERR_INVALID_STATE; }
     xQueueReset(notifications);
     cancelled = stop_requested = stop_intent = cancel_storage_failed = cancel_preparing = false;
     busy = true;
     xSemaphoreGive(guard);
     portENTER_CRITICAL(&capture_lock);
     stt_stream_init(&stream, pcm, PCM_BYTES);
+    memset(&diagnostics, 0, sizeof(diagnostics));
+    strlcpy(diagnostics.stage, "starting", sizeof(diagnostics.stage));
+    diagnostic_failed = capture_stopped_pending = false;
     transport_failed = capacity_failed = false; capturing = true;
     portEXIT_CRITICAL(&capture_lock);
     const esp_err_t result = audio_live_start(sink);
@@ -747,6 +792,7 @@ void xiaozhi_stt_stop(void)
     if (active) stop_intent = true;
     xSemaphoreGive(guard);
     if (!active) return;
+    set_stage("draining");
     (void)stop_capture();
     if (!persist_pending_head()) stream_error();
     xSemaphoreTake(guard, portMAX_DELAY);
@@ -759,7 +805,30 @@ bool xiaozhi_stt_busy(void)
     if (!guard) return false;
     xSemaphoreTake(guard, portMAX_DELAY); bool value = busy; xSemaphoreGive(guard); return value;
 }
-bool xiaozhi_stt_poll(stt_event_t *event) { return notifications && xQueueReceive(notifications, event, 0) == pdTRUE; }
+void xiaozhi_stt_get_snapshot(stt_snapshot_t *snapshot)
+{
+    if (!snapshot) return;
+    // Keep the established guard -> capture_lock order used by the text FIFO.
+    if (guard) xSemaphoreTake(guard, portMAX_DELAY);
+    portENTER_CRITICAL(&capture_lock);
+    *snapshot = diagnostics;
+    snapshot->busy = busy;
+    snapshot->capturing = capturing;
+    snapshot->captured_bytes = stream.accepted;
+    snapshot->queued_texts = text_count + (pending.id[0] ? 1 : 0);
+    portEXIT_CRITICAL(&capture_lock);
+    if (guard) xSemaphoreGive(guard);
+}
+bool xiaozhi_stt_poll(stt_event_t *event)
+{
+    if (!event) return false;
+    portENTER_CRITICAL(&capture_lock);
+    const bool stopped = capture_stopped_pending;
+    if (stopped) capture_stopped_pending = false;
+    portEXIT_CRITICAL(&capture_lock);
+    if (stopped) { *event = (stt_event_t){.kind = STT_CAPTURE_STOPPED}; return true; }
+    return notifications && xQueueReceive(notifications, event, 0) == pdTRUE;
+}
 bool xiaozhi_stt_pending(stt_text_t *text)
 {
     if (!guard) return false;
@@ -781,6 +850,11 @@ bool xiaozhi_stt_ack(const char *id)
         ok = live || persist_text(next);
         if (ok && next) { pending = *next; pending_durable = !live; text_head = (text_head + 1) % TEXT_QUEUE_CAPACITY; text_count--; }
         else if (ok) { memset(&pending, 0, sizeof(pending)); pending_durable = false; }
+        if (ok) {
+            portENTER_CRITICAL(&capture_lock);
+            diagnostics.acked_texts++;
+            portEXIT_CRITICAL(&capture_lock);
+        }
     }
     xSemaphoreGive(guard); return ok;
 }

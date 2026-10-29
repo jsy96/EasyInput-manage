@@ -9,6 +9,7 @@
 #include "audio.h"
 #include "cloud.h"
 #include "voice_chat.h"
+#include "xiaozhi_stt.h"
 #include "network_setup.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -827,6 +828,18 @@ static void emit_status(void)
     cJSON_AddNumberToObject(voice_debug, "last_key", voice_state.last_key);
     cJSON_AddNumberToObject(voice_debug, "last_key_mode", voice_state.last_key_mode);
     cJSON_AddNumberToObject(voice_debug, "stage", voice_state.stage);
+    stt_snapshot_t stt_state;
+    xiaozhi_stt_get_snapshot(&stt_state);
+    cJSON *stt = cJSON_AddObjectToObject(voice, "stt");
+    cJSON_AddBoolToObject(stt, "busy", stt_state.busy);
+    cJSON_AddBoolToObject(stt, "capturing", stt_state.capturing);
+    cJSON_AddStringToObject(stt, "stage", stt_state.stage);
+    cJSON_AddNumberToObject(stt, "error", stt_state.error);
+    cJSON_AddNumberToObject(stt, "captured_bytes", (double)stt_state.captured_bytes);
+    cJSON_AddNumberToObject(stt, "sent_bytes", (double)stt_state.sent_bytes);
+    cJSON_AddNumberToObject(stt, "received_texts", stt_state.received_texts);
+    cJSON_AddNumberToObject(stt, "acked_texts", stt_state.acked_texts);
+    cJSON_AddNumberToObject(stt, "queued_texts", stt_state.queued_texts);
     cJSON *audio = cJSON_AddObjectToObject(root, "audio");
     cJSON_AddBoolToObject(audio, "ready", audio_state.ready && light_state.ready);
     cJSON_AddNumberToObject(audio, "sample_rate_hz", AUDIO_SAMPLE_RATE);

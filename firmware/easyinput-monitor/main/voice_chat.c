@@ -101,6 +101,7 @@ typedef enum {
     PROMPT_ACTION_START_RECORDING,
     PROMPT_ACTION_START_STT,
     PROMPT_ACTION_SETTINGS_CONFIRM,
+    PROMPT_ACTION_STT_ENDED,
 } prompt_action_t;
 
 static const char *TAG = "voice_chat";
@@ -175,6 +176,11 @@ static bool text_sent_announce_pending;
 static bool stt_s5_pressed;
 static bool stt_cancel_failed;
 static bool stt_cancel_announce_pending;
+static bool stt_round_started;
+static bool stt_start_attempted;
+static bool stt_end_announced;
+static bool stt_terminal_received;
+static bool stt_awaiting_ack;
 static unsigned deferred_timer_events;
 static char summary_request_id[40], text_request_id[40], text_inflight_id[33];
 static unsigned ledger_generation, summary_generation;
@@ -463,8 +469,10 @@ static void append_number(int *ids, int *length, int value)
 static void start_prompt_sequence(const int *ids, int length, prompt_action_t action)
 {
     // The streaming microphone must never transcribe our own speaker prompts.
-    // Terminal STT events are emitted only after microphone capture has stopped.
-    if (xiaozhi_stt_busy()) return;
+    // Final-result draining may continue after capture has already stopped.
+    stt_snapshot_t stt;
+    xiaozhi_stt_get_snapshot(&stt);
+    if (stt.capturing || (stt.busy && action != PROMPT_ACTION_STT_ENDED)) return;
     stop_prompt();
     prompt_length = length > PROMPT_SEQUENCE_CAPACITY ? PROMPT_SEQUENCE_CAPACITY : length;
     for (int i = 0; i < prompt_length; i++) prompt_ids[i] = ids[i];
@@ -475,6 +483,64 @@ static void start_prompt_sequence(const int *ids, int length, prompt_action_t ac
 static void start_prompt(int prompt, prompt_action_t action)
 {
     start_prompt_sequence(&prompt, 1, action);
+}
+
+static void stt_feedback(const int *tail, int tail_length)
+{
+    stt_snapshot_t stt;
+    xiaozhi_stt_get_snapshot(&stt);
+    if (stt.capturing) return;
+    // A terminal event can follow CAPTURE_STOPPED in the same task tick. Append
+    // its explanation without interrupting/replaying the microphone-off cue.
+    if (prompt_action == PROMPT_ACTION_STT_ENDED && (prompt_length || prompt_playing)) {
+        for (int i = 0; i < tail_length; i++) append_prompt(prompt_ids, &prompt_length, tail[i]);
+        return;
+    }
+    const bool announce_end = stt_round_started && !stt_end_announced;
+    if (!announce_end && !tail_length) return;
+    int ids[PROMPT_SEQUENCE_CAPACITY], length = 0;
+    if (announce_end) append_prompt(ids, &length, PROMPT_STT_ENDED);
+    for (int i = 0; i < tail_length; i++) append_prompt(ids, &length, tail[i]);
+    start_prompt_sequence(ids, length, PROMPT_ACTION_STT_ENDED);
+    if (announce_end && prompt_action == PROMPT_ACTION_STT_ENDED) stt_end_announced = true;
+}
+
+static void handle_stt_event(const stt_event_t *event)
+{
+    if (event->kind == STT_DONE) { text_retry_at = 0; return; }
+    if (event->kind == STT_WAIT || event->kind == STT_CAPTURE_STOPPED) {
+        if (stt_start_attempted) stt_feedback(NULL, 0);
+        return;
+    }
+    if (stt_terminal_received) return;
+    stt_terminal_received = true;
+    int ids[PROMPT_SEQUENCE_CAPACITY], length = 0;
+    if (event->kind == STT_CANCELLED) {
+        if (stt_cancel_announce_pending) {
+            stt_cancel_announce_pending = false;
+            append_prompt(ids, &length, stt_cancel_failed ? PROMPT_RECORD_CANCEL_FAILED : PROMPT_RECORD_CANCELLED);
+        }
+    } else if (event->kind != STT_FINISHED) {
+        // Keep the failed interaction separate from worker busy: the next S5
+        // short press acknowledges it instead of starting an ordinary recording.
+        stt_awaiting_ack = true;
+        if (event->kind == STT_ACTIVATE) {
+            append_prompt(ids, &length, PROMPT_STT_ACTIVATE);
+            for (int i = 0; event->code[i]; i++) if (event->code[i] >= '0' && event->code[i] <= '9')
+                append_prompt(ids, &length, PROMPT_DIGIT_0 + event->code[i] - '0');
+        } else append_prompt(ids, &length, event->kind == STT_EMPTY ? PROMPT_STT_EMPTY :
+            event->kind == STT_FULL ? PROMPT_FULL : PROMPT_STT_FAILED);
+    }
+    stt_feedback(ids, length);
+    if (mode == MODE_STT && prompt_action != PROMPT_ACTION_STT_ENDED) mode = MODE_IDLE;
+}
+
+static void poll_stt_events(void)
+{
+    stt_event_t event;
+    while (xiaozhi_stt_poll(&event)) handle_stt_event(&event);
+    // Snapshot fallback also covers a coalesced/missed capture-stop event.
+    if (stt_start_attempted) stt_feedback(NULL, 0);
 }
 
 static void announce_alarm_draft(void)
@@ -978,16 +1044,20 @@ static void confirm_ledger_record(void)
 static void cancel_recording(void)
 {
     pending_click = -1; second_click = false;
-    if (mode == MODE_STT || xiaozhi_stt_busy() || xiaozhi_stt_pending(NULL) || prompt_action == PROMPT_ACTION_START_STT) {
-        stop_prompt();
+    if (mode == MODE_STT || xiaozhi_stt_busy() || stt_awaiting_ack || xiaozhi_stt_pending(NULL) || prompt_action == PROMPT_ACTION_START_STT) {
+        if (prompt_action != PROMPT_ACTION_STT_ENDED) stop_prompt();
         const bool ok = xiaozhi_stt_cancel();
         text_request_id[0] = 0;
         text_sent_announce_pending = false;
         stt_cancel_failed = !ok;
         stt_cancel_announce_pending = xiaozhi_stt_busy();
+        stt_awaiting_ack = false;
+        stt_feedback(NULL, 0);
         if (!stt_cancel_announce_pending) {
-            mode = MODE_IDLE;
-            start_prompt(ok ? PROMPT_RECORD_CANCELLED : PROMPT_RECORD_CANCEL_FAILED, PROMPT_ACTION_NONE);
+            stt_terminal_received = true;
+            const int prompt = ok ? PROMPT_RECORD_CANCELLED : PROMPT_RECORD_CANCEL_FAILED;
+            stt_feedback(&prompt, 1);
+            if (prompt_action != PROMPT_ACTION_STT_ENDED) mode = MODE_IDLE;
         }
         return;
     }
@@ -1157,6 +1227,11 @@ static void on_double_key(int key)
         stt_cancel_failed = false;
         stt_cancel_announce_pending = false;
         text_sent_announce_pending = false;
+        stt_round_started = false;
+        stt_start_attempted = false;
+        stt_end_announced = false;
+        stt_terminal_received = false;
+        stt_awaiting_ack = false;
         mode = MODE_STT;
         start_prompt(PROMPT_STT_START, PROMPT_ACTION_START_STT);
     } else if (key == 5) announce_ledger();
@@ -1178,6 +1253,48 @@ static int64_t key_long_threshold(int key)
     return key <= 1 || key == 4 || key == 8 ? SETUP_LONG_US : LONG_US;
 }
 
+static bool on_stt_key(int key, bool down, int64_t now)
+{
+    // In continuous STT the release of S5 stops immediately. Keep a separate
+    // press latch so a terminal event between press/release cannot start an
+    // ordinary voice recording, and holding S5 can still cancel instead.
+    if (key == 4 && !down && stt_s5_pressed) {
+        const bool long_handled = key_long_handled[key] ||
+            (key_down[key] && now - key_down[key] >= SETUP_LONG_US && on_long_key(key));
+        stt_s5_pressed = false;
+        key_down[key] = 0;
+        key_held[key] = key_long_handled[key] = key_consumed[key] = false;
+        pending_click = -1; second_click = false;
+        if (!long_handled) {
+            if (xiaozhi_stt_busy()) { xiaozhi_stt_stop(); stt_feedback(NULL, 0); }
+            else if (prompt_action == PROMPT_ACTION_START_STT) {
+                stop_prompt();
+                stt_terminal_received = true;
+                stt_feedback(NULL, 0);
+                if (prompt_action != PROMPT_ACTION_STT_ENDED) mode = MODE_IDLE;
+            }
+            stt_awaiting_ack = false;
+        }
+        return true;
+    }
+    if (mode == MODE_STT || xiaozhi_stt_busy() || prompt_action == PROMPT_ACTION_START_STT ||
+        (key == 4 && stt_awaiting_ack)) {
+        pending_click = -1; second_click = false;
+        if (down) {
+            if (key_down[key]) return true;
+            key_down[key] = now;
+            key_held[key] = key_long_handled[key] = false;
+            key_consumed[key] = key != 4;
+            if (key == 4) stt_s5_pressed = true;
+        } else {
+            key_down[key] = 0;
+            key_held[key] = key_long_handled[key] = key_consumed[key] = false;
+        }
+        return true;
+    }
+    return false;
+}
+
 static void on_key(int key, bool down)
 {
     if (key < 0 || key > 8) return;
@@ -1190,36 +1307,7 @@ static void on_key(int key, bool down)
         else diag_s6_up_events++;
     }
     if (down && key == 6) diag_s7_events++;
-    // In continuous STT the release of S5 stops immediately. Keep a separate
-    // press latch so a terminal event between press/release cannot start an
-    // ordinary voice recording, and holding S5 can still cancel instead.
-    if (key == 4 && !down && stt_s5_pressed) {
-        const bool long_handled = key_long_handled[key] ||
-            (key_down[key] && now - key_down[key] >= SETUP_LONG_US && on_long_key(key));
-        stt_s5_pressed = false;
-        key_down[key] = 0;
-        key_held[key] = key_long_handled[key] = key_consumed[key] = false;
-        pending_click = -1; second_click = false;
-        if (!long_handled) {
-            if (xiaozhi_stt_busy()) xiaozhi_stt_stop();
-            else if (prompt_action == PROMPT_ACTION_START_STT) { stop_prompt(); mode = MODE_IDLE; }
-        }
-        return;
-    }
-    if (mode == MODE_STT || xiaozhi_stt_busy() || prompt_action == PROMPT_ACTION_START_STT) {
-        pending_click = -1; second_click = false;
-        if (down) {
-            if (key_down[key]) return;
-            key_down[key] = now;
-            key_held[key] = key_long_handled[key] = false;
-            key_consumed[key] = key != 4;
-            if (key == 4) stt_s5_pressed = true;
-        } else {
-            key_down[key] = 0;
-            key_held[key] = key_long_handled[key] = key_consumed[key] = false;
-        }
-        return;
-    }
+    if (on_stt_key(key, down, now)) return;
     // S5-S8 release/press pairs are resolved before any single-click action.
     // A second press at exactly 400 ms still belongs to the double click.
     if (down && pending_click >= 0 && (key != pending_click || now > click_deadline)) {
@@ -1746,7 +1834,10 @@ static void prompt_task_step(int64_t now)
         if (prompt_position < prompt_length) {
             size_t length = 0;
             const uint8_t *data = voice_prompt_data(prompt_ids[prompt_position], &length);
-            if (data != NULL && length && audio_play_voice(data, length) == ESP_OK) prompt_playing = true;
+            if (data != NULL && length && audio_play_voice(data, length) == ESP_OK) {
+                prompt_playing = true;
+                if (prompt_action == PROMPT_ACTION_START_STT) stt_round_started = true;
+            }
             prompt_position++;
         }
         if (!prompt_playing && prompt_position >= prompt_length) {
@@ -1755,8 +1846,15 @@ static void prompt_task_step(int64_t now)
             prompt_length = 0;
             prompt_action = PROMPT_ACTION_NONE;
             if (action == PROMPT_ACTION_START_RECORDING) start_recording();
-            else if (action == PROMPT_ACTION_START_STT && xiaozhi_stt_start() != ESP_OK) {
-                mode = MODE_IDLE; start_prompt(PROMPT_STT_FAILED, PROMPT_ACTION_NONE);
+            else if (action == PROMPT_ACTION_START_STT) {
+                stt_start_attempted = true;
+                if (xiaozhi_stt_start() != ESP_OK) {
+                    const stt_event_t failed = {.kind = STT_FAILED};
+                    handle_stt_event(&failed);
+                } else stt_round_started = true;
+            }
+            else if (action == PROMPT_ACTION_STT_ENDED && stt_terminal_received && mode == MODE_STT) {
+                mode = MODE_IDLE;
             }
             else if (action == PROMPT_ACTION_SETTINGS_CONFIRM) {
                 settings_commit_at = now + SETTINGS_COMMIT_US;
@@ -1826,32 +1924,7 @@ static void task(void *argument)
         sync_ledger(now);
         sync_summary(now);
         sync_text(now);
-        stt_event_t stt_event;
-        while (xiaozhi_stt_poll(&stt_event)) {
-            if (stt_event.kind == STT_WAIT) {
-                // Keep the session quiet through final-result draining too.
-            }
-            else if (stt_event.kind == STT_DONE) { text_retry_at = 0; }
-            else if (stt_event.kind == STT_FINISHED) { if (mode == MODE_STT) mode = MODE_IDLE; }
-            else if (stt_event.kind == STT_CANCELLED) {
-                if (mode == MODE_STT) mode = MODE_IDLE;
-                if (stt_cancel_announce_pending) {
-                    stt_cancel_announce_pending = false;
-                    start_prompt(stt_cancel_failed ? PROMPT_RECORD_CANCEL_FAILED : PROMPT_RECORD_CANCELLED, PROMPT_ACTION_NONE);
-                }
-            }
-            else {
-                mode = MODE_IDLE;
-                if (stt_event.kind == STT_ACTIVATE) {
-                    int ids[PROMPT_SEQUENCE_CAPACITY], length = 0;
-                    append_prompt(ids, &length, PROMPT_STT_ACTIVATE);
-                    for (int i = 0; stt_event.code[i]; i++) if (stt_event.code[i] >= '0' && stt_event.code[i] <= '9')
-                        append_prompt(ids, &length, PROMPT_DIGIT_0 + stt_event.code[i] - '0');
-                    start_prompt_sequence(ids, length, PROMPT_ACTION_NONE);
-                } else start_prompt(stt_event.kind == STT_EMPTY ? PROMPT_STT_EMPTY :
-                    stt_event.kind == STT_FULL ? PROMPT_FULL : PROMPT_STT_FAILED, PROMPT_ACTION_NONE);
-            }
-        }
+        poll_stt_events();
 
         diag_stage = 7;
         audio_snapshot_t audio;

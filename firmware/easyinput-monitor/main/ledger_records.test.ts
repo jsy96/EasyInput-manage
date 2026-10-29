@@ -44,6 +44,7 @@ static int64_t summary_retry_at, click_deadline, input_timestamp;
 static int pending_click = -1;
 static bool second_click, stt_busy, stt_pending, stt_s5_pressed, stt_cancel_failed, stt_cancel_announce_pending, text_sent_announce_pending;
 static int stt_stops;
+static bool stt_round_started, stt_start_attempted, stt_end_announced, stt_terminal_received, stt_awaiting_ack;
 static unsigned deferred_timer_events;
 static char summary_request_id[40], text_request_id[40];
 static bool xiaozhi_stt_busy(void) { return stt_busy; }
@@ -53,6 +54,7 @@ static bool xiaozhi_stt_cancel(void) { stt_pending = false; return true; }
 static int diag_last_key, stopped, released, uploads, setup_calls, volume_changes, stop_error, discard_error;
 static void stop_prompt(void) { prompt_playing = false; prompt_action = PROMPT_ACTION_NONE; }
 static void start_prompt(int p, prompt_action_t a) { last_prompt = p; prompt_playing = true; prompt_action = a; }
+static void stt_feedback(const int *ids, int n) { if (n) start_prompt(ids[0], PROMPT_ACTION_NONE); }
 static void append_prompt(int *ids, int *n, int p) { ids[(*n)++] = p; }
 static void append_number(int *ids, int *n, int p) { ids[(*n)++] = p; }
 static void start_prompt_sequence(const int *ids, int n, prompt_action_t a) { if (n) start_prompt(ids[0], a); }
@@ -83,12 +85,13 @@ static void announce_volume(void) {}
 static bool uploading(void) { return job == JOB_UP_BEGIN || job == JOB_UP_CHUNK || job == JOB_UP_COMMIT; }
 static bool on_long_key(int key);
 ${['begin_recording_with_prompt', 'append_health_value', 'begin_health_record', 'commit_health_record', 'begin_ledger_record',
-      'confirm_ledger_record', 'cancel_recording', 'on_short_key', 'announce_recent_health', 'append_amount', 'announce_ledger', 'on_double_key', 'poll_click', 'key_long_threshold', 'on_key', 'on_long_key', 'on_rotate', 'handle_timer_events'].map(extractFunction).join('\n')}
+      'confirm_ledger_record', 'cancel_recording', 'on_short_key', 'announce_recent_health', 'append_amount', 'announce_ledger', 'on_double_key', 'poll_click', 'key_long_threshold', 'on_stt_key', 'on_key', 'on_long_key', 'on_rotate', 'handle_timer_events'].map(extractFunction).join('\n')}
 static void reset_input(void) {
   mode = MODE_IDLE; job = JOB_IDLE; stop_prompt();
   pending_click = -1; second_click = stt_busy = stt_pending = false;
   stt_s5_pressed = stt_cancel_failed = stt_cancel_announce_pending = text_sent_announce_pending = false; stt_stops = 0;
   deferred_timer_events = 0;
+  stt_round_started = stt_start_attempted = stt_end_announced = stt_terminal_received = stt_awaiting_ack = false;
   health_edit_cancel(&health_edit); ledger_edit_cancel(&ledger_edit);
   memset(key_down, 0, sizeof key_down); memset(key_held, 0, sizeof key_held);
   memset(key_long_handled, 0, sizeof key_long_handled); memset(key_consumed, 0, sizeof key_consumed);

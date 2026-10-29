@@ -95,6 +95,7 @@ typedef enum {
     PROMPT_LEDGER_INCOMPLETE,
     PROMPT_LEDGER_UNDATED,
     PROMPT_LARGE_DIGITS,
+    PROMPT_STT_ENDED,
     PROMPT_COUNT,
 } voice_prompt_t;
 
