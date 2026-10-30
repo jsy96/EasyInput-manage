@@ -40,7 +40,7 @@
 #define REALTIME_QUEUE_DEPTH 32
 #define INPUT_QUEUE_DEPTH 16
 #define SLOW_BLINK_ON_US 500000LL
-#define SLOW_BLINK_PERIOD_US 2500000LL
+#define SLOW_BLINK_PERIOD_US 2000000LL
 #define FLASH_ON_US 500000LL
 #define FLASH_PERIOD_US 1000000LL
 #define ALARM_FLASH_US 60000000LL
@@ -113,6 +113,7 @@ static void (*send_line)(const char *);
 static bool (*send_binary_line)(const uint8_t *data, size_t length);
 static bool (*send_immediate_line)(const char *line);
 static bool (*cloud_online)(void);
+static voice_chat_wifi_state_t (*wifi_status)(void);
 static message_t *messages;
 static int message_count;
 static job_t job;
@@ -709,7 +710,9 @@ static void refresh_lights(int64_t now)
     modes[1] = alarm_fired ? "blink" : timer_running ? "flash" : alarm_set ? "solid" : "off";
     modes[2] = recording ? "solid" : sending ? "blink" : "off";
     modes[3] = realtime_active ? "blink" : "off";
-    modes[4] = network_fresh(now) ? "blink" : "solid";
+    const voice_chat_wifi_state_t wifi = wifi_status ? wifi_status() : VOICE_CHAT_WIFI_DISCONNECTED;
+    modes[4] = wifi == VOICE_CHAT_WIFI_CONNECTED ? "solid" :
+        wifi == VOICE_CHAT_WIFI_CONNECTING ? "blink" : "off";
     for (int index = 0; index < LIGHT_PIXEL_COUNT; index++) {
         const bool on = strcmp(modes[index], "solid") == 0 ||
             (strcmp(modes[index], "blink") == 0 && slow_blink) ||
@@ -2007,12 +2010,14 @@ static void task(void *argument)
 void voice_chat_init(void (*send)(const char *line),
                      bool (*send_binary)(const uint8_t *data, size_t length),
                      bool (*send_immediate)(const char *line),
-                     bool (*is_cloud_online)(void))
+                     bool (*is_cloud_online)(void),
+                     voice_chat_wifi_state_t (*get_wifi_state)(void))
 {
     send_line = send;
     send_binary_line = send_binary;
     send_immediate_line = send_immediate;
     cloud_online = is_cloud_online;
+    wifi_status = get_wifi_state;
     timers_init();
     health_records_init();
     ledger_records_init();

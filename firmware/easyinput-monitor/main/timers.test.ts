@@ -10,7 +10,7 @@ it('runs real alarm persistence, feedback, stopwatch and five-light priorities w
     const sourceDir = resolve('firmware/easyinput-monitor/main')
     const voice = readFileSync(join(sourceDir, 'voice_chat.c'), 'utf8')
     const extract = (source: string, name: string): string => {
-      const start = source.search(new RegExp(`(?:static )?(?:void|bool|int64_t|size_t) ${name}\\([^;]*?\\)\\n\\{`))
+      const start = source.search(new RegExp(`(?:static )?(?:void|bool|int64_t|size_t|voice_chat_wifi_state_t) ${name}\\([^;]*?\\)\\n\\{`))
       if (start < 0) throw new Error(`Missing function ${name}`)
       return source.slice(start, source.indexOf('\n}\n', start) + 3)
     }
@@ -21,6 +21,9 @@ it('runs real alarm persistence, feedback, stopwatch and five-light priorities w
     const constants = ['SLOW_BLINK_ON_US', 'SLOW_BLINK_PERIOD_US', 'FLASH_ON_US', 'FLASH_PERIOD_US',
       'ALARM_FLASH_US', 'STOPWATCH_RESULT_CAPACITY', 'PROMPT_SEQUENCE_CAPACITY', 'SETUP_LONG_US']
       .map(name => voice.match(new RegExp(`^#define ${name} .+$`, 'm'))?.[0]).join('\n')
+    const wifiType = readFileSync(join(sourceDir, 'voice_chat.h'), 'utf8')
+      .match(/typedef enum \{[^}]+\} voice_chat_wifi_state_t;/)?.[0]
+    if (!wifiType) throw new Error('Missing Wi-Fi state type')
     writeFileSync(join(root, 'esp_err.h'), '#pragma once\ntypedef int esp_err_t;\n#define ESP_OK 0\nconst char *esp_err_to_name(int);\n')
     writeFileSync(join(root, 'esp_log.h'), '#pragma once\nvoid capture_log(const char *, const char *, ...);\n#define ESP_LOGE(...) capture_log(__VA_ARGS__)\n')
     writeFileSync(join(root, 'nvs.h'), `#pragma once
@@ -66,6 +69,13 @@ int nvs_commit(nvs_handle_t h) { (void)h;commits++;if(fail_commit)return fail_co
 void nvs_close(nvs_handle_t h) { (void)h;closes++; }
 ${constants}
 ${enums}
+${wifiType}
+static char wifi_state[16]="disconnected";
+static bool wifi_reconfiguring,state_lock;
+#define portENTER_CRITICAL(lock) do { assert(!*(lock));*(lock)=true; } while(0)
+#define portEXIT_CRITICAL(lock) do { assert(*(lock));*(lock)=false; } while(0)
+${extract(readFileSync(join(sourceDir, 'main.c'), 'utf8'), 'get_voice_wifi_state')}
+static voice_chat_wifi_state_t (*wifi_status)(void);
 #define LIGHT_PIXEL_COUNT 5
 typedef struct { int rgb,brightness; bool on; } light_pixel_t;
 typedef struct { bool ready; int status_brightness; light_pixel_t pixels[5]; } lights_snapshot_t;
@@ -186,33 +196,55 @@ int main(void) {
   speech_done();deferred_timer_events=0;timers_init();assert(timers_alarm_minute()==-1);
 
   assert(timers_set_alarm_minute(-1));refresh_lights(10000000);
-  assert_modes("off","off","off","off","solid");
+  assert_modes("off","off","off","off","off");
+  wifi_status=get_voice_wifi_state;
+  refresh_lights(10000000);assert(!strcmp(pushed_modes[4],"off"));
   assert(timers_set_alarm_minute(720));refresh_lights(10000000);
-  assert_modes("off","solid","off","off","solid");
+  assert_modes("off","solid","off","off","off");
   timers_start_stopwatch(0);refresh_lights(10000000);
-  assert_modes("off","flash","off","off","solid");assert(light_state.pixels[1].on);
+  assert_modes("off","flash","off","off","off");assert(light_state.pixels[1].on);
   refresh_lights(10499999);assert(light_state.pixels[1].on);
   refresh_lights(10500000);assert(!light_state.pixels[1].on);
   alarm_fired_at_us=10000000;refresh_lights(10000000);
-  assert_modes("off","blink","off","off","solid");
+  assert_modes("off","blink","off","off","off");
   refresh_lights(70000000);assert(!strcmp(pushed_modes[1],"flash"));
   timers_stop_stopwatch(70000000);timers_start_countdown(1);refresh_lights(70000000);
   assert(!strcmp(pushed_modes[1],"flash"));timers_cancel_countdown();
   refresh_lights(70000000);assert(!strcmp(pushed_modes[1],"solid"));
   unread=true;refresh_lights(70000000);assert(!strcmp(pushed_modes[0],"solid"));
-  receiving_until_us=72500000;refresh_lights(70000000);assert(!strcmp(pushed_modes[0],"blink"));
-  refresh_lights(72500000);assert(!strcmp(pushed_modes[0],"solid"));
+  receiving_until_us=70000000+SLOW_BLINK_PERIOD_US;refresh_lights(70000000);assert(!strcmp(pushed_modes[0],"blink"));
+  refresh_lights(71999999);assert(!strcmp(pushed_modes[0],"blink"));
+  refresh_lights(72000000);assert(!strcmp(pushed_modes[0],"solid"));
   unread=false;job=JOB_PLAYING;stream_complete=false;refresh_lights(73000000);
   assert(!strcmp(pushed_modes[0],"blink"));stream_complete=true;refresh_lights(73000000);
   assert(!strcmp(pushed_modes[0],"off"));job=JOB_IDLE;
   pending_text=true;mode=MODE_STT;refresh_lights(75000000);assert(!strcmp(pushed_modes[2],"solid"));
   mode=MODE_IDLE;refresh_lights(75000000);assert(!strcmp(pushed_modes[2],"blink"));
-  pending_text=false;realtime_active=true;last_network_at=75000000;refresh_lights(75000000);
+  pending_text=false;realtime_active=true;last_network_at=75000000;
+  strcpy(wifi_state,"connecting");refresh_lights(76000000);
   assert_modes("off","solid","off","blink","blink");
-  refresh_lights(75499999);assert(light_state.pixels[3].on);
-  refresh_lights(75500000);assert(!light_state.pixels[3].on);
-  refresh_lights(82999999);assert(!strcmp(pushed_modes[4],"blink"));
-  refresh_lights(83000000);assert(!strcmp(pushed_modes[4],"solid"));
+  refresh_lights(76499999);assert(light_state.pixels[3].on && light_state.pixels[4].on);
+  refresh_lights(76500000);assert(!light_state.pixels[3].on && !light_state.pixels[4].on);
+  refresh_lights(77999999);assert(!light_state.pixels[3].on && !light_state.pixels[4].on);
+  refresh_lights(78000000);assert(light_state.pixels[3].on && light_state.pixels[4].on);
+  strcpy(wifi_state,"connected");refresh_lights(78500000);
+  assert(!strcmp(pushed_modes[4],"solid") && light_state.pixels[4].on);
+  refresh_lights(82999999);assert(network_fresh(82999999) && !strcmp(pushed_modes[4],"solid"));
+  refresh_lights(83000000);assert(!network_fresh(83000000) && !strcmp(pushed_modes[4],"solid"));
+  strcpy(wifi_state,"connecting");refresh_lights(83000001);assert(!strcmp(pushed_modes[4],"blink"));
+  wifi_reconfiguring=true;refresh_lights(83000002);assert(!strcmp(pushed_modes[4],"off"));
+  strcpy(wifi_state,"disconnected");wifi_reconfiguring=false;last_network_at=83000000;
+  refresh_lights(83000003);assert(network_fresh(83000003) && !strcmp(pushed_modes[4],"off"));
+
+  receiving_until_us=86000000;alarm_fired_at_us=84000000;pending_text=true;
+  strcpy(wifi_state,"connecting");refresh_lights(84000000);
+  assert_modes("blink","blink","blink","blink","blink");
+  for(int i=0;i<5;i++)assert(light_state.pixels[i].on);
+  refresh_lights(84499999);for(int i=0;i<5;i++)assert(light_state.pixels[i].on);
+  refresh_lights(84500000);for(int i=0;i<5;i++)assert(!light_state.pixels[i].on);
+  refresh_lights(85999999);for(int i=0;i<5;i++)assert(!light_state.pixels[i].on);
+  refresh_lights(86000000);for(int i=1;i<5;i++)assert(light_state.pixels[i].on);
+  receiving_until_us=0;pending_text=false;
 
   realtime_active=false;last_network_at=0;timers_start_stopwatch(0);
   toggle_stopwatch(65000000);assert(stopwatch_result_count==1 && !timers_stopwatch_active());

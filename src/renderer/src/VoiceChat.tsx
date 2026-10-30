@@ -12,7 +12,7 @@ const BOARD_LIGHTS = [
   { label: '灯 2', hint: '闹钟到点慢闪 1 分钟；正／倒计时 1 Hz；已设闹钟常亮' },
   { label: '灯 3', hint: 'S5／S6／S7 常亮；有待发送内容慢闪；其余熄灭' },
   { label: '灯 4', hint: '网页实时监听采集中慢闪；其余熄灭' },
-  { label: '灯 5', hint: '语音服务网络正常慢闪；未连接或故障常亮' },
+  { label: '灯 5', hint: '连接／重试 Wi-Fi 时慢闪；连接正常常亮；未连接熄灭' },
 ]
 export function VoiceChat({ room, board, lights, connection, busyChanged, disabled }: { room: RoomState; board: BoardStatus | null; lights: BoardLights | null; connection: ChatConnection | null; busyChanged(busy: boolean): void; disabled: boolean }): React.JSX.Element {
   const [recording, setRecording] = useState(false), [seconds, setSeconds] = useState(0)
@@ -229,7 +229,7 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
             return <li className="board-light-row" key={label}><i className={`board-light-dot is-${mode}`} /><span>{label}</span><small>{hint}</small></li>
           })}
         </ul>
-        <p className="light-note">适用固件 0.4.20 起。红灯均为 1% 亮度；慢闪：亮 0.5 秒、灭 2 秒；1 Hz：亮灭各 0.5 秒。灯 2 按表中顺序优先显示，其他计时继续运行。</p>
+        <p className="light-note">适用固件 0.4.22 起。红灯均为 1% 亮度；慢闪：亮 0.5 秒、灭 1.5 秒；1 Hz：亮灭各 0.5 秒。灯 2 按表中顺序优先显示，其他计时继续运行。</p>
       </section>
       <section className={`realtime-card ${room.realtimeActive ? 'is-active' : ''}`}>
         <div className="side-title"><span><Radio size={17} />实时监听状态</span><span>{room.realtimeActive ? '监听中' : room.realtimeEnabled ? '开启中' : '关闭'}<i className={room.realtimeActive ? 'live-dot active' : 'live-dot'} /></span></div>

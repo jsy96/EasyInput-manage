@@ -6,6 +6,12 @@
 
 #include "cJSON.h"
 
+typedef enum {
+    VOICE_CHAT_WIFI_DISCONNECTED,
+    VOICE_CHAT_WIFI_CONNECTING,
+    VOICE_CHAT_WIFI_CONNECTED,
+} voice_chat_wifi_state_t;
+
 typedef struct {
     unsigned pending;
     unsigned health_pending;
@@ -56,7 +62,8 @@ typedef struct {
 void voice_chat_init(void (*send)(const char *line),
                      bool (*send_binary)(const uint8_t *data, size_t length),
                      bool (*send_immediate)(const char *line),
-                     bool (*is_cloud_online)(void));
+                     bool (*is_cloud_online)(void),
+                     voice_chat_wifi_state_t (*get_wifi_state)(void));
 bool voice_chat_receive(const cJSON *value);
 void voice_chat_key(int key, bool pressed);
 void voice_chat_rotate(int delta);

@@ -1450,6 +1450,18 @@ static void status_task(void *arg)
     }
 }
 
+static voice_chat_wifi_state_t get_voice_wifi_state(void)
+{
+    voice_chat_wifi_state_t state = VOICE_CHAT_WIFI_DISCONNECTED;
+    portENTER_CRITICAL(&state_lock);
+    if (!wifi_reconfiguring) {
+        if (strcmp(wifi_state, "connected") == 0) state = VOICE_CHAT_WIFI_CONNECTED;
+        else if (strcmp(wifi_state, "connecting") == 0) state = VOICE_CHAT_WIFI_CONNECTING;
+    }
+    portEXIT_CRITICAL(&state_lock);
+    return state;
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     (void)arg;
@@ -1870,7 +1882,8 @@ void app_main(void)
     init_wifi_websocket();
     cloud_monitor_init();
     network_setup_init(wifi_websocket_server, save_phone_config, reconnect_phone_wifi);
-    voice_chat_init(send_chat_line, send_chat_binary, send_chat_immediate, cloud_monitor_is_online);
+    voice_chat_init(send_chat_line, send_chat_binary, send_chat_immediate, cloud_monitor_is_online,
+                    get_voice_wifi_state);
     init_ble_monitor();
     xTaskCreateWithCaps(ble_tx_task, "ble_tx", 4096, NULL, 6, NULL,
                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
