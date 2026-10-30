@@ -1,6 +1,6 @@
 {
   "name": "easyinput-studio",
-  "version": "0.4.9",
+  "version": "0.4.10",
   "private": true,
   "description": "Browser voice timeline and firmware manager for the EasyInput V2 development board",
   "scripts": {

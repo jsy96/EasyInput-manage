@@ -1,5 +1,5 @@
 import {
-  AUDIO_CHUNK, AUDIO_LIMIT, AUDIO_STREAM_WINDOW, CHAT_LIMIT, CHAT_PAGE_SIZE, BOARD_INDEX_PAGE_SIZE, CHAT_VERSION,
+  AUDIO_CHUNK, AUDIO_LIMIT, AUDIO_STREAM_WINDOW, VOICE_SAMPLES_MAX, RECORD_BATCH_CHUNKS, RECORD_IDLE_MS, CHAT_LIMIT, CHAT_PAGE_SIZE, BOARD_INDEX_PAGE_SIZE, CHAT_VERSION,
   isRealtimePacket, sortMessages, validId, isChatCursor, isChatMessage, compareMessages, isVoiceMessage, CHAT_TEXT_LIMIT,
 } from '../../src/shared/chat'
 import type { ChatClient, ChatMessage, ChatCursor, ChatPage } from '../../src/shared/chat'
@@ -11,6 +11,9 @@ import type { LedgerRecord } from '../../src/shared/ledger'
 type Attachment = { role: 'board' | 'browser'; client?: string; name?: string; last?: number; uptime?: number; healthPending?: number; ledgerPending?: number }
 type Frame = Record<string, unknown>
 type Upload = { id: string; sender: string; name: string; samples: number; next: number; created: number; updated?: number }
+type Recording = { id: string; samples: number; created: number; updated: number; tail: boolean }
+type AudioGarbage = { samples: number; next: number }
+type RecordingResult = { state: 'finished' | 'cancelled'; samples: number; interrupted?: boolean }
 const frame = (op: string, data: Frame = {}): Frame => ({ type: 'chat', protocol: CHAT_VERSION, op, ...data })
 const MAX_BATCH = 32
 
@@ -59,6 +62,14 @@ export class DeviceRoomV2 {
       if (!old || old.read !== m.read) writes[`voice-message:${m.id}`] = m
       previous.delete(m.id)
     }
+    for (const old of previous.values()) writes[`retired:${old.id}`] = true
+    const sources = new Set(items.filter(isVoiceMessage).map(m => m.audioSource ?? m.id))
+    let garbage = false
+    for (const old of previous.values()) if (isVoiceMessage(old) && !sources.has(old.audioSource ?? old.id)) {
+      writes[`audio-gc:${old.audioSource ?? old.id}`] = { samples: old.audioTotal ?? old.samples, next: 0 } satisfies AudioGarbage
+      garbage = true
+    }
+    if (garbage) await this.state.storage.setAlarm(Date.now() + 5000)
     await this.state.storage.transaction(async tx => {
       const entries = Object.entries(writes)
       for (let i = 0; i < entries.length; i += 100) await tx.put(Object.fromEntries(entries.slice(i, i + 100)))
@@ -76,12 +87,68 @@ export class DeviceRoomV2 {
       through: upper ? { created: upper.created, id: upper.id } : null, total: this.history.filter(m => !upper || compareMessages(m, upper) <= 0).length }
   }
   private stats(): Frame { return { total: this.history.length, unread: this.history.filter(m => m.sender !== 'board' && !m.read).length } }
-  private async audioChunk(id: string, index: number, clip?: ArrayBuffer): Promise<string> {
+  private async sourceChunk(id: string, index: number, clip?: ArrayBuffer): Promise<string> {
     const bytes = clip ?? await this.state.storage.get<ArrayBuffer>(`clip:${id}`)
     if (bytes) return btoa(String.fromCharCode(...new Uint8Array(bytes).subarray(index * AUDIO_CHUNK, (index + 1) * AUDIO_CHUNK)))
-    const legacy = await this.state.storage.get<string>(`audio:${id}:${index}`)
-    if (!legacy) throw new Error('语音分片不存在')
-    return legacy
+    const data = await this.state.storage.get<string>(`audio:${id}:${index}`)
+    if (!data) throw new Error('语音分片不存在')
+    return data
+  }
+  private async audioChunk(id: string, index: number, clip?: ArrayBuffer): Promise<string> {
+    const m = this.history.find(m => m.id === id)
+    if (!m) throw new Error('语音不存在')
+    const source = m.audioSource ?? id, start = (m.audioStart ?? 0) + index * AUDIO_CHUNK
+    const length = Math.min(AUDIO_CHUNK, m.samples - index * AUDIO_CHUNK)
+    let out = '', offset = start
+    while (out.length < length) {
+      const part = atob(await this.sourceChunk(source, Math.floor(offset / AUDIO_CHUNK), clip))
+      const slice = part.slice(offset % AUDIO_CHUNK, offset % AUDIO_CHUNK + length - out.length)
+      if (!slice.length) throw new Error('语音分片长度异常')
+      out += slice; offset += slice.length
+    }
+    return btoa(out)
+  }
+  // Split messages share immutable source bytes. Only the final reference may remove them.
+  private async retireAudio(m: ChatMessage): Promise<void> {
+    const source = m.audioSource ?? m.id
+    if (this.history.some(item => isVoiceMessage(item) && (item.audioSource ?? item.id) === source)) return
+    try { await this.collectAudio(source) } catch { /* The atomic garbage marker and alarm retain cleanup for retry. */ }
+  }
+  private async collectAudio(source: string): Promise<void> {
+    const key = `audio-gc:${source}`, gc = await this.state.storage.get<AudioGarbage>(key)
+    if (!gc) return
+    const end = Math.min(Math.ceil(gc.samples / AUDIO_CHUNK), gc.next + 100)
+    await this.state.storage.transaction(async tx => {
+      await tx.delete([`clip:${source}`, ...Array.from({ length: end - gc.next }, (_, i) => `audio:${source}:${gc.next + i}`)])
+      if (end * AUDIO_CHUNK >= gc.samples) await tx.delete(key)
+      else await tx.put(key, { ...gc, next: end })
+    })
+    if (end * AUDIO_CHUNK < gc.samples) await this.state.storage.setAlarm(Date.now() + 5000)
+  }
+  private async finishRecording(record: Recording, interrupted: boolean): Promise<ChatMessage | null> {
+    const result: RecordingResult = { state: 'finished', samples: record.samples, interrupted }
+    if (!record.samples) {
+      await this.state.storage.transaction(async tx => {
+        await tx.put(`record-result:${record.id}`, result)
+        await tx.delete(`record:${record.id}`)
+      })
+      return null
+    }
+    const items = await this.messages()
+    let old: ChatMessage | undefined
+    if (items.length >= CHAT_LIMIT) {
+      const index = items.findIndex(m => m.sender === 'board' || m.read)
+      if (index < 0) throw new Error('群内未读消息已满')
+      ;[old] = items.splice(index, 1)
+    }
+    const m: ChatMessage = { id: record.id, sender: 'board', name: '开发板', samples: record.samples,
+      created: Math.max(Date.now(), (this.history.at(-1)?.created ?? 0) + 1), read: true, ...(interrupted ? { interrupted: true } : {}) }
+    items.push(m)
+    // No full-clip allocation. Audio chunks and every append are durable before publication.
+    await this.saveMessages(items, { [`record-result:${record.id}`]: result, [`delivered:${record.id}`]: true }, [`record:${record.id}`])
+    if (old) { await this.retireAudio(old); this.broadcast(frame('pruned', { ids: [old.id], ...this.stats() }), true) }
+    this.broadcast(frame('message', { message: m, added: true, ...this.stats() }), true)
+    return m
   }
   constructor(private readonly state: DurableObjectState) {}
   private sockets(): WebSocket[] { return this.state.getWebSockets().filter((s) => s.readyState === 1) }
@@ -251,7 +318,7 @@ export class DeviceRoomV2 {
   }
   private async chat(socket: WebSocket, v: Frame, board: boolean, locked = false): Promise<void> {
     if (v.protocol !== CHAT_VERSION) return
-    if (['begin', 'chunk', 'chunks', 'commit', 'read', 'readAll', 'text.put', 'text.displayed', 'ledger.put', 'ledger.summary'].includes(String(v.op)) && !locked) {
+    if (['begin', 'chunk', 'chunks', 'commit', 'read', 'readAll', 'text.put', 'text.displayed', 'ledger.put', 'ledger.summary', 'record.begin', 'record.append', 'record.finish', 'record.cancel', 'split'].includes(String(v.op)) && !locked) {
       // Expected upload errors must leave the concurrency gate normally, otherwise the runtime resets the object.
       let failed = false, failure: unknown
       await this.state.blockConcurrencyWhile(async () => {
@@ -267,6 +334,91 @@ export class DeviceRoomV2 {
     }
     const sender = board ? 'board' : a.client!
     const id = v.id
+    if (!board && (v.op === 'begin' || v.op === 'commit') && validId(id) && await this.state.storage.get(`retired:${id}`)) throw new Error('这条消息已分割或清理，请使用新的消息 ID')
+    if ((v.op === 'begin' || v.op === 'text.put') && validId(id) &&
+      (await this.state.storage.get(`record:${id}`) || await this.state.storage.get(`record-result:${id}`))) throw new Error('消息 ID 已用于持续录音')
+    if (String(v.op).startsWith('record.')) {
+      if (!board || a.role !== 'board' || !validId(id)) throw new Error('录音仅允许开发板 Wi-Fi 直传')
+      const key = `record:${id}`, doneKey = `record-result:${id}`
+      const done = await this.state.storage.get<RecordingResult>(doneKey)
+      if (done) { reply('record.ack', { id, ...done, offset: done.samples }); return }
+      if (await this.state.storage.get(`retired:${id}`) || await this.state.storage.get(`delivered:${id}`) || this.history.some(m => m.id === id) || await this.state.storage.get(`upload:${id}`)) throw new Error('消息 ID 已占用')
+      let record = await this.state.storage.get<Recording>(key)
+      if (v.op === 'record.cancel') {
+        await this.state.storage.transaction(async tx => {
+          await tx.put(doneKey, { state: 'cancelled', samples: record?.samples ?? 0 } satisfies RecordingResult)
+          await tx.delete(key)
+          if (record?.samples) await tx.put(`audio-gc:${id}`, { samples: record.samples, next: 0 } satisfies AudioGarbage)
+        })
+        if (record) { try { await this.collectAudio(id) } catch { /* Cancellation is already durable; the alarm retries cleanup. */ } }
+        reply('record.ack', { id, state: 'cancelled', offset: record?.samples ?? 0 }); return
+      }
+      if (v.op === 'record.begin') {
+        if (!record) {
+          if ((await this.state.storage.list({ prefix: 'record:', limit: 1 })).size) throw new Error('请先完成上一条录音')
+          if (this.history.length >= CHAT_LIMIT && !this.history.some(m => m.sender === 'board' || m.read)) throw new Error('群内未读消息已满')
+          record = { id, samples: 0, created: Date.now(), updated: Date.now(), tail: false }
+          await this.state.storage.put(key, record)
+        }
+        await this.state.storage.setAlarm(Date.now() + 5000)
+        reply('record.ack', { id, state: 'recording', offset: record.samples }); return
+      }
+      if (!record) throw new Error('录音会话不存在或已超时')
+      if (v.op === 'record.append') {
+        const offset = Number(v.offset), data = v.data
+        if (!Number.isSafeInteger(v.offset) || offset < 0 || offset % AUDIO_CHUNK || typeof data !== 'string' ||
+          data.length > RECORD_BATCH_CHUNKS * AUDIO_CHUNK / 3 * 4 || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) throw new Error('录音分片无效')
+        const bytes = atob(data)
+        if (!bytes.length || bytes.length > RECORD_BATCH_CHUNKS * AUDIO_CHUNK || offset + bytes.length > VOICE_SAMPLES_MAX) throw new Error('录音分片长度无效')
+        if (offset < record.samples) {
+          if (offset + bytes.length > record.samples) throw new Error('录音重试范围冲突')
+          for (let i = 0; i < bytes.length; i += AUDIO_CHUNK) {
+            if (await this.sourceChunk(id, (offset + i) / AUDIO_CHUNK) !== btoa(bytes.slice(i, i + AUDIO_CHUNK))) throw new Error('录音重试内容冲突')
+          }
+        } else {
+          if (offset !== record.samples || record.tail) throw new Error('录音分片顺序异常')
+          const writes: Record<string, unknown> = {}
+          for (let i = 0; i < bytes.length; i += AUDIO_CHUNK) writes[`audio:${id}:${(offset + i) / AUDIO_CHUNK}`] = btoa(bytes.slice(i, i + AUDIO_CHUNK))
+          record = { ...record, samples: offset + bytes.length, updated: Date.now(), tail: bytes.length % AUDIO_CHUNK !== 0 }
+          writes[key] = record
+          await this.state.storage.transaction(tx => tx.put(writes))
+        }
+        await this.state.storage.setAlarm(Date.now() + 5000)
+        reply('record.ack', { id, state: 'recording', offset: record.samples }); return
+      }
+      if (v.op === 'record.finish') {
+        if (v.samples !== record.samples || typeof v.interrupted !== 'boolean') throw new Error('录音尾部尚未上传完整')
+        await this.finishRecording(record, v.interrupted)
+        reply('record.ack', { id, state: 'finished', offset: record.samples, interrupted: v.interrupted }); return
+      }
+      throw new Error('未知录音操作')
+    }
+    if (v.op === 'split') {
+      if (board || a.role !== 'browser' || !validId(id) || !validId(v.splitId) || !Number.isSafeInteger(v.seconds) || Number(v.seconds) < 1) throw new Error('分割参数无效')
+      const receipt = await this.state.storage.get<{ id: string; seconds: number }>(`split:${v.splitId}`)
+      if (receipt) {
+        if (receipt.id !== id || receipt.seconds !== v.seconds) throw new Error('分割请求冲突')
+        reply('split.ack', { id }); return
+      }
+      const original = this.history.find(m => m.id === id)
+      if (!original || !isVoiceMessage(original)) throw new Error('语音不存在，请刷新历史')
+      const size = Number(v.seconds) * 8000, count = Math.ceil(original.samples / size)
+      if (count < 2 || count > 100 || this.history.length - 1 + count > CHAT_LIMIT) throw new Error('每次可分割为 2–100 条，且不能超过历史容量')
+      const created = Math.max(Date.now(), (this.history.at(-1)?.created ?? 0) + 1)
+      const parts: ChatMessage[] = Array.from({ length: count }, (_, i) => ({ ...original, id: `${v.splitId}_${i}`,
+        samples: Math.min(size, original.samples - i * size), created: created + i,
+        audioSource: original.audioSource ?? id, audioStart: (original.audioStart ?? 0) + i * size, audioTotal: original.audioTotal ?? original.samples }))
+      if (parts.some(m => !validId(m.id) || this.history.some(old => old.id === m.id))) throw new Error('分割消息 ID 冲突')
+      for (const part of parts) if (await this.state.storage.get(`retired:${part.id}`) || await this.state.storage.get(`delivered:${part.id}`) || await this.state.storage.get(`upload:${part.id}`) ||
+        await this.state.storage.get(`record:${part.id}`) || await this.state.storage.get(`record-result:${part.id}`)) throw new Error('分割消息 ID 已占用')
+      const extra: Record<string, unknown> = { [`split:${v.splitId}`]: { id, seconds: v.seconds } }
+      for (const part of parts) if (part.sender === 'board') extra[`delivered:${part.id}`] = true
+      await this.saveMessages([...this.history.filter(m => m.id !== id), ...parts], extra)
+      this.broadcast(frame('pruned', { ids: [id], ...this.stats() }), true)
+      for (const part of parts) this.broadcast(frame('message', { message: part, added: true, ...this.stats() }), true)
+      this.toBoard(frame('index.changed', { revision: this.revision }))
+      reply('split.ack', { id }); return
+    }
     if (v.op === 'text.displayed') {
       if (board || a.role !== 'browser' || !validId(id)) throw new Error('文字显示回执格式错误')
       const message = this.history.find(m => m.id === id)
@@ -306,8 +458,8 @@ export class DeviceRoomV2 {
       const m: ChatMessage = { id, sender: 'board', name: '开发板', kind: 'text', text: v.text.trim(), samples: 0,
         created: Math.max(Date.now(), (this.history.at(-1)?.created ?? 0) + 1), read: true }
       items.push(m)
-      const remove = old ? [`clip:${old.id}`, ...Array.from({ length: Math.ceil(old.samples / AUDIO_CHUNK) }, (_, i) => `audio:${old!.id}:${i}`)] : []
-      await this.saveMessages(items, { [`delivered:${id}`]: 'text' }, remove)
+      await this.saveMessages(items, { [`delivered:${id}`]: 'text' })
+      if (old) await this.retireAudio(old)
       if (old) this.broadcast(frame('pruned', { ids: [old.id], ...this.stats() }), true)
       reply('text.ack', { id, displayed: false })
       this.broadcast(frame('message', { message: m, added: true, ...this.stats() }), true)
@@ -424,7 +576,7 @@ export class DeviceRoomV2 {
       const m = this.history.find(m => m.id === id)
       if (!m || !isVoiceMessage(m)) throw new Error('这条语音不可用')
       const end = Math.min(Math.ceil(m.samples / AUDIO_CHUNK), start + count)
-      const clip = await this.state.storage.get<ArrayBuffer>(`clip:${id}`)
+      const clip = await this.state.storage.get<ArrayBuffer>(`clip:${m.audioSource ?? id}`)
       if (v.op === 'pullBatch') {
         const chunks: Array<{ index: number; data: string }> = []
         for (let index = start; index < end; index++) {
@@ -530,8 +682,9 @@ export class DeviceRoomV2 {
       const m: ChatMessage = { id, sender, name: upload.name, samples: upload.samples, created: Math.max(Date.now(), (this.history.at(-1)?.created ?? 0) + 1), read: sender === 'board' }
       items.push(m)
       const remove = [`upload:${id}`, ...Array.from({ length: upload.next }, (_, i) => `audio:${id}:${i}`)]
-      if (old) remove.push(`clip:${old.id}`, ...Array.from({ length: Math.ceil(old.samples / AUDIO_CHUNK) }, (_, i) => `audio:${old!.id}:${i}`))
+
       await this.saveMessages(items, { [`clip:${id}`]: audio.buffer, ...(board ? { [`delivered:${id}`]: true } : {}) }, remove)
+      if (old) await this.retireAudio(old)
       if (old) this.broadcast(frame('pruned', { ids: [old.id], ...this.stats() }), true)
       reply('ack', { id, committed: true })
       this.broadcast(frame('message', { message: m, added: true, ...this.stats() }), true)
@@ -596,8 +749,10 @@ export class DeviceRoomV2 {
     }
   }
   private async deleteChunks(id: string, samples: number): Promise<void> {
-    const keys = Array.from({ length: Math.ceil(samples / AUDIO_CHUNK) }, (_, i) => `audio:${id}:${i}`)
-    for (let i = 0; i < keys.length; i += 100) await this.state.storage.delete(keys.slice(i, i + 100))
+    for (let i = 0; i < Math.ceil(samples / AUDIO_CHUNK); i += 100) {
+      const keys = Array.from({ length: Math.min(100, Math.ceil(samples / AUDIO_CHUNK) - i) }, (_, n) => `audio:${id}:${i + n}`)
+      await this.state.storage.delete(keys)
+    }
   }
   private async deleteAudio(id: string, samples: number): Promise<void> {
     await this.state.storage.delete(`clip:${id}`)
@@ -605,8 +760,9 @@ export class DeviceRoomV2 {
   }
   private async clearHistory(): Promise<number> {
     const messages = await this.messages()
-    await this.saveMessages([])
-    for (const prefix of ['audio:', 'clip:', 'upload:']) {
+    const recordings = await this.state.storage.list<Recording>({ prefix: 'record:' })
+    await this.saveMessages([], Object.fromEntries([...recordings.values()].map(r => [`record-result:${r.id}`, { state: 'cancelled', samples: r.samples }])), [...recordings.keys()])
+    for (const prefix of ['audio:', 'clip:', 'upload:', 'audio-gc:']) {
       for (;;) {
         const keys = [...(await this.state.storage.list({ prefix, limit: 100 })).keys()]
         if (!keys.length) break
@@ -618,14 +774,23 @@ export class DeviceRoomV2 {
   }
   async alarm(): Promise<void> {
     await this.loadHistory()
+    const recordings = await this.state.storage.list<Recording>({ prefix: 'record:' })
+    for (const record of recordings.values()) if (Date.now() - record.updated > RECORD_IDLE_MS) {
+      await this.state.blockConcurrencyWhile(async () => {
+        const current = await this.state.storage.get<Recording>(`record:${record.id}`)
+        if (current && Date.now() - current.updated > RECORD_IDLE_MS) await this.finishRecording(current, true)
+      })
+    }
     const pending = await this.state.storage.list<Upload>({ prefix: 'upload:' })
     for (const [key, upload] of pending) if (Date.now() - (upload.updated ?? upload.created) > 10 * 60 * 1000) {
       if (this.history.some(m => m.id === upload.id)) await this.deleteChunks(upload.id, upload.samples)
       else await this.deleteAudio(upload.id, upload.samples)
       await this.state.storage.delete(key)
     }
+    const garbage = await this.state.storage.list<AudioGarbage>({ prefix: 'audio-gc:', limit: 10 })
+    for (const key of garbage.keys()) await this.state.blockConcurrencyWhile(() => this.collectAudio(key.slice('audio-gc:'.length)))
     await this.presence()
-    if (this.sockets().length || pending.size) await this.state.storage.setAlarm(Date.now() + 5000)
+    if (this.sockets().length || pending.size || recordings.size || garbage.size) await this.state.storage.setAlarm(Date.now() + 5000)
   }
   async webSocketClose(socket?: WebSocket): Promise<void> {
     if (socket) {

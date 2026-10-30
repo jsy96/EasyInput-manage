@@ -1,6 +1,10 @@
 export const CHAT_VERSION = 2
 export const AUDIO_RATE = 8000
 export const AUDIO_LIMIT = AUDIO_RATE * 20
+// Storage/WAV format guard (about 74 hours), independent of the browser mic limit.
+export const VOICE_SAMPLES_MAX = 0x7ffff000
+export const RECORD_BATCH_CHUNKS = 8
+export const RECORD_IDLE_MS = 90_000
 export const AUDIO_CHUNK = 768
 export const AUDIO_BATCH = 16
 export const AUDIO_STREAM_WINDOW = 24
@@ -21,6 +25,10 @@ export interface ChatMessage {
   read: boolean
   kind?: 'voice' | 'text'
   text?: string
+  interrupted?: boolean
+  audioSource?: string
+  audioStart?: number
+  audioTotal?: number
 }
 export function isVoiceMessage(m: ChatMessage): boolean { return m.kind !== 'text' }
 export interface ChatCursor { created: number; id: string }
@@ -42,7 +50,10 @@ export function isChatMessage(value: unknown): value is ChatMessage {
   return isChatCursor(m) && typeof m.sender === 'string' && typeof m.name === 'string' &&
     typeof m.read === 'boolean' && (m.kind === 'text'
       ? m.samples === 0 && m.sender === 'board' && m.read && typeof m.text === 'string' && m.text.trim().length > 0 && m.text.length <= CHAT_TEXT_LIMIT
-      : (m.kind === undefined || m.kind === 'voice') && Number.isInteger(m.samples) && m.samples > 0 && m.samples <= AUDIO_LIMIT)
+      : (m.kind === undefined || m.kind === 'voice') && Number.isSafeInteger(m.samples) && m.samples > 0 && m.samples <= VOICE_SAMPLES_MAX &&
+        (m.interrupted === undefined || typeof m.interrupted === 'boolean') &&
+        (m.audioSource === undefined || (validId(m.audioSource) && Number.isSafeInteger(m.audioStart) && m.audioStart! >= 0 &&
+          Number.isSafeInteger(m.audioTotal) && m.audioTotal! <= VOICE_SAMPLES_MAX && m.audioStart! + m.samples <= m.audioTotal!)))
 }
 export interface ChatClient { id: string; name: string; online?: boolean }
 export interface RoomState {

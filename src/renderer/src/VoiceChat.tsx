@@ -5,7 +5,7 @@ import { sortMessages } from '@shared/chat'
 import type { BoardLights, BoardStatus } from '@shared/protocol'
 import type { ChatConnection } from './services/chat'
 import { LiveVoicePlayer } from './services/live-audio'
-import { VoiceRecorder, VoiceSequencePlayer, voiceWav } from './services/voice'
+import { VoiceRecorder, VoiceSequencePlayer, voiceWavChunks } from './services/voice'
 import { downloadFile, voiceZip, voiceZipBatches } from './services/downloads'
 const BOARD_LIGHTS = [
   { label: '灯 1', hint: '接收信息慢闪；有未读语音常亮；其余熄灭' },
@@ -26,7 +26,8 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
   const [sequencePlaying, setSequencePlaying] = useState(false), [sequenceProgress, setSequenceProgress] = useState(0)
   const sequencePlayer = useRef<VoiceSequencePlayer | null>(null)
   const sequenceRun = useRef(0)
-  const audioCache = useRef(new Map<string, Uint8Array>())
+  const [splitId, setSplitId] = useState(''), [splitSeconds, setSplitSeconds] = useState(60), [splitting, setSplitting] = useState(false)
+  const urlSizes = useRef(new Map<string, number>())
   const [realtimeBusy, setRealtimeBusy] = useState(false)
   const players = useRef<Record<string, HTMLAudioElement | null>>({})
   const [loading, setLoading] = useState(''), [urls, setUrls] = useState<Record<string, string>>({})
@@ -43,7 +44,7 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
       void connection.textDisplayed(message.id).catch(() => { /* A later message replay or reconnect can retry. */ })
     }
   }, [connection, room.connected, room.messages])
-  useEffect(() => { busyChanged(recording || sending || !!loading || playing || batchDownloading || sequencePlaying); return () => busyChanged(false) }, [recording, sending, loading, playing, batchDownloading, sequencePlaying, busyChanged])
+  useEffect(() => { busyChanged(recording || sending || !!loading || playing || batchDownloading || sequencePlaying || splitting); return () => busyChanged(false) }, [recording, sending, loading, playing, batchDownloading, sequencePlaying, splitting, busyChanged])
   useEffect(() => {
     alive.current = true
     return () => {
@@ -57,22 +58,24 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
   }, [])
   useEffect(() => {
     const ids = new Set(room.messages.map(m => m.id))
-    for (const id of audioCache.current.keys()) if (!ids.has(id)) audioCache.current.delete(id)
     for (const [id, url] of Object.entries(urlsRef.current)) if (!ids.has(id)) {
-      URL.revokeObjectURL(url); delete urlsRef.current[id]; delete players.current[id]
+      URL.revokeObjectURL(url); delete urlsRef.current[id]; delete players.current[id]; urlSizes.current.delete(id)
     }
     setUrls({ ...urlsRef.current })
   }, [room.messages])
-  async function audioBytes(message: ChatMessage): Promise<Uint8Array> {
-    const cached = audioCache.current.get(message.id)
-    if (cached) return cached
+  async function audioBlob(message: ChatMessage): Promise<Blob> {
     if (!connection) throw new Error('语音服务未连接')
-    const bytes = await connection.download(message)
-    if (alive.current) {
-      audioCache.current.set(message.id, bytes)
-      while (audioCache.current.size > 10) audioCache.current.delete(audioCache.current.keys().next().value!)
-    }
-    return bytes
+    return voiceWavChunks(connection.audioChunks(message), message.samples, () => alive.current)
+  }
+  async function splitVoice(message: ChatMessage): Promise<void> {
+    if (!connection || splitting) return
+    setSplitting(true); setError('')
+    try {
+      players.current[message.id]?.pause()
+      await connection.split(message, splitSeconds)
+      if (alive.current) { setSplitId(''); setZipBatches([]); setZipPart(0) }
+    } catch (e) { if (alive.current) setError(e instanceof Error ? e.message : '分割失败') }
+    finally { if (alive.current) setSplitting(false) }
   }
   function stopSequence(): void {
     sequenceRun.current++
@@ -91,7 +94,7 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
       return items
     })
     // The player resumes audio synchronously from this click, before history requests finish.
-    try { await player.play(snapshot, audioBytes, (_message, index) => { if (alive.current) setSequenceProgress(index + 1) }) }
+    try { await player.play(snapshot, (m) => connection.audioChunks(m), (_message, index) => { if (alive.current) setSequenceProgress(index + 1) }) }
     catch (e) { if (alive.current && run === sequenceRun.current) setError(e instanceof Error ? e.message : '连续播放失败') }
     finally { if (alive.current && run === sequenceRun.current) { setSequencePlaying(false); setSequenceProgress(0) } }
   }
@@ -107,10 +110,10 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
       const files: Array<{ name: string; blob: Blob }> = []
       for (const [index, m] of snapshot.entries()) {
         // Downloads retain audio for this ZIP only; sequential playback has a separate bounded cache.
-        const bytes = await connection.download(m)
+        const blob = await audioBlob(m)
         if (!alive.current) return
         const ordinal = batches.slice(0, selected).reduce((n, batch) => n + batch.length, 0) + index + 1
-        files.push({ name: `${String(ordinal).padStart(4, '0')}_${new Date(m.created).toISOString().replaceAll(':', '-')}_${m.sender === 'board' ? '开发板' : '网页'}_${m.id}.wav`, blob: voiceWav(bytes) })
+        files.push({ name: `${String(ordinal).padStart(4, '0')}_${new Date(m.created).toISOString().replaceAll(':', '-')}_${m.sender === 'board' ? '开发板' : '网页'}_${m.id}.wav`, blob })
         setBatchProgress(index + 1)
       }
       const zip = await voiceZip(files)
@@ -164,14 +167,15 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
     if (!connection || loading) return
     setLoading(m.id); setError('')
     try {
-      const bytes = await audioBytes(m)
+      const blob = await audioBlob(m)
       if (!alive.current) return
-      while (Object.keys(urlsRef.current).length >= 5) {
+      while (Object.keys(urlsRef.current).length && (Object.keys(urlsRef.current).length >= 5 || [...urlSizes.current.values()].reduce((a, b) => a + b, 0) + blob.size > 32 * 1024 * 1024)) {
         const oldest = Object.keys(urlsRef.current)[0]
         players.current[oldest]?.pause(); delete players.current[oldest]
-        URL.revokeObjectURL(urlsRef.current[oldest]); delete urlsRef.current[oldest]
+        URL.revokeObjectURL(urlsRef.current[oldest]); delete urlsRef.current[oldest]; urlSizes.current.delete(oldest)
       }
-      const url = URL.createObjectURL(voiceWav(bytes)); urlsRef.current[m.id] = url; setUrls({ ...urlsRef.current })
+      urlSizes.current.set(m.id, blob.size)
+      const url = URL.createObjectURL(blob); urlsRef.current[m.id] = url; setUrls({ ...urlsRef.current })
     } catch (e) { setError(e instanceof Error ? e.message : '语音加载失败') }
     finally { if (alive.current) setLoading('') }
   }
@@ -191,7 +195,7 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
     catch (e) { if (!room.realtimeEnabled) livePlayer.current?.stop(); setError(e instanceof Error ? e.message : '实时麦克风设置失败') }
     finally { if (alive.current) setRealtimeBusy(false) }
   }
-  const busy = recording || sending || disabled || batchDownloading || sequencePlaying
+  const busy = recording || sending || disabled || batchDownloading || sequencePlaying || splitting
   return <article className="panel voice-page">
     <div className="voice-main">
       <div className="panel-heading voice-heading">
@@ -202,7 +206,7 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
         <button className="button button-subtle" disabled={!room.connected || busy || !!loading || !room.total} onClick={() => void downloadAll()}><Download size={15} />{batchDownloading ? `正在打包 ${batchProgress} / ${operationTotal} 条` : '下载全部语音 ZIP'}</button>
         <button className="button button-subtle" disabled={!sequencePlaying && (!room.connected || busy || !!loading || !room.total || room.realtimeEnabled)} onClick={() => sequencePlaying ? stopSequence() : void playAll()}>{sequencePlaying ? <Square size={15} /> : <Play size={15} />}{sequencePlaying ? `停止播放 · ${sequenceProgress} / ${operationTotal}` : '顺序播放全部'}</button>
       </div>
-      {zipBatches.length > 1 && <div className="voice-batch-actions" role="status"><span>每包最多 100 条，共 {zipBatches.length} 包；已完成 {zipPart} 包。</span>{zipPart < zipBatches.length && <button className="button button-subtle" disabled={busy || !!loading || !room.connected} onClick={() => void downloadAll(zipPart)}><Download size={15} />下载第 {zipPart + 1} 包</button>}</div>}
+      {zipBatches.length > 1 && <div className="voice-batch-actions" role="status"><span>每包最多 100 条或约 64 MiB（单条较大时独立一包），共 {zipBatches.length} 包；已完成 {zipPart} 包。</span>{zipPart < zipBatches.length && <button className="button button-subtle" disabled={busy || !!loading || !room.connected} onClick={() => void downloadAll(zipPart)}><Download size={15} />下载第 {zipPart + 1} 包</button>}</div>}
       {board?.voice && <p className="chat-board-state" role="status">{alarmMinute === null || alarmMinute === undefined ? '未设置闹钟' : `闹钟 ${String(Math.floor(alarmMinute / 60)).padStart(2, '0')}:${String(alarmMinute % 60).padStart(2, '0')}`} · {countdownSeconds ? `倒计时 ${Math.ceil(countdownSeconds / 60)} 分钟` : '无倒计时'}{board.voice.pending > 0 ? ` · ${board.voice.sending ? '发送中' : '待发送'} ${board.voice.pending} 条` : ''}{board.voice.storage_error ? ' · 录音存储异常' : ''}</p>}
       <div className="chat-messages" aria-live="polite">
         {room.next && <button className="button button-subtle full-button" disabled={historyLoading || busy || !room.connected} onClick={() => void loadOlder()}>{historyLoading ? '正在加载历史…' : `加载更早消息 · 已加载 ${messages.length} / ${room.total}`}</button>}
@@ -210,6 +214,16 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
         {messages.map(m => <div key={m.id} className={`chat-message ${m.sender === room.self?.id ? 'chat-mine' : ''}`}>
           <div className="chat-message-meta"><strong>{m.sender === 'board' ? '开发板' : m.name}</strong><span>{m.kind === 'text' ? '语音转文字' : m.sender === 'board' ? '录音' : '网页'}</span><time>{new Date(m.created).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</time></div>
           {m.kind === 'text' ? <p style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{m.text}</p> : urls[m.id] ? <audio controls autoPlay preload="metadata" ref={element => { players.current[m.id] = element }} onPlay={() => { stopSequence(); Object.entries(players.current).forEach(([id, player]) => { if (id !== m.id) player?.pause() }); setPlaying(true) }} onPause={() => setPlaying(false)} onEnded={() => setPlaying(false)} src={urls[m.id]} aria-label={`${m.name}的语音留言`} /> : <button className="button button-subtle chat-play" disabled={!room.connected || !!loading || busy} onClick={() => void load(m)}><Volume2 size={16} />{loading === m.id ? '加载语音…' : '播放语音'}<span>{Math.ceil(m.samples / 8000)}″</span></button>}
+          {m.kind !== 'text' && <div className="voice-split">
+            {m.interrupted && <small className="voice-interrupted">录音传输中断 · 仅保留云端已收到的部分</small>}
+            <button className="text-button" disabled={busy || !!loading || !room.connected || m.samples <= 8000} onClick={() => { setSplitId(splitId === m.id ? '' : m.id); setSplitSeconds(Math.max(1, Math.min(60, Math.floor(m.samples / 16000)))) }}>分割语音</button>
+            {splitId === m.id && <form onSubmit={event => { event.preventDefault(); void splitVoice(m) }}>
+              <label>每条 <input type="number" min="1" max={Math.ceil(m.samples / 8000) - 1} step="1" value={splitSeconds} disabled={busy} onChange={event => setSplitSeconds(Number(event.target.value))} /> 秒</label>
+              <span>将原留言替换为 {Math.ceil(m.samples / (Math.max(1, splitSeconds) * 8000))} 条；每次最多 100 条</span>
+              <button className="button button-subtle" disabled={busy || !Number.isSafeInteger(splitSeconds) || splitSeconds < 1 || splitSeconds * 8000 >= m.samples || Math.ceil(m.samples / (splitSeconds * 8000)) > 100} type="submit">确认分割</button>
+              <button className="text-button" disabled={busy} type="button" onClick={() => setSplitId('')}>取消</button>
+            </form>}
+          </div>}
           {m.kind !== 'text' && m.sender !== 'board' && <small className={m.read ? 'is-live' : 'is-muted'}>{m.read ? '开发板已读' : '开发板未读'}</small>}
         </div>)}
       </div>
@@ -243,9 +257,9 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
           <div><dt>S2</dt><dd>短按播放最早未读，并重设 S1 回听起点。全部已读确认中，长按 3 秒执行，短按取消。</dd></div>
           <div><dt>S3</dt><dd><Bell size={13} />短按设置每日闹钟，旋钮每格调 30 分钟（00:00～23:30）；数字播完静置 3 秒保存。长按 1.2 秒取消闹钟。</dd></div>
           <div><dt>S4</dt><dd><Timer size={13} />短按设置倒计时，默认 30 分钟；旋钮每格调 1 分钟（1～60 分钟），数字播完静置 3 秒开始。运行中按 S1～S7 或旋钮可取消；S8 独立计时。</dd></div>
-          <div><dt>S5</dt><dd>短按，等开始提示结束后录音；再短按结束并发送。满 20 秒暂存，需再按发送；长按 3 秒取消本次未发送录音。开始提示未播完就再按，会取消开始。</dd></div>
-          <div><dt>S6</dt><dd>短按开始小智对话，再按立即结束。回答时暂停收音，播完自动继续听；请等回答结束再说。对话不写入聊天记录。</dd></div>
-          <div><dt>S7</dt><dd>短按开始持续语音转文字，再按停止收音。最多等 20 秒尾句，再等 12 秒网页显示回执；本轮有文字且全部显示才播报“成功”。需打开本“语音”页，等待期间再按不会另开一轮。</dd></div>
+          <div><dt>S5</dt><dd>短按开始，提示结束并连接云端后持续录音上传；按任意键停止并保存，尾音保存完成后显示留言。默认一条录音一条留言，网页可分割；长按也按停止保存处理。</dd></div>
+          <div><dt>S6</dt><dd>短按开始小智对话，按任意键立即结束收音和播放。回答时暂停收音，播完自动继续听；请等回答结束再说。对话不写入聊天记录。</dd></div>
+          <div><dt>S7</dt><dd>短按开始持续语音转文字，按任意键停止收音。最多等 20 秒尾句，再等 12 秒网页显示回执；本轮有文字且全部显示才播报“成功”。需打开本“语音”页，等待期间再按不会另开一轮。</dd></div>
           <div><dt>S8</dt><dd>短按开始正计时，再按停止并播报总时长，下次从零开始。与倒计时独立；收音或播放忙时先记下停止时刻，等空闲再播报。断网可用，重启归零。</dd></div>
           <div><dt>旋钮</dt><dd>设置闹钟／倒计时时调整数值；其余状态每格调音量 10%，范围 10%～100%。空闲时长按 3 秒开启手机配网热点。</dd></div>
         </dl>
@@ -258,12 +272,13 @@ export function VoiceChat({ room, board, lights, connection, busyChanged, disabl
         </details>
         <details className="board-help">
           <summary>操作限制与失败处理</summary>
-          <p>S5 录音、S6 对话、S7 转写和网页实时监听互斥。S6／S7 期间仅当前功能键、S8 和旋钮旋转有效。实时监听需在网页关闭，板端 S1～S5 暂停操作。</p>
+          <p>S5 录音、S6 对话、S7 转写和网页实时监听互斥。S5／S6／S7 期间按 S1～S8 或旋钮按键停止，本次按键不执行原功能；旋转仍调音量。实时监听需在网页关闭，板端 S1～S5 暂停操作。</p>
+          <p>S5／S6／S7 连续 60 秒未检测到说话或单次达到 60 分钟时自动结束。S6 思考和回答播放不计入静音时间，重新收音后重新计时；总时长仍继续。S5 保存尾音，S7 继续等待尾句。</p>
           <p>S6／S7 需开发板直接连接 2.4 GHz Wi-Fi，并在小智官方平台绑定；蓝牙网关可转发历史语音和状态，不能代替小智连接或实时监听。</p>
           <p>正计时、停止结果和待播报提示不跨重启保存。音频忙时最多排队 8 次正计时结果，满后需等播报腾出位置再开始。闹钟音乐约 10 秒、播放一次，收音期间延后。</p>
           <p>S7 失败后文字仍可能补传，后来送达不补播成功。待发文字队列未满时可开始下一轮；本轮音频不保存，只有已持久化的队首文字有断电保留保证。</p>
-          <p>普通录音最多离线缓存 8 条，每条 20 秒，满后拒绝新录音；已开始发送的录音不受 S5 长按取消影响。保存失败时保持供电。网页播放不会改变开发板未读状态。</p>
-          <p>闹钟使用北京时间 UTC+8，每次开机需有效网络校时；设置可跨重启保存。倒计时和正计时断网继续，重启后清零。S5／S6／S7 在松手时执行，没有双击功能。</p>
+          <p>S5 需 Wi-Fi 直连云端，网页可关闭；停止并保存后再查看。短时断网会缓冲重试，持续失败则停止，云端将已收到的部分标为中断。历史固件留下的离线录音仍会补传。网页播放不会改变开发板未读状态。</p>
+          <p>闹钟使用北京时间 UTC+8，每次开机需有效网络校时；设置可跨重启保存。倒计时和正计时断网继续，重启后清零。S5／S6／S7 在松手时开始，按下任意键即停止，没有双击功能。</p>
         </details>
       </section>
     </aside>

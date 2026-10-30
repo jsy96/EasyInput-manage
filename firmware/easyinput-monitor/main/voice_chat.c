@@ -20,6 +20,7 @@
 #include "network_setup.h"
 #include "timers.h"
 #include "voice_outbox.h"
+#include "voice_recording.h"
 #include "voice_prompts.h"
 #include "xiaozhi_stt.h"
 
@@ -33,6 +34,8 @@
 #define INDEX_PAGE_SIZE 8
 #define LONG_US 1200000
 #define SETUP_LONG_US 3000000
+#define VOICE_SILENCE_US 60000000LL
+#define VOICE_SESSION_US 3600000000LL
 #define SETTINGS_COMMIT_US 3000000
 #define RETRY_US 3000000
 #define ACK_TIMEOUT_US 12000000
@@ -170,8 +173,8 @@ static unsigned stopwatch_result_head, stopwatch_result_count;
 static bool stopwatch_start_pending, stopwatch_busy_pending;
 static bool volume_announce_pending;
 static int prompt_ids[PROMPT_SEQUENCE_CAPACITY];
-static bool stt_s6_pressed;
-static bool stt_s7_pressed;
+static bool voice_stop_keys[9];
+static bool stt_stop_handled;
 static bool stt_text_session;
 static bool stt_text_result_pending;
 static bool stt_text_failed;
@@ -219,6 +222,23 @@ static int64_t realtime_start_sent_at;
 static int diag_last_key = -1;
 static unsigned diag_last_key_mode;
 
+typedef enum { REC_IDLE, REC_BEGIN, REC_CAPTURE, REC_DRAIN, REC_FINISH, REC_CANCEL } recording_stage_t;
+static recording_stage_t recording_stage;
+static voice_recording_t recording;
+static uint8_t *recording_storage;
+static char recording_id[65], recording_req[32];
+static char *recording_line;
+static int64_t recording_sent_at, recording_progress_at;
+static int64_t recording_started_at, recording_voice_at;
+static bool recording_interrupted;
+static portMUX_TYPE recording_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t recording_packet[VOICE_RECORDING_BATCH];
+static bool playback_window_done, playback_finish_sent;
+static size_t playback_buffered, playback_read;
+
+static bool recording_busy(void) { return recording_stage != REC_IDLE; }
+static bool recording_capturing(void) { return recording_stage == REC_CAPTURE; }
+
 static bool uploading(void)
 {
     return job == JOB_UP_BEGIN || job == JOB_UP_CHUNK || job == JOB_UP_COMMIT;
@@ -241,7 +261,7 @@ static cJSON *new_frame(const char *op)
 
 static void sync_health(int64_t now)
 {
-    if (xiaozhi_stt_busy() || now < health_retry_at || !network_fresh(now)) return;
+    if (recording_busy() || xiaozhi_stt_busy() || now < health_retry_at || !network_fresh(now)) return;
     health_pending_t record;
     if (!health_pending_oldest(&record)) return;
     static const char *const kinds[] = {"mother_high", "mother_low", "father_high", "father_low", "father_glucose", "mother_glucose"};
@@ -265,7 +285,7 @@ static void sync_health(int64_t now)
 
 static void sync_ledger(int64_t now)
 {
-    if (xiaozhi_stt_busy() || now < ledger_retry_at || !network_fresh(now)) return;
+    if (recording_busy() || xiaozhi_stt_busy() || now < ledger_retry_at || !network_fresh(now)) return;
     ledger_pending_t record;
     if (!ledger_pending_oldest(&record)) return;
     cJSON *frame = new_frame("ledger.put");
@@ -294,7 +314,7 @@ static void send_frame(cJSON *frame)
 
 static void sync_summary(int64_t now)
 {
-    if (xiaozhi_stt_busy() || now < summary_retry_at || !network_fresh(now) || ledger_pending_count()) return;
+    if (recording_busy() || xiaozhi_stt_busy() || now < summary_retry_at || !network_fresh(now) || ledger_pending_count()) return;
     cJSON *frame = new_frame("ledger.summary");
     snprintf(summary_request_id, sizeof(summary_request_id), "summary-%lu", (unsigned long)++sequence);
     summary_generation = ledger_generation;
@@ -307,7 +327,7 @@ static void sync_text(int64_t now)
 {
     // S7 drains its text FIFO while listening. S6 keeps all background delivery
     // deferred; the STT queue avoids Flash writes while capture is active.
-    if (((mode == MODE_STT || xiaozhi_stt_busy()) && !stt_text_session) ||
+    if (recording_busy() || ((mode == MODE_STT || xiaozhi_stt_busy()) && !stt_text_session) ||
         now < text_retry_at || !network_fresh(now) || !xiaozhi_stt_pending(NULL)) return;
     stt_text_t *text = malloc(sizeof(*text));
     if (!text) return;
@@ -384,7 +404,7 @@ static void add_item(cJSON *value)
     const cJSON *samples = cJSON_GetObjectItemCaseSensitive(value, "samples");
     if (!cJSON_IsString(id) || strlen(id->valuestring) > 64 || !cJSON_IsNumber(created) ||
         created->valuedouble < 1 || !cJSON_IsNumber(samples) || samples->valuedouble < 1 ||
-        samples->valuedouble > MAX_AUDIO) return;
+        samples->valuedouble > VOICE_RECORDING_MAX) return;
     message_t *message = find_message(id->valuestring);
     if (message == NULL) {
         receiving_until_us = esp_timer_get_time() + SLOW_BLINK_PERIOD_US;
@@ -443,9 +463,9 @@ static void release_audio(void)
 
 static void finish_job(void)
 {
-    request_line[0] = '\0';
+    request_line[0] = request_id[0] = '\0';
     job = JOB_IDLE;
-    sync_at = esp_timer_get_time() + 30000000;
+    sync_at = synced_revision < 0 ? 0 : esp_timer_get_time() + 30000000;
 }
 
 static void stop_prompt(void)
@@ -513,7 +533,14 @@ static void handle_stt_event(const stt_event_t *event)
     if (event->kind == STT_DONE) { text_retry_at = 0; return; }
     // Auto-turn dialogue pauses capture on every reply. Only a terminal event
     // ends the interaction; a pause is not an end cue.
-    if (event->kind == STT_WAIT || event->kind == STT_CAPTURE_STOPPED) return;
+    if (event->kind == STT_WAIT) return;
+    if (event->kind == STT_CAPTURE_STOPPED) {
+        if (stt_text_session && !stt_stop_handled && !stt_terminal_received) {
+            stt_stop_handled = true;
+            start_prompt(PROMPT_STT_WAIT, PROMPT_ACTION_STT_ENDED);
+        }
+        return;
+    }
     if (stt_terminal_received) return;
     stt_terminal_received = true;
     if (stt_text_session) {
@@ -567,7 +594,7 @@ static bool handle_text_receipt(const char *op, const char *req, const char *id,
     const bool acknowledgement = !strcmp(op, "text.ack");
     const bool rendered = !strcmp(op, "text.displayed");
     if (!acknowledgement && !rendered) return false;
-    if (((mode == MODE_STT || xiaozhi_stt_busy()) && !stt_text_session) ||
+    if (recording_busy() || ((mode == MODE_STT || xiaozhi_stt_busy()) && !stt_text_session) ||
         !id || !text_inflight_id[0] || strcmp(id, text_inflight_id)) return true;
     if (acknowledgement && (!displayed || !req || !text_request_id[0] || strcmp(req, text_request_id))) return true;
     // A displayed receipt is sent only after the room saved and a browser
@@ -696,8 +723,8 @@ static void refresh_lights(int64_t now)
     const bool unread = earliest_unread() != NULL;
     const bool receiving = now < receiving_until_us || job == JOB_DOWNLOAD ||
         (job == JOB_PLAYING && !stream_complete);
-    const bool recording = mode == MODE_RECORDING || mode == MODE_STT || xiaozhi_stt_busy();
-    const bool sending = uploading() || job == JOB_CACHE || voice_outbox_count() > 0 || xiaozhi_stt_pending(NULL);
+    const bool recording = recording_capturing() || mode == MODE_STT || xiaozhi_stt_busy();
+    const bool sending = recording_busy() || uploading() || job == JOB_CACHE || voice_outbox_count() > 0 || xiaozhi_stt_pending(NULL);
     const bool alarm_set = timers_alarm_minute() >= 0;
     const bool alarm_fired = alarm_set && alarm_fired_at_us != 0 &&
         now - alarm_fired_at_us < ALARM_FLASH_US;
@@ -761,20 +788,36 @@ static void request_stream(void)
     request(value);
 }
 
-static size_t received_audio_bytes(void)
-{
-    const size_t buffered = chunk_index * CHUNK;
-    return buffered < audio_size ? buffered : audio_size;
-}
-
 static bool advance_stream_playback(void)
 {
-    const size_t available = received_audio_bytes();
-    if (stream_started) return audio_voice_stream_extend(available) == ESP_OK;
-    if (available < PREBUFFER && available < audio_size) return true;
-    if (audio_play_voice_stream(audio_data, audio_size, available) != ESP_OK) return false;
-    stream_started = true;
-    job = JOB_PLAYING;
+    if (!stream_started) {
+        if (playback_buffered < PREBUFFER && !stream_complete) return true;
+        if (audio_pcm_start() != ESP_OK) return false;
+        stream_started = true;
+        job = JOB_PLAYING;
+    }
+    // One bounded speaker block per tick keeps keys and network ACKs responsive.
+    if (playback_read < playback_buffered) {
+        const size_t n = playback_buffered - playback_read < CHUNK ? playback_buffered - playback_read : CHUNK;
+        int16_t pcm[CHUNK * 2];
+        voice_recording_decode(audio_data + playback_read, n, pcm);
+        const esp_err_t result = audio_pcm_write(pcm, n * 2);
+        if (result == ESP_ERR_NO_MEM) return true;
+        if (result != ESP_OK) return false;
+        playback_read += n;
+    }
+    if (playback_read == playback_buffered && playback_window_done) {
+        if (stream_complete) {
+            if (!playback_finish_sent) {
+                if (audio_pcm_finish() != ESP_OK) return false;
+                playback_finish_sent = true;
+            }
+        } else {
+            playback_read = playback_buffered = 0;
+            playback_window_done = false;
+            request_stream();
+        }
+    }
     return true;
 }
 
@@ -818,13 +861,15 @@ static void play_message(message_t *message)
         start_prompt(PROMPT_OFFLINE, PROMPT_ACTION_NONE);
         return;
     }
-    audio_data = heap_caps_malloc(message->samples, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    audio_data = heap_caps_malloc(STREAM_WINDOW * CHUNK, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (audio_data == NULL) return;
     audio_size = message->samples;
     set_cursor(message);
     strlcpy(active_id, message->id, sizeof(active_id));
     chunk_index = 0;
     stream_started = stream_complete = false;
+    playback_read = playback_buffered = 0;
+    playback_window_done = playback_finish_sent = false;
     mode = MODE_PLAYING;
     job = JOB_DOWNLOAD;
     request_stream();
@@ -860,26 +905,196 @@ static void begin_timer_setting(void)
     announce_timer_draft();
 }
 
+static void recording_sink(const uint8_t *data, size_t length)
+{
+    portENTER_CRITICAL(&recording_lock);
+    if (recording_storage) (void)voice_recording_pcm(&recording, data, length);
+    portEXIT_CRITICAL(&recording_lock);
+}
+
+static void recording_reset(void)
+{
+    // Detach callback access under the same lock before freeing the bounded ring.
+    portENTER_CRITICAL(&recording_lock);
+    uint8_t *storage = recording_storage;
+    recording_storage = NULL;
+    portEXIT_CRITICAL(&recording_lock);
+    free(storage);
+    free(recording_line); recording_line = NULL;
+    recording_req[0] = 0;
+    recording_stage = REC_IDLE;
+    mode = MODE_IDLE;
+}
+
+static bool recording_request(cJSON *value)
+{
+    if (!value) return false;
+    snprintf(recording_req, sizeof(recording_req), "rec-%lu", (unsigned long)++sequence);
+    cJSON_AddStringToObject(value, "req", recording_req);
+    cJSON_AddStringToObject(value, "id", recording_id);
+    free(recording_line);
+    recording_line = cJSON_PrintUnformatted(value);
+    cJSON_Delete(value);
+    recording_sent_at = 0;
+    return recording_line != NULL;
+}
+
+static void stop_recording_stream(void)
+{
+    if (recording_stage == REC_BEGIN) {
+        recording_stage = REC_CANCEL;
+        (void)recording_request(new_frame("record.cancel"));
+        mode = MODE_RECORD_READY;
+        return;
+    }
+    if (recording_stage != REC_CAPTURE) return;
+    const esp_err_t result = audio_live_stop();
+    portENTER_CRITICAL(&recording_lock);
+    voice_recording_stop(&recording);
+    recording_interrupted = recording_interrupted || recording.failed || result != ESP_OK;
+    portEXIT_CRITICAL(&recording_lock);
+    recording_stage = REC_DRAIN;
+    mode = MODE_RECORD_READY;
+}
+
 static void start_recording(void)
 {
-    if (!outbox_ready || voice_outbox_count() >= VOICE_OUTBOX_CAPACITY) {
-        start_prompt(outbox_ready ? PROMPT_FULL : PROMPT_SAVE_FAILED, PROMPT_ACTION_NONE);
+    if (recording_busy() || uploading() || realtime_active || !cloud_online || !cloud_online() ||
+        !network_fresh(esp_timer_get_time()) || network_via != 1) {
+        start_prompt(PROMPT_OFFLINE, PROMPT_ACTION_NONE);
         return;
     }
-    audio_data = heap_caps_malloc(MAX_AUDIO, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (audio_data == NULL) return;
-    if (audio_record_start(audio_data, MAX_AUDIO) != ESP_OK) {
-        release_audio();
-        return;
-    }
-    snprintf(active_id, sizeof(active_id), "board-%08lx-%08lx",
-             (unsigned long)esp_random(), (unsigned long)esp_random());
+    if (job != JOB_IDLE) finish_job();
+    // 32 seconds of network jitter, constant memory regardless of recording length.
+    uint8_t *storage = heap_caps_malloc(256 * 1024, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!storage) { start_prompt(PROMPT_SAVE_FAILED, PROMPT_ACTION_NONE); return; }
+    portENTER_CRITICAL(&recording_lock);
+    recording_storage = storage;
+    voice_recording_init(&recording, storage, 256 * 1024);
+    portEXIT_CRITICAL(&recording_lock);
+    snprintf(recording_id, sizeof(recording_id), "board-%08lx-%08lx", (unsigned long)esp_random(), (unsigned long)esp_random());
+    recording_stage = REC_BEGIN;
+    recording_interrupted = false;
+    recording_progress_at = esp_timer_get_time();
     mode = MODE_RECORDING;
-    send_when_saved = false;
+    // Wait for a durable begin ACK before opening the microphone.
+    if (!recording_request(new_frame("record.begin"))) {
+        recording_reset();
+        start_prompt(PROMPT_SAVE_FAILED, PROMPT_ACTION_NONE);
+    }
+}
+
+static void recording_step(int64_t now)
+{
+    if (!recording_busy()) return;
+    audio_snapshot_t audio;
+    audio_get_snapshot(&audio);
+    portENTER_CRITICAL(&recording_lock);
+    const bool failed = recording.failed;
+    portEXIT_CRITICAL(&recording_lock);
+    if (recording_stage == REC_CAPTURE && (failed || !audio.live_sink_active || audio.microphone_error != ESP_OK)) {
+        recording_interrupted = true;
+        stop_recording_stream();
+    }
+    if (recording_stage == REC_CAPTURE) {
+        if (audio.vad) recording_voice_at = now;
+        if (now - recording_started_at >= VOICE_SESSION_US || now - recording_voice_at >= VOICE_SILENCE_US)
+            stop_recording_stream();
+    }
+    if (now - recording_progress_at >= 30000000) {
+        if (recording_stage == REC_CAPTURE) stop_recording_stream();
+        // Cloud's independent alarm preserves the received prefix as interrupted.
+        recording_reset();
+        start_prompt(PROMPT_OFFLINE, PROMPT_ACTION_NONE);
+        return;
+    }
+    if (!recording_line && (recording_stage == REC_CAPTURE || recording_stage == REC_DRAIN)) {
+        portENTER_CRITICAL(&recording_lock);
+        const size_t n = voice_recording_packet(&recording, recording_packet, sizeof(recording_packet));
+        const uint32_t offset = recording.acknowledged;
+        const bool drained = recording.stopped && recording.size == 0;
+        portEXIT_CRITICAL(&recording_lock);
+        cJSON *value = NULL;
+        if (n) {
+            char *encoded = malloc(VOICE_RECORDING_BATCH / 3 * 4 + 1);
+            size_t length = 0;
+            if (encoded && mbedtls_base64_encode((unsigned char *)encoded, VOICE_RECORDING_BATCH / 3 * 4 + 1,
+                                               &length, recording_packet, n) == 0) {
+                encoded[length] = 0;
+                value = new_frame("record.append");
+                cJSON_AddNumberToObject(value, "offset", offset);
+                cJSON_AddStringToObject(value, "data", encoded);
+            }
+            free(encoded);
+        } else if (drained) {
+            recording_stage = REC_FINISH;
+            value = new_frame("record.finish");
+            cJSON_AddNumberToObject(value, "samples", offset);
+            cJSON_AddBoolToObject(value, "interrupted", recording_interrupted);
+        }
+        if (value) (void)recording_request(value);
+    }
+    if (recording_line && cloud_online && cloud_online() && (!recording_sent_at || now - recording_sent_at >= 1000000)) {
+        // Retain exactly these bytes until matching application ACK, even if transport reports success.
+        if (send_immediate_line) (void)send_immediate_line(recording_line);
+        recording_sent_at = now;
+    }
+}
+
+static bool recording_receive(cJSON *value, const char *op, const char *req)
+{
+    if (!recording_busy() || !req || !recording_req[0] || strcmp(req, recording_req)) return false;
+    const cJSON *id = cJSON_GetObjectItemCaseSensitive(value, "id");
+    if (!strcmp(op, "error")) {
+        if (recording_stage == REC_CAPTURE) stop_recording_stream();
+        recording_reset();
+        start_prompt(PROMPT_SAVE_FAILED, PROMPT_ACTION_NONE);
+        return true;
+    }
+    uint32_t offset;
+    const cJSON *state = cJSON_GetObjectItemCaseSensitive(value, "state");
+    if (strcmp(op, "record.ack") || !cJSON_IsString(id) || strcmp(id->valuestring, recording_id) ||
+        !cJSON_IsString(state) || !json_uint(cJSON_GetObjectItemCaseSensitive(value, "offset"), &offset)) return true;
+    if (recording_stage == REC_CANCEL || recording_stage == REC_FINISH) {
+        const bool cancelled = recording_stage == REC_CANCEL && !strcmp(state->valuestring, "cancelled");
+        const bool success = recording_stage == REC_FINISH && !strcmp(state->valuestring, "finished") &&
+            offset > 0 && offset == recording.acknowledged && !recording_interrupted &&
+            !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(value, "interrupted"));
+        recording_reset();
+        sync_at = 0;
+        start_prompt(cancelled ? PROMPT_RECORD_CANCELLED : success ? PROMPT_SEND_OK : PROMPT_SAVE_FAILED, PROMPT_ACTION_NONE);
+        return true;
+    }
+    if (strcmp(state->valuestring, "recording")) {
+        if (recording_stage == REC_CAPTURE) stop_recording_stream();
+        recording_reset();
+        start_prompt(PROMPT_SAVE_FAILED, PROMPT_ACTION_NONE);
+        return true;
+    }
+    if (recording_stage == REC_BEGIN) {
+        if (offset != 0) return true;
+        if (audio_live_start(recording_sink) != ESP_OK) {
+            recording_stage = REC_CANCEL;
+            (void)recording_request(new_frame("record.cancel"));
+            mode = MODE_RECORD_READY;
+            return true;
+        }
+        recording_stage = REC_CAPTURE;
+        recording_started_at = recording_voice_at = esp_timer_get_time();
+    } else {
+        portENTER_CRITICAL(&recording_lock);
+        const bool accepted = voice_recording_ack(&recording, offset);
+        portEXIT_CRITICAL(&recording_lock);
+        if (!accepted) return true;
+    }
+    free(recording_line); recording_line = NULL; recording_req[0] = 0;
+    recording_progress_at = esp_timer_get_time();
+    return true;
 }
 
 static void begin_recording_with_prompt(void)
 {
+    if (recording_busy() || uploading()) return;
     start_prompt(PROMPT_RECORDING, PROMPT_ACTION_START_RECORDING);
 }
 
@@ -1024,29 +1239,6 @@ static void upload_chunk(void)
     request(value);
 }
 
-static void cancel_recording(void)
-{
-    if (mode != MODE_RECORDING && job != JOB_CACHE && !hold_id[0] &&
-        prompt_action != PROMPT_ACTION_START_RECORDING) return;
-    stop_prompt();
-    if (hold_id[0]) {
-        if (voice_outbox_discard(hold_id) != ESP_OK) {
-            start_prompt(PROMPT_RECORD_CANCEL_FAILED, PROMPT_ACTION_NONE);
-            return;
-        }
-        hold_id[0] = '\0';
-    }
-    if (mode == MODE_RECORDING && audio_record_stop() != ESP_OK) {
-        start_prompt(PROMPT_RECORD_CANCEL_FAILED, PROMPT_ACTION_NONE);
-        return;
-    }
-    if (mode == MODE_RECORDING || job == JOB_CACHE) release_audio();
-    if (job == JOB_CACHE) finish_job();
-    send_when_saved = false;
-    mode = MODE_IDLE;
-    start_prompt(PROMPT_RECORD_CANCELLED, PROMPT_ACTION_NONE);
-}
-
 static void start_realtime(void)
 {
     if (realtime_active) return;
@@ -1055,7 +1247,7 @@ static void start_realtime(void)
     }
     audio_snapshot_t audio;
     audio_get_snapshot(&audio);
-    if (audio.recording || prompt_action == PROMPT_ACTION_START_RECORDING ||
+    if (recording_busy() || audio.recording || prompt_action == PROMPT_ACTION_START_RECORDING ||
         !cloud_online || !cloud_online() || audio_live_start(realtime_sink) != ESP_OK) {
         realtime_enabled = false;
         diag_realtime_failures++;
@@ -1080,7 +1272,7 @@ static void start_realtime(void)
 
 static void begin_dialogue(void)
 {
-    if (realtime_active || mode == MODE_RECORDING || mode == MODE_RECORD_READY || job == JOB_CACHE ||
+    if (recording_busy() || realtime_active || mode == MODE_RECORDING || mode == MODE_RECORD_READY || job == JOB_CACHE ||
         hold_id[0] || uploading()) {
         start_prompt(PROMPT_DIALOGUE_FAILED, PROMPT_ACTION_NONE);
         return;
@@ -1089,7 +1281,7 @@ static void begin_dialogue(void)
     if (job != JOB_IDLE) finish_job();
     settings_commit_at = 0;
     stt_text_session = stt_text_result_pending = false;
-    stt_engine_started = false;
+    stt_engine_started = stt_stop_handled = false;
     stt_round_started = true;
     stt_end_announced = stt_terminal_received = false;
     mode = MODE_STT;
@@ -1098,7 +1290,7 @@ static void begin_dialogue(void)
 
 static void begin_transcription(void)
 {
-    if (realtime_active || mode == MODE_RECORDING || mode == MODE_RECORD_READY || job == JOB_CACHE ||
+    if (recording_busy() || realtime_active || mode == MODE_RECORDING || mode == MODE_RECORD_READY || job == JOB_CACHE ||
         hold_id[0] || uploading()) {
         start_prompt(PROMPT_TRANSCRIPT_FAILURE, PROMPT_ACTION_NONE);
         return;
@@ -1107,7 +1299,7 @@ static void begin_transcription(void)
     if (job != JOB_IDLE) finish_job();
     settings_commit_at = 0;
     stt_text_session = stt_text_result_pending = true;
-    stt_engine_started = false;
+    stt_engine_started = stt_stop_handled = false;
     stt_text_failed = false;
     stt_delivery_deadline = 0;
     stt_round_started = stt_end_announced = stt_terminal_received = false;
@@ -1117,6 +1309,7 @@ static void begin_transcription(void)
 
 static void on_short_key(int key)
 {
+    if (recording_busy() && key != 4) return;
     if (mode == MODE_STT || xiaozhi_stt_busy()) return;
     const int64_t now = esp_timer_get_time();
     if (mode == MODE_SETTING_ALARM || mode == MODE_SETTING_TIMER) {
@@ -1145,10 +1338,9 @@ static void on_short_key(int key)
                 // replaying the cue and unexpectedly opening the microphone.
                 stop_prompt();
                 mode = MODE_IDLE;
-            } else if (mode == MODE_RECORDING) {
+            } else if (recording_busy()) {
                 stop_prompt();
-                send_when_saved = true;
-                (void)audio_record_stop();
+                stop_recording_stream();
             } else if (mode == MODE_RECORD_READY || job == JOB_CACHE || hold_id[0]) {
                 stop_prompt();
                 hold_id[0] = '\0';
@@ -1176,61 +1368,79 @@ static int64_t key_long_threshold(int key)
     return key <= 1 || key == 4 || key == 8 ? SETUP_LONG_US : LONG_US;
 }
 
-static bool on_stt_key(int key, bool down, int64_t now)
+static void stop_voice_session(void)
 {
-    // Preserve the press identity even if the worker ends between press/release.
-    // That release must never accidentally start another session.
-    bool *pressed = key == 5 ? &stt_s6_pressed : key == 6 ? &stt_s7_pressed : NULL;
-    if (pressed && !down && *pressed) {
-        *pressed = false;
-        key_down[key] = 0;
-        key_held[key] = key_long_handled[key] = key_consumed[key] = false;
-        if (key == 5) diag_s6_actions++;
-        if (!stt_terminal_received && key == (stt_text_session ? 6 : 5)) {
-            const bool queued_start = prompt_action == PROMPT_ACTION_START_STT;
-            if (queued_start) stop_prompt();
-            if (stt_text_session) {
-                if (queued_start) {
-                    stt_terminal_received = stt_text_failed = true;
-                } else {
-                    stt_snapshot_t stt;
-                    xiaozhi_stt_get_snapshot(&stt);
-                    if (stt.capturing) {
-                        xiaozhi_stt_stop();
-                        start_prompt(PROMPT_STT_WAIT, PROMPT_ACTION_STT_ENDED);
-                    }
-                }
-            } else {
-                xiaozhi_dialogue_stop();
-                if (!xiaozhi_stt_busy()) stt_terminal_received = true;
-                stt_feedback(NULL, 0);
-                if (stt_terminal_received && prompt_action != PROMPT_ACTION_STT_ENDED) mode = MODE_IDLE;
+    if (prompt_action == PROMPT_ACTION_START_RECORDING) {
+        // No microphone samples exist until the start cue and cloud begin finish.
+        stop_prompt();
+        mode = MODE_IDLE;
+        return;
+    }
+    if (recording_busy()) {
+        // Once draining/saving, further keys must not cancel or truncate the tail.
+        stop_recording_stream();
+        return;
+    }
+    if (stt_stop_handled || stt_terminal_received) return;
+    stt_stop_handled = true;
+    const bool queued_start = prompt_action == PROMPT_ACTION_START_STT;
+    if (queued_start) stop_prompt();
+    if (stt_text_session) {
+        if (queued_start) {
+            stt_terminal_received = stt_text_failed = true;
+        } else {
+            stt_snapshot_t stt;
+            xiaozhi_stt_get_snapshot(&stt);
+            if (stt.capturing) {
+                xiaozhi_stt_stop();
+                start_prompt(PROMPT_STT_WAIT, PROMPT_ACTION_STT_ENDED);
+            } else if (stt.busy) {
+                // Connecting: stop intent prevents capture from starting later.
+                xiaozhi_stt_stop();
             }
         }
-        return true;
+    } else {
+        xiaozhi_dialogue_stop();
+        if (!xiaozhi_stt_busy()) stt_terminal_received = true;
+        stt_feedback(NULL, 0);
+        if (stt_terminal_received && prompt_action != PROMPT_ACTION_STT_ENDED) mode = MODE_IDLE;
     }
-    if (mode == MODE_STT || xiaozhi_stt_busy() || prompt_action == PROMPT_ACTION_START_STT) {
-        if (down) {
-            if (key_down[key]) return true;
-            key_down[key] = now;
-            key_held[key] = key_long_handled[key] = false;
-            key_consumed[key] = true;
-            if (key == (stt_text_session ? 6 : 5)) *pressed = true;
-        } else {
+}
+
+static bool on_voice_key(int key, bool down, int64_t now)
+{
+    // Keep a separate latch across terminal events and even a later session:
+    // releasing a key used to stop must never start another feature.
+    if (voice_stop_keys[key]) {
+        if (!down) {
+            voice_stop_keys[key] = false;
             key_down[key] = 0;
             key_held[key] = key_long_handled[key] = key_consumed[key] = false;
         }
         return true;
     }
-    return false;
+    if (!recording_busy() && prompt_action != PROMPT_ACTION_START_RECORDING &&
+        mode != MODE_STT && !xiaozhi_stt_busy() && prompt_action != PROMPT_ACTION_START_STT) return false;
+    if (down) {
+        if (key_down[key]) return true;
+        key_down[key] = now;
+        key_held[key] = key_long_handled[key] = false;
+        key_consumed[key] = voice_stop_keys[key] = true;
+        stop_voice_session();
+    } else {
+        key_down[key] = 0;
+        key_held[key] = key_long_handled[key] = key_consumed[key] = false;
+    }
+    return true;
 }
 
 static void on_key(int key, bool down)
 {
     if (key < 0 || key > 8) return;
     const int64_t now = input_timestamp ? input_timestamp : esp_timer_get_time();
+    if (on_voice_key(key, down, now)) return;
     if (key == 7) {
-        // S8 is independent of audio and never cancels a countdown or session.
+        // Outside S5/S6/S7, S8 independently controls the stopwatch.
         if (down) {
             if (!key_down[key]) key_down[key] = now;
         } else if (key_down[key]) {
@@ -1248,15 +1458,14 @@ static void on_key(int key, bool down)
         else diag_s6_up_events++;
     }
     if (down && key == 6) diag_s7_events++;
-    if (on_stt_key(key, down, now)) return;
-    // S5/S6/S7 act immediately on each valid release; S8 is handled above.
+    // Idle S5/S6/S7 starts resolve on release; active sessions stop on press.
     if (key >= 4 && key <= 6) {
         if (down) {
             if (key_down[key]) return;
             key_consumed[key] = key_held[key] = key_long_handled[key] = false;
             key_down[key] = now;
             if (mark_all_read_confirming || mode == MODE_COUNTDOWN || (realtime_active && key == 4) ||
-                ((mode == MODE_RECORDING || job == JOB_CACHE || mode == MODE_STT || xiaozhi_stt_busy()) && key != 4)) {
+                ((recording_busy() || mode == MODE_RECORDING || job == JOB_CACHE || mode == MODE_STT || xiaozhi_stt_busy()) && key != 4)) {
                 if (mode == MODE_COUNTDOWN) cancel_countdown(false);
                 key_consumed[key] = true;
                 return;
@@ -1277,6 +1486,7 @@ static void on_key(int key, bool down)
         }
         return;
     }
+    if (recording_busy() && down) { key_consumed[key] = true; return; }
     if ((mode == MODE_STT || xiaozhi_stt_busy()) && down) { key_consumed[key] = true; return; }
     if (mark_all_read_confirming && down && key != 0 && key != 1) {
         stop_prompt();
@@ -1340,6 +1550,7 @@ static void on_key(int key, bool down)
 
 static bool on_long_key(int key)
 {
+    if (recording_busy() && key != 4) return true;
     if (key == 0) {
         stop_message_playback();
         cancel_countdown(false);
@@ -1366,9 +1577,6 @@ static bool on_long_key(int key)
         stop_prompt();
         start_prompt(removed ? PROMPT_ALARM_CANCEL : PROMPT_TRANSCRIPT_FAILURE, PROMPT_ACTION_NONE);
         return true;
-    } else if (key == 4) {
-        cancel_recording();
-        return true;
     } else if (key == 8) {
         network_setup_begin();
         setup_waiting = true;
@@ -1380,7 +1588,7 @@ static bool on_long_key(int key)
 
 static void on_rotate(int delta)
 {
-    if (mode == MODE_STT || xiaozhi_stt_busy()) {
+    if (recording_busy() || mode == MODE_STT || xiaozhi_stt_busy()) {
         audio_snapshot_t audio; audio_get_snapshot(&audio);
         int level = (int)audio.volume / 10 + delta;
         if (level < 1) level = 1;
@@ -1509,6 +1717,7 @@ static void receive(cJSON *value)
     const cJSON *op = cJSON_GetObjectItemCaseSensitive(value, "op");
     const cJSON *req = cJSON_GetObjectItemCaseSensitive(value, "req");
     if (!cJSON_IsString(op)) return;
+    if (recording_receive(value, op->valuestring, cJSON_IsString(req) ? req->valuestring : NULL)) return;
     const cJSON *text_id = cJSON_GetObjectItemCaseSensitive(value, "id");
     if (handle_text_receipt(op->valuestring, cJSON_IsString(req) ? req->valuestring : NULL,
         cJSON_IsString(text_id) ? text_id->valuestring : NULL,
@@ -1516,7 +1725,7 @@ static void receive(cJSON *value)
     // In-flight record acknowledgements and summary application write NVS.
     // Defer them while Xiaozhi is busy so flash operations cannot stall I2S;
     // retain request IDs and pending records for an idempotent retry on exit.
-    if (xiaozhi_stt_busy() && (!strcmp(op->valuestring, "ledger.summary") ||
+    if ((recording_busy() || xiaozhi_stt_busy()) && (!strcmp(op->valuestring, "ledger.summary") ||
         !strcmp(op->valuestring, "ledger.ack") || !strcmp(op->valuestring, "health.ack"))) return;
     if (cJSON_IsString(req) && summary_request_id[0] && !strcmp(req->valuestring, summary_request_id)) {
         if (!strcmp(op->valuestring, "ledger.summary") && summary_generation == ledger_generation && !ledger_pending_count()) {
@@ -1586,6 +1795,11 @@ static void receive(cJSON *value)
         }
         return;
     }
+    if (strcmp(op->valuestring, "index.changed") == 0) {
+        synced_revision = -1;
+        sync_at = 0;
+        return;
+    }
     if (strcmp(op->valuestring, "item") == 0) {
         add_item(value);
         return;
@@ -1613,6 +1827,7 @@ static void receive(cJSON *value)
     if (mode == MODE_STT || xiaozhi_stt_busy()) return;
     if (strcmp(op->valuestring, "error") == 0) {
         if (uploading()) upload_failed();
+        else if (job == JOB_DOWNLOAD || job == JOB_PLAYING) fail_stream_playback();
         else if (job == JOB_MARK_ALL_READ) {
             finish_job();
             mode = MODE_IDLE;
@@ -1674,7 +1889,9 @@ static void receive(cJSON *value)
         size_t length = 0;
         if (mbedtls_base64_decode(decoded, sizeof(decoded), &length, (unsigned char *)data->valuestring,
                                   strlen(data->valuestring)) != 0 || length != expected) return;
-        memcpy(audio_data + chunk_index * CHUNK, decoded, length);
+        if (playback_window_done || playback_buffered + length > STREAM_WINDOW * CHUNK) { fail_stream_playback(); return; }
+        memcpy(audio_data + playback_buffered, decoded, length);
+        playback_buffered += length;
         chunk_index++;
         if (!advance_stream_playback()) {
             fail_stream_playback();
@@ -1683,22 +1900,13 @@ static void receive(cJSON *value)
     } else if ((job == JOB_DOWNLOAD || job == JOB_PLAYING) && strcmp(op->valuestring, "streamAck") == 0) {
         const cJSON *next = cJSON_GetObjectItemCaseSensitive(value, "next");
         stream_complete = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(value, "complete"));
-        if (!advance_stream_playback()) {
-            fail_stream_playback();
-            return;
+        if (!cJSON_IsNumber(next) || next->valueint != (int)chunk_index ||
+            (stream_complete && chunk_index != (audio_size + CHUNK - 1) / CHUNK)) {
+            fail_stream_playback(); return;
         }
-        if (stream_complete) {
-            const unsigned expected_chunks = (audio_size + CHUNK - 1) / CHUNK;
-            if (chunk_index < expected_chunks) {
-                fail_stream_playback();
-                return;
-            }
-            request_line[0] = '\0';
-        } else if (!cJSON_IsNumber(next) || next->valueint != (int)chunk_index) {
-            fail_stream_playback();
-        } else {
-            request_stream();
-        }
+        request_line[0] = 0;
+        playback_window_done = true;
+        if (!advance_stream_playback()) fail_stream_playback();
     } else if (uploading() && strcmp(op->valuestring, "ack") == 0) {
         if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(value, "committed"))) {
             if (voice_outbox_ack(&outgoing) != ESP_OK) upload_failed();
@@ -1844,18 +2052,9 @@ static void task(void *argument)
         audio_snapshot_t audio;
         audio_get_snapshot(&audio);
         diag_stage = 8;
-        if (mode == MODE_RECORDING && !audio.recording) {
-            audio_size = audio.recorded_bytes;
-            if (audio_size) {
-                mode = MODE_RECORD_READY;
-                job = JOB_CACHE;
-                cache_at = now;
-            } else {
-                release_audio();
-                mode = MODE_IDLE;
-            }
-        }
-        if (volume_announce_pending && !xiaozhi_stt_busy() && mode != MODE_STT && !audio.recording && prompt_length == 0 && !audio.speaker_playing) {
+        recording_step(now);
+        if ((job == JOB_DOWNLOAD || job == JOB_PLAYING) && mode == MODE_PLAYING && !advance_stream_playback()) fail_stream_playback();
+        if (volume_announce_pending && !xiaozhi_stt_busy() && mode != MODE_STT && !recording_busy() && !audio.recording && prompt_length == 0 && !audio.speaker_playing) {
             volume_announce_pending = false;
             announce_volume();
         }
@@ -1918,7 +2117,7 @@ static void task(void *argument)
         }
         diag_stage = 11;
 
-        if (job == JOB_IDLE && network_fresh(now) && !prompt_playing && !realtime_active && mode != MODE_RECORDING &&
+        if (!recording_busy() && job == JOB_IDLE && network_fresh(now) && !prompt_playing && !realtime_active && mode != MODE_RECORDING &&
             mode != MODE_PLAYING && mode != MODE_COUNTDOWN && mode != MODE_STT && !xiaozhi_stt_busy()) {
             message_t *receipt = NULL;
             for (int i = 0; i < message_count; i++) if (messages[i].pending_read) { receipt = &messages[i]; break; }
@@ -1932,7 +2131,7 @@ static void task(void *argument)
             } else if (voice_outbox_count() && now >= retry_at) {
                 upload_begin();
             }
-        } else if (job == JOB_IDLE && network_fresh(now) && mode == MODE_IDLE && !realtime_active &&
+        } else if (!recording_busy() && job == JOB_IDLE && network_fresh(now) && mode == MODE_IDLE && !realtime_active &&
                    !prompt_playing && voice_outbox_count() && now >= retry_at) {
             upload_begin();
         }
@@ -1956,10 +2155,10 @@ static void task(void *argument)
         }
         diag_stage = 14;
         const voice_chat_snapshot_t value = {
-            .pending = voice_outbox_count() + (job == JOB_CACHE ? 1 : 0),
+            .pending = voice_outbox_count() + (job == JOB_CACHE || recording_busy() ? 1 : 0),
             .health_pending = health_pending_count(),
             .ledger_pending = ledger_pending_count(),
-            .sending = uploading(),
+            .sending = uploading() || recording_busy(),
             .storage_error = !outbox_ready || job == JOB_CACHE,
             .alarm_minute = timers_alarm_minute(),
             .countdown_seconds = timers_countdown_seconds(),

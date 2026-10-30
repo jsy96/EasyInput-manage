@@ -43,7 +43,7 @@ static prompt_action_t prompt_action;
 static health_edit_t health_edit;
 static ledger_edit_t ledger_edit;
 static bool realtime_active, mark_all_read_confirming, send_when_saved;
-static bool stt_s6_pressed, stt_s7_pressed, stt_round_started, stt_end_announced, stt_terminal_received;
+static bool voice_stop_keys[9], stt_stop_handled, stt_round_started, stt_end_announced, stt_terminal_received;
 static bool stt_text_session, stt_text_result_pending, stt_text_failed, stt_engine_started;
 static int64_t stt_delivery_deadline;
 static unsigned received_texts, acked_texts, queued_texts;
@@ -98,6 +98,11 @@ static void ledger_edit_cancel(ledger_edit_t *e) { e->active=false; }
 static void health_edit_refine(health_edit_t *e) { e->fine=true; }
 static void stop_message_playback(void) { if(mode==MODE_PLAYING) mode=MODE_IDLE; }
 static void finish_job(void) { job=JOB_IDLE; }
+static bool recording_busy(void) { return mode==MODE_RECORDING; }
+static void stop_recording_stream(void) { record_stops++; mode=MODE_RECORD_READY; }
+static void start_prompt(int, prompt_action_t);
+static void stop_prompt(void);
+static void cancel_recording_stream(void) { stop_prompt(); record_stops++; mode=MODE_IDLE; start_prompt(PROMPT_RECORD_CANCELLED,PROMPT_ACTION_NONE); }
 static bool uploading(void) { return job==JOB_UP_BEGIN || job==JOB_UP_CHUNK || job==JOB_UP_COMMIT; }
 static void announce_recent_health(bool pressure) { (void)pressure; }
 static void release_audio(void) {}
@@ -115,14 +120,15 @@ static void begin_timer_setting(void) {}
 static void commit_health_record(void) { health_edit.active=false; mode=MODE_IDLE; }
 static void confirm_ledger_record(void) { assert(!"removed ledger input must not execute"); }
 static bool on_long_key(int key);
-${['sync_text', 'stop_prompt', 'append_prompt', 'start_prompt_sequence', 'start_prompt', 'stt_feedback', 'handle_stt_event', 'poll_stt_events', 'poll_text_result', 'handle_text_receipt', 'cancel_recording', 'begin_recording_with_prompt', 'begin_dialogue', 'begin_transcription', 'on_short_key', 'key_long_threshold', 'on_stt_key', 'on_key', 'prompt_task_step'].map(extract).join('\n')}
-static bool on_long_key(int key) { if(key!=4) return false; cancel_recording(); return true; }
+${['sync_text', 'stop_prompt', 'append_prompt', 'start_prompt_sequence', 'start_prompt', 'stt_feedback', 'handle_stt_event', 'poll_stt_events', 'poll_text_result', 'handle_text_receipt', 'begin_recording_with_prompt', 'begin_dialogue', 'begin_transcription', 'on_short_key', 'key_long_threshold', 'stop_voice_session', 'on_voice_key', 'on_key', 'prompt_task_step'].map(extract).join('\n')}
+static bool on_long_key(int key) { (void)key; return false; }
 static void reset(void) {
   job=JOB_IDLE; mode=MODE_IDLE; prompt_action=PROMPT_ACTION_NONE;
   prompt_length=prompt_position=played_count=queued_count=interrupted=0;
   ordinary_recordings=record_stops=starts=stops=start_error=text_starts=text_stops=0;
   worker_busy=capturing=speaker_playing=prompt_playing=false;
-  stt_s6_pressed=stt_s7_pressed=stt_round_started=stt_end_announced=stt_terminal_received=false;
+  memset(voice_stop_keys,0,sizeof voice_stop_keys);
+  stt_stop_handled=stt_round_started=stt_end_announced=stt_terminal_received=false;
   stt_text_session=stt_text_result_pending=stt_text_failed=false; stt_delivery_deadline=0;
   stt_engine_started=delivery_success=delivery_network=false; prior_texts=delivery_results=0;
   received_texts=acked_texts=queued_texts=0; text_request_id[0]=text_inflight_id[0]=0;
@@ -142,25 +148,46 @@ static void begin(void) {
   finish_prompts(); assert(starts==previous_starts+1 && capturing && worker_busy && mode==MODE_STT);
 }
 int main(void) {
-  // S8 uses the release timestamp and cannot cancel audio or a countdown.
+  // Outside a board voice session S8 keeps its independent stopwatch behavior.
   reset(); mode=MODE_COUNTDOWN; on_key(7,false); assert(!stopwatch_toggles);
   on_key(7,true); on_key(7,true); input_timestamp=clock_us+2300000;
   on_key(7,false); on_key(7,false);
   assert(stopwatch_toggles==1 && stopwatch_toggled_at==input_timestamp && mode==MODE_COUNTDOWN);
   reset(); begin(); press(7,50000);
-  assert(stopwatch_toggles==1 && capturing && stops==0 && mode==MODE_STT);
+  assert(stopwatch_toggles==0 && !capturing && stops==1 && mode==MODE_STT);
   reset(); realtime_active=true; press(7,50000);
   assert(stopwatch_toggles==1 && realtime_active);
   // Each S5 release is immediately an ordinary recording action; no double-click mode.
   reset(); press(4,50000); assert(prompt_action==PROMPT_ACTION_START_RECORDING);
   finish_prompts(); assert(ordinary_recordings==1 && mode==MODE_RECORDING);
-  clock_us+=100000; press(4,50000); assert(record_stops==1 && send_when_saved && starts==0);
+  clock_us+=100000; press(4,50000); assert(record_stops==1 && mode==MODE_RECORD_READY && starts==0);
   reset(); press(4,50000); press(4,50000); finish_prompts();
   assert(ordinary_recordings==0 && starts==0 && record_stops==0 && mode==MODE_IDLE);
   reset(); press(4,50000); prompt_task_step(++clock_us); assert(speaker_playing);
   press(4,50000); finish_prompts(); assert(ordinary_recordings==0 && starts==0 && mode==MODE_IDLE);
   reset(); press(4,50000); press(4,SETUP_LONG_US); finish_prompts();
-  assert(ordinary_recordings==0 && starts==0 && count_played(PROMPT_RECORD_CANCELLED)==1);
+  assert(ordinary_recordings==0 && starts==0 && count_played(PROMPT_RECORD_CANCELLED)==0 && mode==MODE_IDLE);
+
+  // All nine physical keys stop at DOWN; repeated DOWN/held/release cannot
+  // cancel saving, toggle S8, open setup, or start a different voice mode.
+  for(int key=0;key<9;key++) {
+    reset(); press(4,50000); finish_prompts(); on_key(key,true);
+    assert(record_stops==1 && mode==MODE_RECORD_READY);
+    on_key(key,true); clock_us+=SETUP_LONG_US; on_key(key,false);
+    assert(record_stops==1 && ordinary_recordings==1 && !starts && !text_starts && !stopwatch_toggles);
+    for(int feature=5;feature<=6;feature++) {
+      reset(); press(feature,50000); finish_prompts(); speaker_playing=feature==5;
+      on_key(key,true); assert(!capturing && (feature==5 ? stops==1 : text_stops==1));
+      on_key(key,true); clock_us+=SETUP_LONG_US; on_key(key,false);
+      assert(!stopwatch_toggles && !ordinary_recordings && starts+text_starts==1);
+    }
+    // A key during either start cue cancels before any audio is captured.
+    for(int feature=4;feature<=6;feature++) {
+      reset(); press(feature,50000); on_key(key,true); on_key(key,false);
+      poll_text_result(clock_us); finish_prompts();
+      assert(!ordinary_recordings && !starts && !text_starts && !stopwatch_toggles);
+    }
+  }
 
   // S6 stops capture/playback locally while the network worker is still busy.
   reset(); begin(); speaker_playing=true; press(5,50000);
@@ -175,13 +202,13 @@ int main(void) {
   reset(); begin(); capturing=false; push(STT_CAPTURE_STOPPED); push(STT_WAIT); poll_stt_events();
   assert(mode==MODE_STT && !prompt_length && !prompt_playing && !stt_end_announced);
   capturing=true; push(STT_DONE); poll_stt_events(); assert(text_retry_at==0 && !prompt_length);
-  for(int key=0;key<9;key++) if(key!=5) { press(key,SETUP_LONG_US); }
-  assert(stops==0 && ordinary_recordings==0 && mode==MODE_STT);
+  press(0,SETUP_LONG_US);
+  assert(stops==1 && ordinary_recordings==0 && mode==MODE_STT);
 
   // A terminal event between S6 press and release cannot start a new session.
   reset(); begin(); on_key(5,true); worker_busy=capturing=false; push(STT_FAILED); poll_stt_events();
   clock_us+=50000; on_key(5,false); finish_prompts();
-  assert(starts==1 && stops==0 && mode==MODE_IDLE);
+  assert(starts==1 && stops==1 && mode==MODE_IDLE);
   assert(count_played(PROMPT_DIALOGUE_ENDED)==1 && count_played(PROMPT_DIALOGUE_FAILED)==1);
   push(STT_FAILED); push(STT_CAPTURE_STOPPED); poll_stt_events(); finish_prompts();
   assert(count_played(PROMPT_DIALOGUE_FAILED)==1);
@@ -237,14 +264,21 @@ int main(void) {
   handle_text_receipt("text.displayed",NULL,"first",true); assert(acked_texts==1); // Duplicate receipt.
   strcpy(text_inflight_id,"second"); strcpy(text_request_id,"text-2");
   handle_text_receipt("text.ack","text-2","second",true); assert(acked_texts==2 && !queued_texts);
-  press(5,50000); press(7,50000); assert(text_stops==0 && stops==0 && capturing);
+  press(5,50000); press(7,50000); assert(text_stops==1 && stops==0 && !capturing);
   poll_text_result(clock_us); assert(count_played(PROMPT_TRANSCRIPT_SUCCESS)==0);
   press(6,50000); assert(text_stops==1 && !capturing && worker_busy);
   finish_prompts(); assert(mode==MODE_STT && stt_text_result_pending);
   press(6,50000); assert(text_stops==1 && text_starts==1); // Drain cannot restart.
-  worker_busy=false; push(STT_FINISHED); poll_stt_events(); poll_text_result(clock_us); finish_prompts();
+  worker_busy=false; push(STT_FINISHED); poll_stt_events(); finish_prompts(); poll_text_result(clock_us); finish_prompts();
   assert(mode==MODE_IDLE && count_played(PROMPT_TRANSCRIPT_SUCCESS)==1 && count_played(PROMPT_TRANSCRIPT_FAILURE)==0);
-  push(STT_FINISHED); poll_stt_events(); poll_text_result(clock_us); finish_prompts();
+  push(STT_FINISHED); poll_stt_events(); finish_prompts(); poll_text_result(clock_us); finish_prompts();
+  assert(count_played(PROMPT_TRANSCRIPT_SUCCESS)==1);
+
+  reset(); press(6,50000); finish_prompts(); capturing=false;
+  push(STT_CAPTURE_STOPPED); push(STT_CAPTURE_STOPPED); poll_stt_events(); finish_prompts();
+  assert(stt_stop_handled && count_played(PROMPT_STT_WAIT)==1);
+  received_texts=acked_texts=1; worker_busy=false; push(STT_FINISHED);
+  poll_stt_events(); finish_prompts(); poll_text_result(clock_us); finish_prompts();
   assert(count_played(PROMPT_TRANSCRIPT_SUCCESS)==1);
 
   // Partial delivery waits for the bounded post-terminal receipt window.
@@ -259,20 +293,20 @@ int main(void) {
 
   // Empty recognition and transport failure never become a successful result.
   reset(); press(6,50000); finish_prompts(); press(6,50000); finish_prompts();
-  worker_busy=false; push(STT_EMPTY); poll_stt_events(); poll_text_result(clock_us); finish_prompts();
+  worker_busy=false; push(STT_EMPTY); poll_stt_events(); finish_prompts(); poll_text_result(clock_us); finish_prompts();
   assert(count_played(PROMPT_TRANSCRIPT_FAILURE)==1 && mode==MODE_IDLE);
   reset(); press(6,50000); finish_prompts(); received_texts=acked_texts=1;
-  worker_busy=capturing=false; push(STT_FAILED); poll_stt_events(); poll_text_result(clock_us); finish_prompts();
+  worker_busy=capturing=false; push(STT_FAILED); poll_stt_events(); finish_prompts(); poll_text_result(clock_us); finish_prompts();
   assert(count_played(PROMPT_TRANSCRIPT_FAILURE)==1 && count_played(PROMPT_TRANSCRIPT_SUCCESS)==0);
 
   // Quick cancellation never starts capture, and held keys cannot reopen a round.
   reset(); press(6,50000); press(6,50000); poll_text_result(clock_us); finish_prompts();
   assert(text_starts==0 && text_stops==0 && count_played(PROMPT_TRANSCRIPT_FAILURE)==1 && mode==MODE_IDLE && delivery_results==0);
   reset(); press(6,50000); finish_prompts(); on_key(6,true);
-  worker_busy=capturing=false; push(STT_FAILED); poll_stt_events(); poll_text_result(clock_us); finish_prompts();
+  worker_busy=capturing=false; push(STT_FAILED); poll_stt_events(); finish_prompts(); poll_text_result(clock_us); finish_prompts();
   clock_us+=50000; on_key(6,false); finish_prompts(); assert(text_starts==1 && mode==MODE_IDLE);
   reset(); press(6,50000); finish_prompts(); on_key(6,true);
-  worker_busy=capturing=false; push(STT_FAILED); poll_stt_events(); poll_text_result(clock_us); finish_prompts();
+  worker_busy=capturing=false; push(STT_FAILED); poll_stt_events(); finish_prompts(); poll_text_result(clock_us); finish_prompts();
   begin(); on_key(6,false); assert(stops==0 && worker_busy && capturing); // Old S7 release cannot stop new S6.
   reset(); press(7,50000); assert(mode==MODE_IDLE && !prompt_length && text_starts==0);
   for(int state=0;state<2;state++) {
@@ -294,13 +328,13 @@ int main(void) {
   handle_text_receipt("text.displayed",NULL,text_inflight_id,true);
   assert(acked_texts==1 && !queued_texts);
   press(6,50000); finish_prompts(); worker_busy=false; push(STT_FINISHED);
-  poll_stt_events(); poll_text_result(clock_us); finish_prompts();
+  poll_stt_events(); finish_prompts(); poll_text_result(clock_us); finish_prompts();
   assert(count_played(PROMPT_TRANSCRIPT_SUCCESS)==1 && delivery_success && delivery_results==1);
   // An old late receipt cannot turn an empty new recognition into success.
   reset(); queued_texts=1; press(6,50000); finish_prompts(); sync_text(clock_us);
   handle_text_receipt("text.displayed",NULL,text_inflight_id,true);
   press(6,50000); finish_prompts(); worker_busy=false; push(STT_EMPTY);
-  poll_stt_events(); poll_text_result(clock_us); finish_prompts();
+  poll_stt_events(); finish_prompts(); poll_text_result(clock_us); finish_prompts();
   assert(count_played(PROMPT_TRANSCRIPT_FAILURE)==1 && acked_texts==0 && !delivery_success);
   // A display timeout keeps its text but the following round can start again.
   reset(); press(6,50000); finish_prompts(); received_texts=queued_texts=1;

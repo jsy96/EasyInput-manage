@@ -55,3 +55,17 @@ it('omits transcription text from ZIP audio batches', () => {
   const text = { ...voice, id: 'text', kind: 'text' as const, text: '你好', samples: 0, read: true }
   expect(voiceZipBatches([voice, text])).toEqual([[voice]])
 })
+
+it('limits long voice ZIP batches by bytes and reads blobs through bounded streams', async () => {
+  const m = { id: 'long', sender: 'board', name: '开发板', samples: 20 * 1024 * 1024, created: 1, read: true }
+  expect(voiceZipBatches([m, { ...m, id: 'next' }]).map(batch => batch.length)).toEqual([1, 1])
+  const file = new Blob(['123456789'])
+  file.arrayBuffer = () => { throw new Error('whole file allocation forbidden') }
+  const zip = await voiceZip([{ name: 'long.wav', blob: file }])
+  expect(new DataView(await zip.arrayBuffer()).getUint32(14, true)).toBe(0xcbf43926)
+})
+
+it('rejects ZIP32 overflow before reading an oversized source', async () => {
+  const blob = { size: 0x100000000 } as Blob
+  await expect(voiceZip([{ name: 'huge.wav', blob }])).rejects.toThrow('4 GiB')
+})

@@ -37,7 +37,7 @@ static int64_t key_down[9], settings_commit_at, retry_at, alarm_fired_at_us, set
 static char hold_id[65], discarded_id[65];
 static int alarm_draft, timer_draft, last_prompt;
 static unsigned diag_s5_events, diag_s6_down_events, diag_s6_up_events, diag_s6_actions, diag_s7_events, diag_last_key_mode;
-static bool stt_busy, stt_pending, stt_s6_pressed, stt_s7_pressed, stt_text_session;
+static bool stt_busy, stt_pending, stt_stop_handled, voice_stop_keys[9], stt_text_session;
 static bool stt_text_result_pending, stt_text_failed, stt_engine_started, stt_round_started, stt_end_announced, stt_terminal_received;
 static int64_t stt_delivery_deadline;
 static int stt_stops, text_stops;
@@ -50,12 +50,12 @@ static int prompt_length;
 static bool timers_stopwatch_active(void) { return stopwatch_active; }
 static void timers_start_stopwatch(int64_t now) { stopwatch_active=true; stopwatch_started_at=now; }
 static uint32_t timers_stop_stopwatch(int64_t now) { stopwatch_active=false; return (uint32_t)((now-stopwatch_started_at)/1000000); }
-typedef struct { bool capturing; } stt_snapshot_t;
+typedef struct { bool capturing, busy; } stt_snapshot_t;
 static bool stt_capturing;
 static bool xiaozhi_stt_busy(void) { return stt_busy; }
 static void xiaozhi_dialogue_stop(void) { stt_stops++; stt_capturing=false; }
 static void xiaozhi_stt_stop(void) { text_stops++; stt_capturing=false; }
-static void xiaozhi_stt_get_snapshot(stt_snapshot_t *s) { *s=(stt_snapshot_t){.capturing=stt_capturing}; }
+static void xiaozhi_stt_get_snapshot(stt_snapshot_t *s) { *s=(stt_snapshot_t){.capturing=stt_capturing,.busy=stt_busy}; }
 static bool xiaozhi_stt_pending(void *t) { (void)t; return stt_pending; }
 static int diag_last_key, stopped, released, uploads, setup_calls, volume_changes, stop_error, discard_error;
 static unsigned speaker_volume;
@@ -90,18 +90,22 @@ static int audio_set_volume(uint8_t v) { speaker_volume=v; volume_changes++; ret
 static void announce_alarm_draft(void) {}
 static void announce_timer_draft(void) {}
 static void announce_volume(void) {}
+static bool recording_busy(void) { return false; }
+static void stop_recording_stream(void) { stopped++; mode=MODE_RECORD_READY; }
+static void cancel_recording_stream(void) { assert(!"stream is tested by voice_recording.test.ts"); }
 static bool uploading(void) { return job == JOB_UP_BEGIN || job == JOB_UP_CHUNK || job == JOB_UP_COMMIT; }
 static bool on_long_key(int key);
-${['toggle_stopwatch', 'begin_recording_with_prompt', 'begin_dialogue', 'begin_transcription', 'cancel_recording', 'on_short_key', 'key_long_threshold', 'on_stt_key', 'on_key', 'on_long_key', 'on_rotate', 'append_duration', 'handle_timer_events'].map(extractFunction).join('\n')}
+${['toggle_stopwatch', 'begin_recording_with_prompt', 'begin_dialogue', 'begin_transcription', 'on_short_key', 'key_long_threshold', 'stop_voice_session', 'on_voice_key', 'on_key', 'on_long_key', 'on_rotate', 'append_duration', 'handle_timer_events'].map(extractFunction).join('\n')}
 static void reset_input(void) {
   mode = MODE_IDLE; job = JOB_IDLE; stop_prompt();
   stt_busy = stt_pending = stt_capturing = false;
-  stt_s6_pressed = stt_s7_pressed = stt_text_session = stt_text_result_pending = stt_text_failed = stt_engine_started = false;
+  stt_stop_handled = stt_text_session = stt_text_result_pending = stt_text_failed = stt_engine_started = false;
   stt_stops = text_stops = 0; stt_delivery_deadline = 0;
   deferred_timer_events = 0;
   stopwatch_active=stopwatch_start_pending=stopwatch_busy_pending=false;
   stopwatch_result_head=stopwatch_result_count=0;
   stt_round_started = stt_end_announced = stt_terminal_received = false;
+  memset(voice_stop_keys, 0, sizeof voice_stop_keys);
   memset(key_down, 0, sizeof key_down); memset(key_held, 0, sizeof key_held);
   memset(key_long_handled, 0, sizeof key_long_handled); memset(key_consumed, 0, sizeof key_consumed);
   hold_id[0] = discarded_id[0] = 0;
@@ -121,7 +125,7 @@ static void test_inputs(void) {
   const size_t history_bytes=sizes[0]; unsigned char original_health[8192]; memcpy(original_health,disk[0],history_bytes);
   reset_input(); press_key(6, 50000);
   assert(mode == MODE_STT && stt_text_session && prompt_action == PROMPT_ACTION_START_STT);
-  press_key(7, 50000); assert(mode == MODE_STT && prompt_action == PROMPT_ACTION_START_STT);
+  press_key(7, 50000); assert(mode == MODE_STT && stt_terminal_received && stt_text_failed && prompt_action == PROMPT_ACTION_NONE);
   assert(health_pending_count() == 1 && ledger_pending_count() == 0);
   reset_input(); press_key(7, 50000); press_key(7, 3000000);
   assert(mode == MODE_IDLE && !prompt_playing && setup_calls == 0);
@@ -134,26 +138,20 @@ static void test_inputs(void) {
 
   reset_input(); press_key(4, 50000); assert(prompt_action == PROMPT_ACTION_START_RECORDING);
   press_key(4, 3000000);
-  assert(last_prompt == PROMPT_RECORD_CANCELLED && mode == MODE_IDLE);
-  reset_input(); mode = MODE_RECORDING; press_key(4, 50000);
-  assert(send_when_saved && stopped == 1 && released == 0);
-  reset_input(); mode = MODE_RECORDING; press_key(4, 3000000);
-  assert(mode == MODE_IDLE && !send_when_saved && stopped == 1 && released == 1 && uploads == 0);
-  reset_input(); mode = MODE_RECORDING; stop_error = 1; press_key(4, 3000000);
-  assert(mode == MODE_RECORDING && !send_when_saved && released == 0 && last_prompt == PROMPT_RECORD_CANCEL_FAILED);
+  assert(prompt_action == PROMPT_ACTION_NONE && mode == MODE_IDLE);
   reset_input(); mode = MODE_RECORD_READY; strcpy(hold_id, "synthetic-current-draft");
   press_key(4, 3000000);
-  assert(hold_id[0] == 0 && strcmp(discarded_id, "synthetic-current-draft") == 0 && uploads == 0);
+  assert(hold_id[0] == 0 && discarded_id[0] == 0 && uploads == 1);
   reset_input(); mode = MODE_RECORD_READY; strcpy(hold_id, "synthetic-current-draft"); discard_error=1;
-  press_key(4,3000000); assert(!strcmp(hold_id,"synthetic-current-draft") && last_prompt==PROMPT_RECORD_CANCEL_FAILED);
-  assert(mode==MODE_RECORD_READY && released==0 && uploads==0);
+  press_key(4,3000000); assert(!hold_id[0] && !discarded_id[0]);
+  assert(released==0 && uploads==1);
   reset_input(); mode = MODE_RECORD_READY; strcpy(hold_id, "synthetic-current-draft");
   press_key(4, 50000); assert(hold_id[0] == 0 && uploads == 1 && send_when_saved);
   // A short/long press outside the current unsent slot never discards an upload.
   reset_input(); job=JOB_UP_CHUNK; mode=MODE_IDLE; on_long_key(4);
   assert(job==JOB_UP_CHUNK && !discarded_id[0] && !released && !uploads);
   reset_input(); job=JOB_CACHE; mode=MODE_RECORD_READY; press_key(4,3000000);
-  assert(job==JOB_IDLE && mode==MODE_IDLE && released==1 && uploads==0);
+  assert(job==JOB_CACHE && mode==MODE_RECORD_READY && released==0 && uploads==0 && send_when_saved);
 
   reset_input(); realtime_active=true; press_key(6,50000);
   assert(!stt_text_session && realtime_active && last_prompt==PROMPT_TRANSCRIPT_FAILURE);
@@ -166,7 +164,7 @@ static void test_inputs(void) {
   // Conversation controls neither alter legacy records nor resurrect a held key.
   reset_input(); mode=MODE_STT; stt_busy=stt_capturing=true;
   press_key(6,50000); press_key(4,50000); press_key(7,50000);
-  assert(stt_stops==0 && text_stops==0 && health_pending_count()==1);
+  assert(stt_stops==1 && text_stops==0 && health_pending_count()==1);
   on_rotate(1); assert(volume_changes==1 && speaker_volume==30 && !prompt_playing);
   reset_input(); mode=MODE_STT; stt_busy=true;
   on_key(6,true); monotonic_us+=50000; mode=MODE_IDLE; stt_busy=false;

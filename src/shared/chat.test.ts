@@ -7,7 +7,7 @@ import {
 import type { ChatMessage } from './chat'
 const message = (id: string, created: number, read = false, sender = 'computer'): ChatMessage => ({ id, sender, name: '电脑', samples: 8000, created, read })
 describe('voice timeline behavior', () => {
-  it('limits one recording to twenty seconds', () => { expect(AUDIO_LIMIT).toBe(160_000) })
+  it('keeps browser microphone capture limited to twenty seconds', () => { expect(AUDIO_LIMIT).toBe(160_000) })
   it('sorts every sender by time without grouping computers', () => {
     const messages = [message('new-board', 300, false, 'board'), message('old-computer', 100), message('new-computer', 200)]
     expect(sortMessages(messages).map((value) => value.id)).toEqual(['old-computer', 'new-computer', 'new-board'])
@@ -45,4 +45,14 @@ it('validates board text without accepting a fake audio clip', () => {
   const m = { id: 'text', sender: 'board', name: '开发板', samples: 0, created: 1, read: true, kind: 'text', text: '你好' }
   expect(isChatMessage(m)).toBe(true)
   for (const patch of [{ samples: 1 }, { read: false }, { sender: 'browser' }, { text: ' ' }, { text: '字'.repeat(1001) }, { kind: 'html' }]) expect(isChatMessage({ ...m, ...patch })).toBe(false)
+})
+
+it('accepts saved recordings beyond the browser mic limit and validates split source ranges', () => {
+  const m = { id: 'long', sender: 'board', name: '开发板', samples: 8000 * 3600, created: 1, read: true, interrupted: true }
+  expect(isChatMessage(m)).toBe(true)
+  expect(isChatMessage({ ...m, audioSource: 'source', audioStart: 8000, audioTotal: m.samples + 8000 })).toBe(true)
+  for (const patch of [{ samples: 2 ** 31 }, { samples: 1.5 }, { interrupted: 'true' }, { audioSource: 'source' },
+    { audioSource: 'source', audioStart: -1, audioTotal: m.samples }, { audioSource: 'source', audioStart: 1, audioTotal: m.samples }]) {
+    expect(isChatMessage({ ...m, ...patch })).toBe(false)
+  }
 })

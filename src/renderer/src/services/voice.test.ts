@@ -67,3 +67,53 @@ describe('VoiceSequencePlayer', () => {
     expect(load).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('long voice WAV', () => {
+  it('preserves every PCM sample and length across bounded input chunks', async () => {
+    const { voiceWavChunks } = await import('./voice')
+    const { decodeMulaw } = await import('@shared/chat')
+    async function* chunks() { for (let i = 0; i < 21; i++) yield new Uint8Array(8000).fill(i === 20 ? 128 : 255); yield new Uint8Array([0]) }
+    const blob = await voiceWavChunks(chunks(), 168001), view = new DataView(await blob.arrayBuffer())
+    expect(blob.size).toBe(44 + 168001 * 2)
+    expect(view.getUint32(40, true)).toBe(168001 * 2)
+    expect(view.getInt16(44 + 160000 * 2, true)).toBe(32124)
+    expect(view.getInt16(blob.size - 2, true)).toBe(decodeMulaw(0))
+  })
+  it('rejects missing tails, overflow and cancellation', async () => {
+    const { voiceWavChunks } = await import('./voice')
+    async function* chunks() { yield new Uint8Array(10) }
+    await expect(voiceWavChunks(chunks(), 11)).rejects.toThrow('尾部')
+    await expect(voiceWavChunks(chunks(), 9)).rejects.toThrow('长度')
+    await expect(voiceWavChunks(chunks(), 10, () => false)).rejects.toThrow('取消')
+    await expect(voiceWavChunks(chunks(), 2 ** 31)).rejects.toThrow('WAV')
+  })
+})
+
+it('bounds sequential playback to three decoded blocks while a long recording is still downloading', async () => {
+  const sources: Array<{ onended: (() => void) | null; ended: boolean; stop(): void }> = [], lengths: number[] = []
+  let yielded = 0
+  vi.stubGlobal('AudioContext', class {
+    currentTime = 0
+    destination = {}
+    async resume() {}
+    async close() {}
+    createBuffer(_channels: number, length: number) { lengths.push(length); return { getChannelData: () => new Float32Array(length) } }
+    createBufferSource() {
+      const source = { onended: null as (() => void) | null, ended: false, buffer: null, connect() {}, start() {}, stop() { this.ended = true } }
+      sources.push(source); return source
+    }
+  })
+  try {
+    const player = new VoiceSequencePlayer()
+    async function* chunks() { for (let i = 0; i < 40; i++) { yielded++; yield new Uint8Array(8192).fill(255) } }
+    const done = player.play(['long'], chunks, vi.fn())
+    await vi.waitFor(() => expect(sources).toHaveLength(3))
+    expect(yielded).toBeLessThanOrEqual(4)
+    expect(Math.max(...lengths)).toBe(8192)
+    sources[0].ended = true; sources[0].onended?.()
+    await vi.waitFor(() => expect(sources).toHaveLength(4))
+    expect(yielded).toBeLessThanOrEqual(5)
+    player.stop(); await done
+    expect(sources.every(source => source.ended)).toBe(true)
+  } finally { vi.unstubAllGlobals() }
+})

@@ -637,6 +637,17 @@ typedef struct {
 
 #define DECODED_PCM_BYTES (AUDIO_SAMPLE_RATE * 120 / 1000 * sizeof(int16_t))
 #define DIALOGUE_REPLY_TIMEOUT_US 90000000LL
+#define VOICE_SILENCE_US 60000000LL
+#define VOICE_SESSION_US 3600000000LL
+
+static bool session_limit_reached(int64_t now, int64_t started, int64_t *last_voice, bool listening, bool vad)
+{
+    // Paused capture during thinking/playback is not user silence. A new
+    // listening turn gets a fresh window; the overall session clock never resets.
+    if (!listening || vad) *last_voice = now;
+    return now - started >= VOICE_SESSION_US ||
+        (listening && now - *last_voice >= VOICE_SILENCE_US);
+}
 
 static bool dialogue_audio_params(const cJSON *hello)
 {
@@ -885,6 +896,8 @@ static stt_event_kind_t transcribe(cJSON *provisioning)
     unsigned encoded_frames = 0;
     bool stop_sent = false, got_text = false, heard = false;
     int64_t stopped_at = 0, audio_check_at = 0;
+    const int64_t session_started = esp_timer_get_time();
+    int64_t last_voice = session_started;
     ok = ok && event;
     while (ok && !is_cancelled() && !stream_failed()) {
         const int64_t now = esp_timer_get_time();
@@ -905,6 +918,16 @@ static stt_event_kind_t transcribe(cJSON *provisioning)
         if (!ok || is_cancelled()) break;
         if (dialogue_session && !dialogue_next_turn(&dialogue, ws, session)) { ok = false; break; }
         if (!esp_websocket_client_is_connected(ws)) { log_failure("ws.connection_lost", ESP_ERR_INVALID_STATE); ok = false; break; }
+        if (!is_stopping()) {
+            audio_snapshot_t audio;
+            audio_get_snapshot(&audio);
+            if (session_limit_reached(now, session_started, &last_voice, capture_running(), audio.vad)) {
+                if (dialogue_session) { xiaozhi_dialogue_stop(); break; }
+                // Normal S7 stop flushes the final frame and retains the full
+                // recognition/display drain, just like a physical stop key.
+                xiaozhi_stt_stop();
+            }
+        }
         const bool stopping = is_stopping();
         portENTER_CRITICAL(&capture_lock);
         const size_t available = stream.size;

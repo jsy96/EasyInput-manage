@@ -109,6 +109,8 @@ static int prompt_length,spoken[128],spoken_count,beeps;
 static bool xiaozhi_stt_busy(void) { return worker_busy; }
 static bool xiaozhi_stt_pending(void *p) { (void)p;return pending_text; }
 static void *earliest_unread(void) { return unread ? &unread : NULL; }
+static bool recording_busy(void) { return mode==MODE_RECORDING; }
+static bool recording_capturing(void) { return mode==MODE_RECORDING; }
 static bool uploading(void) { return uploading_now; }
 static unsigned voice_outbox_count(void) { return 0; }
 static void append_prompt(int *ids,int *n,int p) { assert(*n<128);ids[(*n)++]=p; }

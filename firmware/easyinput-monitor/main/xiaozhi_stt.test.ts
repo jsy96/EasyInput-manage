@@ -888,6 +888,8 @@ it('keeps one continuous transcription session through multiple utterances and t
 #include "stt_stream.h"
 #define STT_JSON_BYTES 16384
 #define TEXT_BATCH_MAX 17
+#define VOICE_SILENCE_US 60000000LL
+#define VOICE_SESSION_US 3600000000LL
 #define AUDIO_SAMPLE_RATE 16000
 #define DECODED_PCM_BYTES 3840
 #define CODEC_STACK_BYTES 49152
@@ -929,7 +931,8 @@ static uint8_t pcm[8192];
 static stt_snapshot_t diagnostics;
 static int capture_lock, incoming=1, microphone_guard=2, codec_worker=3;
 static bool dialogue_session, connected, heard=true, connection_failure;
-static int64_t clock_us, stop_at, stop_sent_at;
+static int64_t clock_us, stop_at, stop_sent_at, loop_deadline;
+static unsigned automatic_stops;
 static unsigned listen_starts, listen_stops, aborts, binary_frames, speaker_calls, cleanup_calls;
 static const char *device="test-device", *client="test-client";
 static size_t ws_used, ws_expected, ws_frame_start;
@@ -951,6 +954,12 @@ static bool is_cancelled(void) { return false; }
 static bool stream_failed(void) { return false; }
 static bool capacity_exhausted(void) { return false; }
 static bool is_stopping(void) { return clock_us>=stop_at; }
+static bool capture_running(void) { return !is_stopping(); }
+void xiaozhi_stt_stop(void) {
+  assert(!is_stopping()); automatic_stops++; stop_at=clock_us;
+  const uint8_t tail[2]={1,2}; assert(stt_stream_write(&stream,tail,sizeof tail));
+}
+void xiaozhi_dialogue_stop(void) { assert(!"transcription must not cancel dialogue"); }
 static bool stop_capture(void) { cleanup_calls++;return true; }
 static void xSemaphoreTake(int h,int wait) { (void)h;(void)wait; }
 static void xSemaphoreGive(int h) { (void)h; }
@@ -964,7 +973,7 @@ static void vTaskDelay(int ticks) {
     uint8_t samples[1600]={0};assert(length<=sizeof(samples));
     assert(stt_stream_write(&stream,samples,length));
   }
-  clock_us=next;assert(clock_us<22000000);
+  clock_us=next;assert(clock_us<loop_deadline);
 }
 #undef strlcpy
 #define strlcpy stt_session_strlcpy
@@ -1031,6 +1040,7 @@ static bool dialogue_next_turn(dialogue_t *state,void *ws,const char *session) {
     const main = String.raw`
 static void reset(void) {
   memset(&diagnostics,0,sizeof(diagnostics));stt_stream_init(&stream,pcm,sizeof(pcm));
+  automatic_stops=0;loop_deadline=22000000;
   clock_us=0;stop_at=1000000;stop_sent_at=0;script_head=0;script_count=6;
   listen_starts=listen_stops=aborts=binary_frames=speaker_calls=cleanup_calls=row_count=0;
   connected=connection_failure=false;heard=true;
@@ -1049,12 +1059,71 @@ int main(void) {
   reset();connection_failure=true;assert(transcribe(provisioning)==STT_FAILED);
   assert(row_count==2 && !strcmp(rows[0],"first") && !strcmp(rows[1],"second"));
   assert(!listen_stops && listen_starts==1 && !speaker_calls && cleanup_calls==1);
+  // Automatic silence stop still transmits a final partial sample and waits
+  // the complete recognition window instead of aborting the transcript.
+  reset(); script_count=0; heard=false; stop_at=INT64_MAX; loop_deadline=81000000;
+  assert(transcribe(provisioning)==STT_EMPTY);
+  assert(automatic_stops==1 && stop_sent_at==VOICE_SILENCE_US && clock_us==VOICE_SILENCE_US+20000000);
+  assert(listen_stops==1 && stream.consumed==stream.accepted && stream.accepted%1920==2);
+  // Continuous VAD and successful recognition do not extend the one-hour cap.
+  reset(); script_count=1; stop_at=INT64_MAX; loop_deadline=VOICE_SESSION_US+21000000;
+  assert(transcribe(provisioning)==STT_FINISHED);
+  assert(automatic_stops==1 && stop_sent_at==VOICE_SESSION_US && clock_us==VOICE_SESSION_US+20000000);
+  assert(row_count==1 && stream.consumed==stream.accepted);
   cJSON_Delete(provisioning);puts("continuous transcription session passed");
 }
 `
-    writeFileSync(join(root, 'session.c'), prelude + '\n' + ['listen_frame', 'receive_message', 'transcribe'].map(extract).join('\n') + '\n' + main)
+    writeFileSync(join(root, 'session.c'), prelude + '\n' + ['session_limit_reached', 'listen_frame', 'receive_message', 'transcribe'].map(extract).join('\n') + '\n' + main)
     execFileSync('cc', ['-std=c11', '-Wall', '-Wextra', '-Werror', '-I', root, '-I', sourceDir,
       join(root, 'session.c'), join(sourceDir, 'stt_stream.c'), '-o', join(root, 'session')], { encoding: 'utf8' })
     expect(execFileSync(join(root, 'session'), { encoding: 'utf8' })).toContain('continuous transcription session passed')
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+it('bounds silent listening and total session time without counting Xiaozhi thinking or playback as silence', () => {
+  const root = mkdtempSync(join(tmpdir(), 'easyinput-session-limit-'))
+  try {
+    const source = readFileSync(resolve('firmware/easyinput-monitor/main/xiaozhi_stt.c'), 'utf8')
+    const start = source.indexOf('static bool session_limit_reached(')
+    const fn = source.slice(start, source.indexOf('\n}\n', start) + 3)
+    const limits = source.match(/^#define VOICE_(?:SILENCE|SESSION)_US .+$/gm)?.join('\n')
+    if (start < 0 || !limits) throw new Error('Missing session limits')
+    writeFileSync(join(root, 'limits.c'), `
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+${limits}
+${fn}
+int main(void) {
+  const int64_t started=1000000;
+  int64_t last=started;
+  assert(!session_limit_reached(started+20000000,started,&last,true,false));
+  assert(!session_limit_reached(started+VOICE_SILENCE_US-1,started,&last,true,false));
+  assert(session_limit_reached(started+VOICE_SILENCE_US,started,&last,true,false));
+  // Speech, including speech just before the boundary, grants a new window.
+  last=started;
+  const int64_t speech=started+VOICE_SILENCE_US-1;
+  assert(!session_limit_reached(speech,started,&last,true,true) && last==speech);
+  assert(!session_limit_reached(speech+VOICE_SILENCE_US-1,started,&last,true,false));
+  assert(session_limit_reached(speech+VOICE_SILENCE_US,started,&last,true,false));
+  // Many turns and a long reply do not prematurely close the next listening turn.
+  for(int turn=0;turn<8;turn++) {
+    const int64_t reply_end=started+(int64_t)(turn+1)*120000000;
+    assert(!session_limit_reached(reply_end,started,&last,false,false) && last==reply_end);
+    assert(!session_limit_reached(reply_end+VOICE_SILENCE_US-1,started,&last,true,false));
+  }
+  // A persistent VAD/noisy room cannot extend the absolute cap, including TTS.
+  assert(!session_limit_reached(started+VOICE_SESSION_US-1,started,&last,true,true));
+  assert(session_limit_reached(started+VOICE_SESSION_US,started,&last,true,true));
+  assert(session_limit_reached(started+VOICE_SESSION_US,started,&last,false,false));
+  // A new session starts with independent timestamps.
+  const int64_t next=started+VOICE_SESSION_US+1000000; last=next;
+  assert(!session_limit_reached(next,next,&last,true,false));
+  puts("voice silence and session limits passed");
+}
+`)
+    execFileSync('cc', ['-std=c11', '-Wall', '-Wextra', '-Werror', join(root, 'limits.c'), '-o', join(root, 'limits')])
+    expect(execFileSync(join(root, 'limits'), { encoding: 'utf8' })).toContain('voice silence and session limits passed')
   } finally { rmSync(root, { recursive: true, force: true }) }
 })

@@ -848,3 +848,201 @@ describe('ledger summaries by Beijing calendar day', () => {
     expect(board.frames.at(-1)).toMatchObject({ totals: [999, 0, 0] })
   })
 })
+
+describe('durable S5 recordings', () => {
+  const data = (length: number, offset = 0) => btoa(Array.from({ length }, (_, i) => String.fromCharCode((i + offset) % 256)).join(''))
+  async function append(board: Socket, id: string, offset: number, length: number): Promise<void> {
+    await chat(board, 'record.append', { id, offset, data: data(length, offset) })
+    expect(board.frames.at(-1)).toMatchObject({ op: 'record.ack', offset: offset + length })
+  }
+  it('streams past 20 seconds with no browser and publishes exactly once after a durable finish including the tail', async () => {
+    const board = socket('board'), id = 'long-recording', samples = 240017
+    await chat(board, 'record.begin', { id })
+    for (let offset = 0; offset < samples; offset += 6144) await append(board, id, offset, Math.min(6144, samples - offset))
+    expect(store.values.has(`voice-message:${id}`)).toBe(false)
+    expect(store.values.has(`clip:${id}`)).toBe(false)
+    expect(store.values.get(`record:${id}`)).toMatchObject({ samples })
+    await chat(board, 'record.finish', { id, samples: samples - 1, interrupted: false })
+    expect(board.frames.at(-1)?.op).toBe('error')
+    await chat(board, 'record.finish', { id, samples, interrupted: false })
+    expect(board.frames.at(-1)).toMatchObject({ op: 'record.ack', state: 'finished', offset: samples })
+    const browser = socket()
+    await chat(browser, 'list')
+    expect(browser.frames.at(-1)?.messages).toMatchObject([{ id, samples, read: true }])
+    await chat(board, 'record.finish', { id, samples, interrupted: false })
+    expect(browser.frames.filter(f => f.op === 'message')).toHaveLength(0)
+    const index = Math.floor((samples - 1) / 768)
+    await chat(browser, 'pullBatch', { id, index, count: 16 })
+    expect(browser.frames.at(-1)).toMatchObject({ chunks: [{ index, data: data(samples - index * 768, index * 768) }], complete: true })
+  })
+  it('retains exact offsets across ACK loss, rejects conflicting replay and out of order packets', async () => {
+    const board = socket('board'), browser = socket(), id = 'retry-recording'
+    await chat(board, 'record.begin', { id })
+    await append(board, id, 0, 1536)
+    await append(board, id, 0, 1536)
+    await chat(board, 'record.append', { id, offset: 0, data: btoa('x'.repeat(1536)) })
+    expect(board.frames.at(-1)?.op).toBe('error')
+    await chat(board, 'record.append', { id, offset: 2304, data: data(768) })
+    expect(board.frames.at(-1)?.op).toBe('error')
+    expect(store.values.has(`audio:${id}:3`)).toBe(false)
+    expect(browser.frames.some(f => f.op === 'message')).toBe(false)
+    await append(board, id, 1536, 1)
+    await chat(board, 'record.append', { id, offset: 2304, data: data(768) })
+    expect(board.frames.at(-1)?.op).toBe('error')
+  })
+  it('rolls back an append and a finish on storage failure, without an ACK or premature message', async () => {
+    const board = socket('board'), browser = socket(), id = 'atomic-recording'
+    await chat(board, 'record.begin', { id })
+    const put = store.put.getMockImplementation()!
+    store.put.mockImplementationOnce(async (key, value) => { await put(key, value); throw new Error('disk failure') })
+    await chat(board, 'record.append', { id, offset: 0, data: data(768) })
+    expect(board.frames.at(-1)?.op).toBe('error')
+    expect(store.values.has(`audio:${id}:0`)).toBe(false)
+    expect(store.values.get(`record:${id}`)).toMatchObject({ samples: 0 })
+    await append(board, id, 0, 768)
+    store.put.mockRejectedValueOnce(new Error('disk failure'))
+    await chat(board, 'record.finish', { id, samples: 768, interrupted: false })
+    expect(board.frames.at(-1)?.op).toBe('error')
+    expect(store.values.has(`voice-message:${id}`)).toBe(false)
+    expect(browser.frames.some(f => f.op === 'message')).toBe(false)
+    await chat(board, 'record.finish', { id, samples: 768, interrupted: false })
+    expect(browser.frames.filter(f => f.op === 'message')).toHaveLength(1)
+  })
+  it('cancels unfinished audio and tombstones late packets even after restart and clearing', async () => {
+    const board = socket('board'), id = 'cancel-recording'
+    await chat(board, 'record.begin', { id }); await append(board, id, 0, 768)
+    await chat(board, 'record.cancel', { id })
+    expect(board.frames.at(-1)).toMatchObject({ state: 'cancelled' })
+    expect(store.values.has(`audio:${id}:0`)).toBe(false)
+    room = new DeviceRoomV2({ storage: store, getWebSockets: () => sockets, blockConcurrencyWhile: async (fn: () => Promise<unknown>) => fn() } as unknown as DurableObjectState)
+    for (const op of ['record.begin', 'record.append', 'record.finish']) {
+      await chat(board, op, { id, offset: 0, data: data(768), samples: 768, interrupted: false })
+      expect(board.frames.at(-1)).toMatchObject({ state: 'cancelled' })
+    }
+    await chat(board, 'record.begin', { id: 'clear-active' }); await append(board, 'clear-active', 0, 768)
+    await room.fetch(new Request('https://room.internal/clear', { method: 'POST', headers: { 'X-EasyInput-Clear': '1' } }))
+    await chat(board, 'record.finish', { id: 'clear-active', samples: 768, interrupted: false })
+    expect(board.frames.at(-1)).toMatchObject({ state: 'cancelled' })
+    expect([...store.values.keys()].some(k => k.startsWith('voice-message:') || k.startsWith('audio:'))).toBe(false)
+  })
+  it('saves abandoned prefixes as interrupted by alarm with all sockets closed and reschedules active sessions', async () => {
+    const board = socket('board'), id = 'abandoned'
+    vi.spyOn(Date, 'now').mockReturnValue(100000)
+    await chat(board, 'record.begin', { id }); await append(board, id, 0, 768)
+    sockets = []; await room.alarm()
+    expect(store.setAlarm).toHaveBeenLastCalledWith(105000)
+    vi.spyOn(Date, 'now').mockReturnValue(191000)
+    await room.alarm()
+    expect(store.values.get(`voice-message:${id}`)).toMatchObject({ samples: 768, interrupted: true })
+    expect(store.values.has(`record:${id}`)).toBe(false)
+    await chat(board, 'record.finish', { id, samples: 768, interrupted: false })
+    expect(board.frames.at(-1)).toMatchObject({ state: 'finished', interrupted: true })
+  })
+  it('requires a direct board socket and accepts an empty finish without a phantom voice', async () => {
+    const browser = socket(), board = socket('board')
+    await chat(browser, 'record.begin', { id: 'forbidden' })
+    expect(browser.frames.at(-1)?.op).toBe('error')
+    await room.webSocketMessage(browser as unknown as WebSocket, JSON.stringify({ type: 'gateway', payload: { type: 'chat', protocol: 2, op: 'record.begin', id: 'bridge-forbidden', req: 'bridge' } }))
+    expect(store.values.has('record:bridge-forbidden')).toBe(false)
+    await chat(board, 'record.begin', { id: 'empty' })
+    await chat(board, 'record.finish', { id: 'empty', samples: 0, interrupted: false })
+    expect(store.values.has('voice-message:empty')).toBe(false)
+  })
+  it('splits saved long audio only on browser request, keeps unaligned boundaries and deduplicates retries', async () => {
+    const board = socket('board'), browser = socket(), id = 'split-source', samples = 20003
+    await chat(board, 'record.begin', { id })
+    for (let offset = 0; offset < samples; offset += 6144) await append(board, id, offset, Math.min(6144, samples - offset))
+    await chat(board, 'record.finish', { id, samples, interrupted: false })
+    await chat(board, 'split', { id, splitId: 'parts', seconds: 1 })
+    expect(board.frames.at(-1)?.op).toBe('error')
+    board.serializeAttachment({ role: 'board', last: Date.now() })
+    await chat(browser, 'split', { id, splitId: 'parts', seconds: 1 })
+    expect(board.frames.at(-1)).toMatchObject({ op: 'index.changed' })
+    expect(browser.frames.at(-1)).toMatchObject({ op: 'split.ack' })
+    expect(store.values.get('voice-message:parts_1')).toMatchObject({ samples: 8000, audioSource: id, audioStart: 8000 })
+    expect(store.values.get('voice-message:parts_2')).toMatchObject({ samples: 4003, audioStart: 16000 })
+    expect(store.values.has(`voice-message:${id}`)).toBe(false)
+    expect(store.values.has(`audio:${id}:0`)).toBe(true)
+    await chat(browser, 'pullBatch', { id: 'parts_1', index: 0, count: 16 })
+    const chunks = browser.frames.at(-1)?.chunks as Array<{ data: string }>
+    expect(chunks.map(c => atob(c.data)).join('')).toBe(atob(data(8000, 8000)))
+    await chat(browser, 'split', { id, splitId: 'parts', seconds: 1 })
+    expect([...store.values.keys()].filter(k => k.startsWith('voice-message:'))).toHaveLength(3)
+    await chat(board, 'record.finish', { id, samples, interrupted: false })
+    expect(store.values.has(`voice-message:${id}`)).toBe(false)
+    await chat(browser, 'split', { id: 'parts_1', splitId: 'bad-parts', seconds: 1 })
+    expect(browser.frames.at(-1)?.op).toBe('error')
+  })
+  it('prunes split parts without deleting shared legacy audio until its final reference is gone', async () => {
+    const browser = socket(), board = socket('board')
+    await upload(board, 'legacy-source')
+    const original = store.values.get('voice-message:legacy-source') as Record<string, unknown>
+    store.values.set('voice-message:legacy-source', { ...original, samples: 16000 })
+    store.values.set('clip:legacy-source', new Uint8Array(16000).fill(128).buffer)
+    const reload = () => { room = new DeviceRoomV2({ storage: store, getWebSockets: () => sockets, blockConcurrencyWhile: async (fn: () => Promise<unknown>) => fn() } as unknown as DurableObjectState) }
+    reload()
+    await chat(browser, 'split', { id: 'legacy-source', splitId: 'legacy-parts', seconds: 1 })
+    for (let i = 0; i < CHAT_LIMIT - 2; i++) store.values.set(`voice-message:filler-${i}`, { id: `filler-${i}`, sender: 'board', name: 'test', samples: 1, created: Date.now() + 10000 + i, read: true })
+    reload()
+    await chat(board, 'text.put', { id: 'prune-first', text: 'first' })
+    expect(store.values.has('voice-message:legacy-parts_0')).toBe(false)
+    await chat(browser, 'begin', { id: 'legacy-parts_0', samples: 900 })
+    expect(browser.frames.at(-1)?.op).toBe('error')
+    expect(store.values.has('clip:legacy-source')).toBe(true)
+    await chat(browser, 'pullBatch', { id: 'legacy-parts_1', index: 0, count: 16 })
+    expect(browser.frames.at(-1)?.op).toBe('chunks')
+    await chat(board, 'text.put', { id: 'prune-final', text: 'final' })
+    expect(store.values.has('voice-message:legacy-parts_1')).toBe(false)
+    expect(store.values.has('clip:legacy-source')).toBe(false)
+  })
+})
+
+it('reserves active and completed recording IDs against legacy upload and text writers', async () => {
+  const board = socket('board'), browser = socket(), id = 'reserved-recording'
+  await chat(board, 'record.begin', { id })
+  for (const writer of [board, browser]) {
+    await chat(writer, 'begin', { id, samples: 1 }); expect(writer.frames.at(-1)?.op).toBe('error')
+  }
+  await chat(board, 'text.put', { id, text: 'collision' }); expect(board.frames.at(-1)?.op).toBe('error')
+  await chat(board, 'record.cancel', { id })
+  await chat(board, 'begin', { id, samples: 1 }); expect(board.frames.at(-1)?.op).toBe('error')
+})
+
+
+it('resumes bounded cancelled-audio cleanup after object restart without open sockets', async () => {
+  const board = socket('board'), id = 'long-cancel'
+  await chat(board, 'record.begin', { id })
+  const data = btoa('x'.repeat(6144))
+  for (let offset = 0; offset < 6144 * 20; offset += 6144) await chat(board, 'record.append', { id, offset, data })
+  await chat(board, 'record.cancel', { id })
+  expect(board.frames.at(-1)).toMatchObject({ state: 'cancelled' })
+  expect(store.values.get(`audio-gc:${id}`)).toMatchObject({ next: 100 })
+  expect(store.values.has(`audio:${id}:0`)).toBe(false)
+  expect(store.values.has(`audio:${id}:159`)).toBe(true)
+  sockets = []
+  room = new DeviceRoomV2({ storage: store, getWebSockets: () => sockets, blockConcurrencyWhile: async (fn: () => Promise<unknown>) => fn() } as unknown as DurableObjectState)
+  await room.alarm()
+  expect(store.values.has(`audio-gc:${id}`)).toBe(false)
+  expect([...store.values.keys()].some(k => k.startsWith(`audio:${id}:`))).toBe(false)
+  await chat(board, 'record.begin', { id })
+  expect(board.frames.at(-1)).toMatchObject({ state: 'cancelled' })
+})
+
+
+it('acknowledges durable cancellation when optional audio cleanup fails and retries it by alarm', async () => {
+  const board = socket('board'), id = 'cleanup-retry'
+  await chat(board, 'record.begin', { id })
+  await chat(board, 'record.append', { id, offset: 0, data: btoa('x'.repeat(768)) })
+  const remove = store.delete.getMockImplementation()!
+  store.delete.mockImplementation(async keys => {
+    if (Array.isArray(keys) && keys.includes(`clip:${id}`)) throw new Error('cleanup unavailable')
+    await remove(keys)
+  })
+  await chat(board, 'record.cancel', { id })
+  expect(board.frames.at(-1)).toMatchObject({ op: 'record.ack', state: 'cancelled' })
+  expect(store.values.has(`audio-gc:${id}`)).toBe(true)
+  store.delete.mockImplementation(remove)
+  await room.alarm()
+  expect(store.values.has(`audio:${id}:0`)).toBe(false)
+  expect(store.values.has(`audio-gc:${id}`)).toBe(false)
+})

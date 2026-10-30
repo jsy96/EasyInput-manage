@@ -218,3 +218,35 @@ describe('displayed text receipts', () => {
     await confirmed
   })
 })
+
+describe('long voice chunks', () => {
+  const m = { id: 'long', sender: 'board', name: '开发板', samples: 240017, created: 1, read: true }
+  it('downloads validated bounded batches and the exact final tail', async () => {
+    const { chat, request } = connection()
+    request.mockImplementation(async (op, data) => {
+      expect(op).toBe('pullBatch')
+      const start = Number(data.index), total = Math.ceil(m.samples / 768), next = Math.min(start + 16, total)
+      return { op: 'chunks', id: m.id, next, complete: next === total,
+        chunks: Array.from({ length: next - start }, (_, i) => ({ index: start + i, data: btoa('a'.repeat(Math.min(768, m.samples - (start + i) * 768))) })) }
+    })
+    const sizes: number[] = []
+    for await (const bytes of chat.audioChunks(m)) { expect(bytes.every(b => b === 97)).toBe(true); sizes.push(bytes.length) }
+    expect(sizes.reduce((a, b) => a + b, 0)).toBe(m.samples)
+    expect(Math.max(...sizes)).toBe(768 * 16)
+    expect(sizes.at(-1)).toBe(6545)
+  })
+  it('rejects missing chunks, false completion, wrong IDs, duplicate indexes and truncated tails', async () => {
+    const small = { ...m, samples: 769 }
+    const good = { op: 'chunks', id: m.id, next: 2, complete: true, chunks: [{ index: 0, data: btoa('a'.repeat(768)) }, { index: 1, data: btoa('b') }] }
+    for (const patch of [{ id: 'other' }, { next: 1 }, { complete: false }, { chunks: good.chunks.slice(0, 1) },
+      { chunks: [good.chunks[0], good.chunks[0]] }, { chunks: [good.chunks[0], { index: 1, data: btoa('bb') }] }]) {
+      const { chat, request } = connection(); request.mockResolvedValue({ ...good, ...patch })
+      await expect(chat.download(small)).rejects.toThrow()
+    }
+  })
+  it('sends a stable browser split ID for idempotent retry', async () => {
+    const { chat, request } = connection(); request.mockResolvedValue({ op: 'split.ack', id: m.id })
+    await chat.split(m, 10, 'stable-split'); await chat.split(m, 10, 'stable-split')
+    expect(request.mock.calls).toEqual(Array(2).fill(['split', { id: m.id, seconds: 10, splitId: 'stable-split' }]))
+  })
+})

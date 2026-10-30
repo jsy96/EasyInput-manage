@@ -33,6 +33,7 @@ export class ChatConnection {
   private lastPong = 0
   private pending = new Map<string, { resolve: (f: Frame) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>()
   private realtimeListeners = new Set<(event: RealtimeEvent) => void>()
+  private splitRequests = new Map<string, string>()
   private uploadBusy = false
   private historyLoading = false
   private generation = 0
@@ -277,13 +278,40 @@ export class ChatConnection {
       after = Number(page.next)
     }
   }
-  async download(m: ChatMessage): Promise<Uint8Array> {
-    if (!isVoiceMessage(m)) throw new Error('文字消息没有语音文件')
-    const out = new Uint8Array(m.samples)
-    for (let start = 0; start * AUDIO_CHUNK < m.samples; start += AUDIO_BATCH) {
+  async split(m: ChatMessage, seconds: number, splitId?: string): Promise<void> {
+    const key = `${m.id}:${seconds}`
+    splitId ??= this.splitRequests.get(key) ?? crypto.randomUUID()
+    this.splitRequests.set(key, splitId)
+    while (this.splitRequests.size > 128) this.splitRequests.delete(this.splitRequests.keys().next().value!)
+    const ack = await this.request('split', { id: m.id, seconds, splitId })
+    if (ack.op !== 'split.ack' || ack.id !== m.id) throw new Error('分割确认异常，请刷新历史')
+  }
+  async *audioChunks(m: ChatMessage): AsyncGenerator<Uint8Array> {
+    if (!isVoiceMessage(m) || !isChatMessage(m)) throw new Error('这条消息没有可用的语音文件')
+    const generation = this.generation, total = Math.ceil(m.samples / AUDIO_CHUNK)
+    for (let start = 0; start < total; start += AUDIO_BATCH) {
+      if (generation !== this.generation || this.pruned.has(m.id)) throw new Error('语音历史已变更，请重新加载')
       const v = await this.request('pullBatch', { id: m.id, index: start, count: AUDIO_BATCH })
-      for (const chunk of v.chunks as Array<{ index: number; data: string }>) out.set(fromBase64(chunk.data), chunk.index * AUDIO_CHUNK)
+      const end = Math.min(total, start + AUDIO_BATCH)
+      if (generation !== this.generation || this.pruned.has(m.id) || v.op !== 'chunks' || v.id !== m.id ||
+        !Array.isArray(v.chunks) || v.chunks.length !== end - start || v.next !== end || v.complete !== (end === total)) throw new Error('语音分片响应不完整')
+      const bytes = new Uint8Array(Math.min((end - start) * AUDIO_CHUNK, m.samples - start * AUDIO_CHUNK))
+      for (const [i, raw] of v.chunks.entries()) {
+        const chunk = raw as { index?: unknown; data?: unknown }
+        if (chunk.index !== start + i || typeof chunk.data !== 'string' || chunk.data.length > AUDIO_CHUNK / 3 * 4 ||
+          !/^[A-Za-z0-9+/]+={0,2}$/.test(chunk.data)) throw new Error('语音分片内容异常')
+        const part = fromBase64(chunk.data)
+        if (part.length !== Math.min(AUDIO_CHUNK, m.samples - (start + i) * AUDIO_CHUNK)) throw new Error('语音尾部长度异常')
+        bytes.set(part, i * AUDIO_CHUNK)
+      }
+      yield bytes
     }
+  }
+  async download(m: ChatMessage): Promise<Uint8Array> {
+    if (m.samples > 16 * 1024 * 1024) throw new Error('长语音请使用分片下载')
+    const out = new Uint8Array(m.samples)
+    let offset = 0
+    for await (const bytes of this.audioChunks(m)) { out.set(bytes, offset); offset += bytes.length }
     return out
   }
   dispose(): void {
