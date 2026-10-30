@@ -6,6 +6,8 @@
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
 #include "esp_timer.h"
+#include "esp_log.h"
+#include "nvs.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -22,6 +24,8 @@
 #define LIVE_FRAME_FRAMES (AUDIO_SAMPLE_RATE / 50)
 #define LIVE_FRAME_BYTES (LIVE_FRAME_FRAMES * sizeof(int16_t))
 #define PCM_BUFFER_FRAMES (AUDIO_SAMPLE_RATE * 4)
+#define VOLUME_SAVE_DELAY_US 750000LL
+#define VOLUME_SAVE_ATTEMPTS 3
 // Six DMA blocks can still be in flight after the last write returns.
 #define TONE_DRAIN_US (6LL * AUDIO_BLOCK_FRAMES * 1000000 / AUDIO_SAMPLE_RATE + 20000)
 
@@ -31,6 +35,8 @@ static const uint8_t *voice_buffer;
 static size_t voice_length;
 static size_t voice_available;
 static uint32_t voice_frame;
+static uint32_t voice_target_frames;
+static bool voice_loop;
 static int64_t record_deadline_us;
 static uint8_t mulaw_encode(int sample)
 {
@@ -65,6 +71,8 @@ static uint32_t tone_frame;
 static uint32_t tone_target_frames;
 static float tone_frequency;
 static uint8_t tone_volume;
+static uint32_t notification_frame, notification_target_frames;
+static bool notification_only;
 static int64_t tone_drain_until_us;
 static audio_microphone_sink_t live_sink;
 static int16_t live_chunk[LIVE_FRAME_FRAMES];
@@ -73,6 +81,48 @@ static size_t live_chunk_frames;
 static int16_t *pcm_buffer;
 static size_t pcm_head, pcm_size;
 static bool pcm_active, pcm_finished;
+static bool volume_dirty;
+static uint8_t saved_volume;
+static unsigned volume_save_attempts;
+static int64_t volume_save_at;
+
+static void load_volume(void)
+{
+    state.volume = 20;
+    nvs_handle_t handle;
+    if (nvs_open("audio", NVS_READONLY, &handle) == ESP_OK) {
+        uint8_t stored;
+        if (nvs_get_u8(handle, "volume", &stored) == ESP_OK && stored <= 100) state.volume = stored;
+        nvs_close(handle);
+    }
+    saved_volume = state.volume;
+    volume_dirty = false;
+    volume_save_attempts = 0;
+}
+
+// Called with audio_mutex held, only while both I2S consumers are idle.
+// Coalesce encoder ticks and never write Flash during capture or playback.
+static void save_volume_if_idle(int64_t now)
+{
+    if (!volume_dirty || state.microphone_active || state.speaker_playing || now < volume_save_at) return;
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open("audio", NVS_READWRITE, &handle);
+    const char *stage = "open";
+    if (result == ESP_OK) {
+        stage = "set";
+        result = nvs_set_u8(handle, "volume", state.volume);
+        if (result == ESP_OK) { stage = "commit"; result = nvs_commit(handle); }
+        nvs_close(handle);
+    }
+    if (result == ESP_OK) {
+        saved_volume = state.volume;
+        volume_dirty = false;
+    } else {
+        ESP_LOGE("audio", "Volume NVS %s failed: %s (0x%x)", stage, esp_err_to_name(result), (unsigned)result);
+        if (++volume_save_attempts >= VOLUME_SAVE_ATTEMPTS) volume_dirty = false;
+        else volume_save_at = now + VOLUME_SAVE_DELAY_US;
+    }
+}
 
 // Called only with audio_mutex held, after the current I2S block has been
 // delivered. Preserve the final short block before detaching the consumer.
@@ -120,6 +170,8 @@ static esp_err_t stop_channel(bool microphone)
         voice_until_us = 0;
     } else {
         state.speaker_playing = false;
+        notification_frame = notification_target_frames = 0;
+        notification_only = false;
         pcm_active = pcm_finished = false;
         pcm_head = pcm_size = 0;
     }
@@ -198,6 +250,37 @@ static void update_microphone(size_t frames, int64_t now)
     state.vad = now < voice_until_us;
 }
 
+// Overlay the minute cue in the same I2S stream, including during alarm music.
+// Clamp the sum rather than wrapping loud music into a clipped negative sample.
+static void mix_notification(size_t frames)
+{
+    for (size_t i = 0; i < frames && notification_frame < notification_target_frames; i++, notification_frame++) {
+        const uint32_t remaining = notification_target_frames - 1 - notification_frame;
+        const float fade = fminf(1.0f, (float)(notification_frame < remaining ? notification_frame : remaining) / TONE_FADE_FRAMES);
+        const int tone = (int)(32767.0f * 0.18f * fade * sinf(2.0f * 3.14159265358979323846f * 880.0f * notification_frame / AUDIO_SAMPLE_RATE));
+        int mixed = speaker_samples[i * 2] + tone;
+        if (mixed > INT16_MAX) mixed = INT16_MAX;
+        if (mixed < INT16_MIN) mixed = INT16_MIN;
+        speaker_samples[i * 2] = speaker_samples[i * 2 + 1] = (int16_t)mixed;
+    }
+}
+
+static bool notification_tail_step(void)
+{
+    size_t frames = notification_target_frames - notification_frame;
+    if (!frames) return false;
+    if (frames > AUDIO_BLOCK_FRAMES) frames = AUDIO_BLOCK_FRAMES;
+    memset(speaker_samples, 0, frames * 2 * sizeof(int16_t));
+    mix_notification(frames);
+    size_t written = 0;
+    const esp_err_t result = i2s_channel_write(speaker_channel, speaker_samples, frames * 4, &written, AUDIO_IO_TIMEOUT_MS);
+    if (result != ESP_OK || written != frames * 4) {
+        state.speaker_error = result != ESP_OK ? result : ESP_ERR_TIMEOUT;
+        (void)stop_channel(false);
+    } else tone_drain_until_us = esp_timer_get_time() + TONE_DRAIN_US;
+    return true;
+}
+
 // Called with audio_mutex held. A temporary network underrun keeps the session
 // open; only EOF plus an empty queue and drained DMA is a successful playback.
 static bool pcm_playback_step(void)
@@ -209,6 +292,7 @@ static bool pcm_playback_step(void)
             const int16_t sample = (int32_t)pcm_buffer[(pcm_head + i) % PCM_BUFFER_FRAMES] * state.volume / 100;
             speaker_samples[i * 2] = speaker_samples[i * 2 + 1] = sample;
         }
+        mix_notification(frames);
         size_t written = 0;
         const esp_err_t result = i2s_channel_write(speaker_channel, speaker_samples,
             frames * 2 * sizeof(int16_t), &written, AUDIO_IO_TIMEOUT_MS);
@@ -222,12 +306,37 @@ static bool pcm_playback_step(void)
         }
         return true;
     }
+    if (notification_frame < notification_target_frames) return notification_tail_step();
     if (pcm_finished && esp_timer_get_time() >= tone_drain_until_us) {
         const esp_err_t result = stop_channel(false);
         if (result != ESP_OK) state.speaker_error = result;
         else state.voice_completed = true;
     }
     return false;
+}
+
+static bool voice_playback_step(void)
+{
+    state.stage = 5;
+    size_t frames = voice_target_frames - voice_frame;
+    if (!voice_loop && frames > voice_available * 2 - voice_frame) frames = voice_available * 2 - voice_frame;
+    if (frames > AUDIO_BLOCK_FRAMES) frames = AUDIO_BLOCK_FRAMES;
+    for (size_t i = 0; i < frames; i++) {
+        const size_t sample_index = ((voice_frame + i) / 2) % voice_length;
+        const int16_t sample = mulaw_decode(voice_buffer[sample_index]) * state.volume / 100;
+        speaker_samples[i * 2] = speaker_samples[i * 2 + 1] = sample;
+    }
+    mix_notification(frames);
+    size_t written = 0;
+    const esp_err_t result = i2s_channel_write(speaker_channel, speaker_samples, frames * 4, &written, AUDIO_IO_TIMEOUT_MS);
+    if (result != ESP_OK || written != frames * 4) {
+        state.speaker_error = result != ESP_OK ? result : ESP_ERR_TIMEOUT;
+        (void)stop_channel(false);
+    } else {
+        voice_frame += frames;
+        if (voice_frame == voice_target_frames) tone_drain_until_us = esp_timer_get_time() + TONE_DRAIN_US;
+    }
+    return true;
 }
 
 static void audio_task(void *arg)
@@ -291,24 +400,9 @@ static void audio_task(void *arg)
         }
         if (pcm_active) {
             did_io = pcm_playback_step() || did_io;
-        } else if (state.speaker_playing && voice_buffer != NULL && voice_frame < voice_available * 2) {
-            state.stage = 5;
-            did_io = true;
-            size_t frames = voice_length * 2 - voice_frame;
-            if (frames > AUDIO_BLOCK_FRAMES) frames = AUDIO_BLOCK_FRAMES;
-            for (size_t i = 0; i < frames; i++) {
-                const int16_t sample = mulaw_decode(voice_buffer[(voice_frame + i) / 2]) * state.volume / 100;
-                speaker_samples[i * 2] = speaker_samples[i * 2 + 1] = sample;
-            }
-            size_t written = 0;
-            esp_err_t result = i2s_channel_write(speaker_channel, speaker_samples, frames * 4, &written, AUDIO_IO_TIMEOUT_MS);
-            if (result != ESP_OK || written != frames * 4) {
-                state.speaker_error = result != ESP_OK ? result : ESP_ERR_TIMEOUT;
-                (void)stop_channel(false);
-            } else {
-                voice_frame += frames;
-                if (voice_frame == voice_length * 2) tone_drain_until_us = esp_timer_get_time() + TONE_DRAIN_US;
-            }
+        } else if (state.speaker_playing && voice_buffer != NULL &&
+                   voice_frame < voice_target_frames && (voice_loop || voice_frame < voice_available * 2)) {
+            did_io = voice_playback_step() || did_io;
         } else if (state.speaker_playing && voice_buffer == NULL && tone_frame < tone_target_frames) {
             state.stage = 6;
             did_io = true;
@@ -322,6 +416,7 @@ static void audio_task(void *arg)
                 speaker_samples[i * 2] = sample;
                 speaker_samples[i * 2 + 1] = sample;
             }
+            mix_notification(frames);
             size_t written = 0;
             const esp_err_t result = i2s_channel_write(speaker_channel, speaker_samples, frames * 2 * sizeof(int16_t), &written, AUDIO_IO_TIMEOUT_MS);
             if (result != ESP_OK || written != frames * 2 * sizeof(int16_t)) {
@@ -331,8 +426,10 @@ static void audio_task(void *arg)
                 tone_frame += frames;
                 if (tone_frame == tone_target_frames) tone_drain_until_us = esp_timer_get_time() + TONE_DRAIN_US;
             }
+        } else if (state.speaker_playing && notification_frame < notification_target_frames) {
+            did_io = notification_tail_step() || did_io;
         } else if (state.speaker_playing && voice_buffer != NULL &&
-                   voice_frame >= voice_length * 2 && esp_timer_get_time() >= tone_drain_until_us) {
+                   voice_frame >= voice_target_frames && esp_timer_get_time() >= tone_drain_until_us) {
             const esp_err_t result = stop_channel(false);
             if (result != ESP_OK) state.speaker_error = result;
             else state.voice_completed = true;
@@ -341,6 +438,7 @@ static void audio_task(void *arg)
             const esp_err_t result = stop_channel(false);
             if (result != ESP_OK) state.speaker_error = result;
         }
+        save_volume_if_idle(esp_timer_get_time());
         xSemaphoreGive(audio_mutex);
         // DMA paces active I/O. Give equal-priority mutex waiters a chance to
         // run before reacquiring the lock, without adding a whole tick delay.
@@ -355,7 +453,7 @@ static void audio_task(void *arg)
 
 esp_err_t audio_init(void)
 {
-    state.volume = 20;
+    load_volume();
     audio_mutex = xSemaphoreCreateMutex();
     if (!audio_mutex) return ESP_ERR_NO_MEM;
     state.ready = true;
@@ -416,11 +514,31 @@ esp_err_t audio_set_microphone(bool on)
     return result;
 }
 
-typedef struct { uint8_t volume; uint16_t duration_ms; float frequency; } tone_context_t;
+typedef struct { uint8_t volume; uint16_t duration_ms; float frequency; bool overlay; } tone_context_t;
 static esp_err_t start_test(void *arg)
 {
     const tone_context_t *context = arg;
     xSemaphoreTake(audio_mutex, portMAX_DELAY);
+    if (context->overlay) {
+        esp_err_t result = ESP_OK;
+        if (!state.speaker_playing) {
+            result = start_channel(false);
+            state.speaker_error = result;
+            if (result == ESP_OK) {
+                voice_buffer = NULL;
+                tone_frame = tone_target_frames = 0;
+                notification_only = true;
+                state.speaker_playing = true;
+                tone_drain_until_us = 0;
+            }
+        }
+        if (result == ESP_OK) {
+            notification_frame = 0;
+            notification_target_frames = (uint32_t)AUDIO_SAMPLE_RATE * context->duration_ms / 1000;
+        }
+        xSemaphoreGive(audio_mutex);
+        return result;
+    }
     const esp_err_t result = start_channel(false);
     state.speaker_error = result;
     if (result == ESP_OK) {
@@ -447,13 +565,32 @@ esp_err_t audio_play_test(uint8_t volume)
 
 esp_err_t audio_play_beep(uint16_t duration_ms, bool strong)
 {
-    if (duration_ms < 30 || duration_ms > 500 || !audio_mutex || !state.ready) return ESP_ERR_INVALID_ARG;
+    if (duration_ms < 30 || duration_ms > 1000 || !audio_mutex || !state.ready) return ESP_ERR_INVALID_ARG;
     const tone_context_t context = {
         .volume = strong ? 32 : 18,
         .duration_ms = duration_ms,
         .frequency = strong ? 660.0f : 880.0f,
     };
     return lights_with_shared_power(start_test, (void *)&context);
+}
+
+esp_err_t audio_play_notification(uint16_t duration_ms)
+{
+    if (duration_ms < 30 || duration_ms > 1000 || !audio_mutex || !state.ready) return ESP_ERR_INVALID_ARG;
+    const tone_context_t context = {.volume = 18, .duration_ms = duration_ms, .frequency = 880.0f, .overlay = true};
+    return lights_with_shared_power(start_test, (void *)&context);
+}
+
+esp_err_t audio_stop_notification(void)
+{
+    if (!audio_mutex || !state.ready) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(audio_mutex, portMAX_DELAY);
+    notification_frame = notification_target_frames = 0;
+    const esp_err_t result = notification_only && state.speaker_playing ? stop_channel(false) : ESP_OK;
+    notification_only = false;
+    if (result != ESP_OK) state.speaker_error = result;
+    xSemaphoreGive(audio_mutex);
+    return result;
 }
 
 esp_err_t audio_stop_speaker(void)
@@ -478,7 +615,7 @@ esp_err_t audio_prepare_power_off(void)
     return mic_result != ESP_OK ? mic_result : spk_result;
 }
 
-typedef struct { const uint8_t *buffer; size_t length; size_t available; } voice_context_t;
+typedef struct { const uint8_t *buffer; size_t length; size_t available; uint32_t repeat_frames; } voice_context_t;
 static esp_err_t start_voice(void *arg)
 {
     const voice_context_t *context = arg;
@@ -489,6 +626,8 @@ static esp_err_t start_voice(void *arg)
     if (result == ESP_OK) {
         voice_buffer = context->buffer; voice_length = context->length;
         voice_available = context->available;
+        voice_loop = context->repeat_frames != 0;
+        voice_target_frames = voice_loop ? context->repeat_frames : context->length * 2;
         state.voice_completed = false;
         state.speaker_playing = true;
         voice_frame = 0;
@@ -503,6 +642,14 @@ esp_err_t audio_play_voice(const uint8_t *buffer, size_t length)
     const voice_context_t context = {.buffer = buffer, .length = length, .available = length};
     return lights_with_shared_power(start_voice, (void *)&context);
 }
+esp_err_t audio_play_voice_loop(const uint8_t *buffer, size_t length, uint32_t duration_ms)
+{
+    if (!buffer || !length || length > 480000 || !duration_ms || duration_ms > 60000) return ESP_ERR_INVALID_ARG;
+    const voice_context_t context = {.buffer = buffer, .length = length, .available = length,
+        .repeat_frames = (uint32_t)((uint64_t)AUDIO_SAMPLE_RATE * duration_ms / 1000)};
+    return lights_with_shared_power(start_voice, (void *)&context);
+}
+
 esp_err_t audio_play_voice_stream(const uint8_t *buffer, size_t length, size_t available)
 {
     if (buffer == NULL || length == 0 || length > 480000 || available == 0 || available > length) return ESP_ERR_INVALID_ARG;
@@ -522,7 +669,7 @@ static esp_err_t start_pcm(void *arg)
 {
     (void)arg;
     xSemaphoreTake(audio_mutex, portMAX_DELAY);
-    if (state.recording || state.speaker_playing) {
+    if (state.recording || (state.speaker_playing && !notification_only)) {
         xSemaphoreGive(audio_mutex);
         return ESP_ERR_INVALID_STATE;
     }
@@ -533,9 +680,13 @@ static esp_err_t start_pcm(void *arg)
         xSemaphoreGive(audio_mutex);
         return ESP_ERR_NO_MEM;
     }
-    const esp_err_t result = start_channel(false);
+    // A minute cue may have started while this stream was prebuffering.
+    // Reuse its running channel and DMA, preserving the whole audible cue.
+    const bool adopt_notification = notification_only && state.speaker_playing;
+    const esp_err_t result = adopt_notification ? ESP_OK : start_channel(false);
     state.speaker_error = result;
     if (result == ESP_OK) {
+        notification_only = false;
         pcm_head = pcm_size = 0;
         pcm_active = true;
         pcm_finished = false;
@@ -587,7 +738,12 @@ esp_err_t audio_set_volume(uint8_t volume)
 {
     if (!audio_mutex || volume > 100) return ESP_ERR_INVALID_ARG;
     xSemaphoreTake(audio_mutex, portMAX_DELAY);
-    state.volume = volume;
+    if (state.volume != volume || (!volume_dirty && saved_volume != volume)) {
+        state.volume = volume;
+        volume_dirty = volume != saved_volume;
+        volume_save_attempts = 0;
+        volume_save_at = esp_timer_get_time() + VOLUME_SAVE_DELAY_US;
+    }
     xSemaphoreGive(audio_mutex);
     return ESP_OK;
 }

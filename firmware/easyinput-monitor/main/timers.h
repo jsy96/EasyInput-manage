@@ -9,6 +9,7 @@ typedef enum {
     TIMER_EVENT_MINUTE = 1 << 1,
     TIMER_EVENT_DONE = 1 << 2,
     TIMER_EVENT_ALARM = 1 << 3,
+    TIMER_EVENT_STOPWATCH_MINUTE = 1 << 4,
 } timer_event_t;
 
 void timers_init(void);

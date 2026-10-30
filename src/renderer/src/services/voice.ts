@@ -95,7 +95,7 @@ export class VoiceSequencePlayer {
     finally { if (active()) this.stop() }
   }
 }
-/** Capture PCM in an AudioWorklet so the twenty-second cutoff does not depend on a foreground tab. */
+/** Capture PCM in an AudioWorklet so the sixty-second cutoff does not depend on a foreground tab. */
 export class VoiceRecorder {
   private stream: MediaStream | null = null
   private context: AudioContext | null = null
@@ -126,11 +126,11 @@ export class VoiceRecorder {
         if (event.data === 'done') { this.stop(); return }
         if (!(event.data instanceof Float32Array) || this.stopped) return
         this.parts.push(event.data); this.frames += event.data.length
-        this.changed(Math.min(20, this.frames / context.sampleRate))
+        this.changed(Math.min(AUDIO_LIMIT / AUDIO_RATE, this.frames / context.sampleRate))
       }
       source.connect(node); node.connect(context.destination)
       await context.resume()
-      this.timer = setTimeout(() => this.stop(), 20000)
+      this.timer = setTimeout(() => this.stop(), AUDIO_LIMIT / AUDIO_RATE * 1000)
     } catch (error) { this.dispose(); throw error } finally { this.starting = false }
   }
   stop(): void {

@@ -7,9 +7,9 @@ describe('captureSampleLimit', () => {
     expect(captureSampleLimit(8000)).toBe(AUDIO_LIMIT)
   })
 
-  it('allows a full twenty seconds at common browser capture rates', () => {
-    expect(captureSampleLimit(44100)).toBe(882000)
-    expect(captureSampleLimit(48000)).toBe(960000)
+  it('allows a full sixty seconds at common browser capture rates', () => {
+    expect(captureSampleLimit(44100)).toBe(2646000)
+    expect(captureSampleLimit(48000)).toBe(2880000)
   })
 
   it('rejects invalid rates', () => {

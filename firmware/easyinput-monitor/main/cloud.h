@@ -13,9 +13,18 @@ typedef struct {
     unsigned realtime_chunks_sent;
     unsigned realtime_chunks_failed;
     unsigned realtime_chunks_dropped;
+    unsigned connections;
+    unsigned disconnects;
+    unsigned errors;
+    int last_tls_error;
+    int last_socket_errno;
+    int last_http_status;
+    int last_close_code;
 } cloud_monitor_stats_t;
 
 void cloud_monitor_init(void);
+// May be called before init; only a station with a valid IP can open cloud WSS.
+void cloud_monitor_set_network_ready(bool ready);
 void cloud_monitor_send(const char *line);
 bool cloud_monitor_send_immediate(const char *line);
 bool cloud_monitor_send_binary(const uint8_t *data, size_t length);

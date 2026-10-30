@@ -45,6 +45,30 @@ beforeEach(() => {
 })
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks() })
 describe('shared voice room', () => {
+  it('saves browser ASR with its real author, splits on Unicode boundaries and deduplicates a retry', async () => {
+    const browser = socket()
+    const save = (room as unknown as { saveTranscription(id: string, sender: { id: string; name: string }, text: string): Promise<void> }).saveTranscription.bind(room)
+    const text = 'a'.repeat(999) + '😀' + '最后一句'
+    await save('web-asr', { id: 'client', name: '电脑' }, text)
+    await save('web-asr', { id: 'client', name: '电脑' }, text)
+    const added = browser.frames.filter(f => f.op === 'message')
+    expect(added).toHaveLength(2)
+    expect(added[0]).toMatchObject({ unread: 0, message: { sender: 'client', name: '电脑', kind: 'text', read: true, text: 'a'.repeat(999) } })
+    expect(added[1]).toMatchObject({ message: { text: '😀最后一句' } })
+    await chat(browser, 'text.put', { id: 'fake-asr', text: '伪造识别文字' })
+    expect(browser.frames.at(-1)?.op).toBe('error')
+  })
+  it('does not acknowledge or partially save ASR when durable storage fails', async () => {
+    const browser = socket()
+    await chat(browser, 'list')
+    const save = (room as unknown as { saveTranscription(id: string, sender: { id: string; name: string }, text: string): Promise<void> }).saveTranscription.bind(room)
+    store.put.mockRejectedValueOnce(new Error('Synthetic storage failure'))
+    await expect(save('asr-retry', { id: 'client', name: '电脑' }, '识别文字')).rejects.toThrow('Synthetic')
+    expect(store.values.has('asr-complete:asr-retry')).toBe(false)
+    expect(browser.frames.filter(f => f.op === 'message')).toHaveLength(0)
+    await save('asr-retry', { id: 'client', name: '电脑' }, '识别文字')
+    expect(browser.frames.filter(f => f.op === 'message')).toHaveLength(1)
+  })
   const entry = { id: 'd'.repeat(32), amount: 273, recordedAt: null, uptimeMs: 12345 }
   it('persists ledger entries, deduplicates retries after restart and retains repeated amounts as distinct records', async () => {
     const board = socket('board'), browser = socket()
@@ -282,16 +306,18 @@ describe('shared voice room', () => {
     expect(store.values.has('clip:committed-voice')).toBe(true)
     expect(store.values.has('upload:committed-voice')).toBe(false)
   })
-  it('commits and reads the maximum 20-second clip with the exact final remainder', async () => {
-    const browser = socket(), samples = 160000
+  it('commits and reads the maximum 60-second clip and rejects overflow', async () => {
+    const browser = socket(), samples = 480000
+    await chat(browser, 'begin', { id: 'too-long', samples: samples + 1 })
+    expect(browser.frames.at(-1)).toMatchObject({ op: 'error', message: '语音必须在 60 秒以内' })
     const chunks = Array.from({ length: Math.ceil(samples / 768) }, (_, index) => ({ index, data: btoa(String.fromCharCode(128 + index % 64).repeat(Math.min(768, samples - index * 768))) }))
     await chat(browser, 'begin', { id: 'max-duration', samples })
     for (let i = 0; i < chunks.length; i += 16) await chat(browser, 'chunks', { id: 'max-duration', chunks: chunks.slice(i, i + 16) })
     await chat(browser, 'commit', { id: 'max-duration' })
     expect((store.values.get('clip:max-duration') as ArrayBuffer).byteLength).toBe(samples)
-    await chat(browser, 'pullBatch', { id: 'max-duration', index: 208, count: 16 })
-    expect(browser.frames.at(-1)).toMatchObject({ complete: true, next: 209, chunks: [{ index: 208, data: chunks[208].data }] })
-    expect(atob(chunks[208].data)).toHaveLength(256)
+    await chat(browser, 'pullBatch', { id: 'max-duration', index: 624, count: 16 })
+    expect(browser.frames.at(-1)).toMatchObject({ complete: true, next: 625, chunks: [{ index: 624, data: chunks[624].data }] })
+    expect(atob(chunks[624].data)).toHaveLength(768)
   })
   it('persists each measurement once after a lost acknowledgement and across room restarts', async () => {
     const board = socket('board'), browser = socket()

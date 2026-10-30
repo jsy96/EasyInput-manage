@@ -596,8 +596,8 @@ export default function App(): React.JSX.Element {
             <div className="device-status-grid">
               <div><Bell size={17} /><span>每日闹钟</span><strong>{formatTime(alarmMinute)}</strong><small>{alarmMinute === null || alarmMinute === undefined ? '短按 S3，旋钮调节后静置保存' : '北京时间 · 长按 S3 1.2 秒取消'}</small></div>
               <div><Timer size={17} /><span>倒计时</span><strong>{countdownSeconds ? `${Math.ceil(countdownSeconds / 60)} 分钟` : '未运行'}</strong><small>{countdownSeconds ? 'S1～S7／旋钮取消，S8 独立计时' : '短按 S4，旋钮调整 1～60 分钟'}</small></div>
-              <div><Timer size={17} /><span>正计时{currentStatus.voice?.stopwatch_running ? ' · 运行中' : ''}</span><strong>{stopwatchTime}</strong><small>短按 S8 开始／停止；停止后播报总时长，重启归零。数值随设备状态更新。</small></div>
-              <div><Radio size={17} /><span>实时监听状态</span><strong>{room.realtimeActive ? '监听中' : room.realtimeEnabled ? '开启中' : '关闭'}</strong><small>在语音页打开或关闭</small></div>
+              <div><Timer size={17} /><span>正计时{currentStatus.voice?.stopwatch_running ? ' · 运行中' : ''}</span><strong>{stopwatchTime}</strong><small>短按 S8 开始，每分钟响 1 秒；任意按键立即停止并播报总时长。重启归零，数值随设备状态更新。</small></div>
+              <div><Radio size={17} /><span>实时监听状态</span><strong>{room.realtimeActive ? '监听中' : room.realtimeEnabled ? '开启中' : '关闭'}</strong><small>在语音页控制；开发板工作时自动关闭，结束后不自动重开</small></div>
               <div><Download size={17} /><span>血压血糖记录</span><button className="text-button" disabled={!room.connected || healthDownloading || deviceBusy} onClick={() => void downloadHealth()}>{healthDownloading ? '正在下载…' : '下载历史 CSV'}</button><small>{room.healthPending ? `板端还有 ${room.healthPending} 条待同步` : '导出云端已同步的全部历史'}</small></div>
               <div><Download size={17} /><span>记账记录</span><button className="text-button" disabled={!room.connected || ledgerDownloading || deviceBusy} onClick={() => void downloadLedger()}>{ledgerDownloading ? '正在下载…' : '下载记账 CSV'}</button><small>{room.ledgerPending ? `板端还有 ${room.ledgerPending} 笔待同步` : '导出云端已同步的全部记账'}</small></div>
             </div>

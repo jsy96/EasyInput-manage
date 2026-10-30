@@ -40,6 +40,8 @@
 #define RETRY_US 3000000
 #define ACK_TIMEOUT_US 12000000
 #define REALTIME_STOP_RETRY_US 1000000
+#define PROBE_WINDOW_SIZE 4
+#define NETWORK_FRESH_US 8000000LL
 #define REALTIME_QUEUE_DEPTH 32
 #define INPUT_QUEUE_DEPTH 16
 #define SLOW_BLINK_ON_US 500000LL
@@ -105,6 +107,7 @@ typedef enum {
     PROMPT_ACTION_START_STT,
     PROMPT_ACTION_SETTINGS_CONFIRM,
     PROMPT_ACTION_STT_ENDED,
+    PROMPT_ACTION_ALARM_MELODY,
 } prompt_action_t;
 
 static const char *TAG = "voice_chat";
@@ -133,6 +136,10 @@ static int64_t synced_revision = -1;
 static bool outbox_ready;
 static bool realtime_enabled;
 static bool realtime_active;
+static bool realtime_cancelled;
+static bool timer_stop_keys[9];
+static bool alarm_music_active;
+static bool stopwatch_beep_active;
 static char ledger_request_id[40];
 static char ledger_inflight_id[33];
 static int64_t ledger_retry_at;
@@ -155,6 +162,8 @@ static bool key_consumed[9];
 static char request_line[1600];
 static char request_id[24];
 static char probe_id[24];
+static struct { char id[24]; int64_t sent_at; } probe_window[PROBE_WINDOW_SIZE];
+static unsigned probe_window_next;
 static char realtime_stop_id[24];
 static bool realtime_stop_pending;
 static int64_t realtime_stop_sent_at;
@@ -246,7 +255,7 @@ static bool uploading(void)
 
 static bool network_fresh(int64_t now)
 {
-    return last_network_at != 0 && now - last_network_at < 8000000;
+    return last_network_at != 0 && now >= last_network_at && now - last_network_at < NETWORK_FRESH_US;
 }
 
 static cJSON *new_frame(const char *op)
@@ -387,8 +396,22 @@ static void probe(int64_t now)
     snprintf(probe_id, sizeof(probe_id), "net-%lu", (unsigned long)++sequence);
     char line[128];
     snprintf(line, sizeof(line), "{\"type\":\"chat\",\"protocol\":%d,\"op\":\"ping\",\"req\":\"%s\"}", CHAT_PROTOCOL, probe_id);
+    const unsigned slot = probe_window_next++ % PROBE_WINDOW_SIZE;
+    strlcpy(probe_window[slot].id, probe_id, sizeof(probe_window[slot].id));
+    probe_window[slot].sent_at = now;
     send_line(line);
     probe_at = now + RETRY_US;
+}
+
+static bool accept_probe_pong(const char *id, int64_t now)
+{
+    for (unsigned i = 0; i < PROBE_WINDOW_SIZE; i++) {
+        if (!probe_window[i].id[0] || strcmp(id, probe_window[i].id)) continue;
+        const int64_t age = now - probe_window[i].sent_at;
+        probe_window[i].id[0] = 0;
+        return age >= 0 && age < NETWORK_FRESH_US;
+    }
+    return false;
 }
 
 static message_t *find_message(const char *id)
@@ -489,6 +512,8 @@ static void append_number(int *ids, int *length, int value)
     for (size_t i = 0; i < count; i++) append_prompt(ids, length, numbers[i]);
 }
 
+static void cancel_realtime_for_work(void);
+
 static void start_prompt_sequence(const int *ids, int length, prompt_action_t action)
 {
     // The streaming microphone must never transcribe our own speaker prompts.
@@ -496,6 +521,7 @@ static void start_prompt_sequence(const int *ids, int length, prompt_action_t ac
     stt_snapshot_t stt;
     xiaozhi_stt_get_snapshot(&stt);
     if (stt.capturing || (stt.busy && action != PROMPT_ACTION_STT_ENDED)) return;
+    cancel_realtime_for_work();
     stop_prompt();
     prompt_length = length > PROMPT_SEQUENCE_CAPACITY ? PROMPT_SEQUENCE_CAPACITY : length;
     for (int i = 0; i < prompt_length; i++) prompt_ids[i] = ids[i];
@@ -638,12 +664,17 @@ static void stop_message_playback(void)
 
 static void send_realtime_stop(void)
 {
+    // Keep one request ID across retries so a slow valid ACK can finish the stop.
+    if (!realtime_stop_pending) {
+        snprintf(realtime_stop_id, sizeof(realtime_stop_id), "stop-%lu", (unsigned long)++sequence);
+    }
+    realtime_stop_pending = true;
+    realtime_stop_sent_at = esp_timer_get_time();
     cJSON *value = new_frame("realtime.stop");
     if (value == NULL || send_immediate_line == NULL) {
         cJSON_Delete(value);
         return;
     }
-    snprintf(realtime_stop_id, sizeof(realtime_stop_id), "stop-%lu", (unsigned long)++sequence);
     cJSON_AddStringToObject(value, "req", realtime_stop_id);
     char *line = cJSON_PrintUnformatted(value);
     if (line != NULL) {
@@ -651,22 +682,61 @@ static void send_realtime_stop(void)
         free(line);
     }
     cJSON_Delete(value);
-    realtime_stop_pending = true;
-    realtime_stop_sent_at = esp_timer_get_time();
 }
+
+static void start_realtime(void);
 
 static void stop_realtime(void)
 {
-    if (!realtime_active) return;
+    const bool had_request = realtime_active || realtime_enabled || realtime_start_pending;
+    const bool was_active = realtime_active;
     realtime_active = false;
     realtime_enabled = false;
     portENTER_CRITICAL(&snapshot_lock);
     realtime_ready = false;
     portEXIT_CRITICAL(&snapshot_lock);
     realtime_start_pending = false;
-    diag_realtime_stops++;
-    send_realtime_stop();
-    (void)audio_live_stop();
+    if (had_request) {
+        diag_realtime_stops++;
+        send_realtime_stop();
+    }
+    if (was_active) (void)audio_live_stop();
+}
+
+static void cancel_realtime_for_work(void)
+{
+    if (!realtime_active && !realtime_enabled && !realtime_start_pending) return;
+    realtime_cancelled = true;
+    stop_realtime();
+}
+
+static bool board_busy(void)
+{
+    audio_snapshot_t audio;
+    audio_get_snapshot(&audio);
+    return recording_busy() || xiaozhi_stt_busy() || job != JOB_IDLE ||
+        (mode != MODE_IDLE && mode != MODE_REALTIME) ||
+        timers_countdown_active() || timers_stopwatch_active() ||
+        prompt_length || prompt_playing || alarm_music_active ||
+        mark_all_read_confirming || audio.recording || audio.speaker_playing;
+}
+
+static void apply_realtime_setting(bool enabled)
+{
+    if (!enabled) {
+        realtime_cancelled = false;
+        stop_realtime();
+        return;
+    }
+    if (realtime_cancelled || realtime_stop_pending || board_busy()) {
+        realtime_enabled = false;
+        realtime_cancelled = true;
+        if (realtime_active || realtime_start_pending) stop_realtime();
+        else send_realtime_stop();
+        return;
+    }
+    realtime_enabled = true;
+    start_realtime();
 }
 
 static void cancel_countdown(bool prompt)
@@ -1189,6 +1259,7 @@ static void upload_begin(void)
 {
     if (!voice_outbox_oldest(&outgoing)) return;
     if (hold_id[0] && strcmp(hold_id, outgoing.id) == 0) return;
+    cancel_realtime_for_work();
     job = JOB_UP_BEGIN;
     cJSON *value = new_frame("begin");
     cJSON_AddStringToObject(value, "id", outgoing.id);
@@ -1242,6 +1313,12 @@ static void upload_chunk(void)
 static void start_realtime(void)
 {
     if (realtime_active) return;
+    if (realtime_cancelled || realtime_stop_pending || board_busy()) {
+        realtime_enabled = false;
+        realtime_cancelled = true;
+        send_realtime_stop();
+        return;
+    }
     if (mode == MODE_STT || xiaozhi_stt_busy() || prompt_action == PROMPT_ACTION_START_STT) {
         realtime_enabled = false; send_realtime_stop(); return;
     }
@@ -1322,9 +1399,12 @@ static void on_short_key(int key)
         case 0:
             play_previous_message();
             break;
-        case 1:
-            play_message(earliest_unread());
+        case 1: {
+            message_t *message = earliest_unread();
+            if (!message) set_cursor(NULL);
+            play_message(message);
             break;
+        }
         case 2:
             begin_alarm_setting();
             break;
@@ -1438,6 +1518,38 @@ static void on_key(int key, bool down)
 {
     if (key < 0 || key > 8) return;
     const int64_t now = input_timestamp ? input_timestamp : esp_timer_get_time();
+    if (timer_stop_keys[key]) {
+        if (!down) {
+            timer_stop_keys[key] = false;
+            key_down[key] = 0;
+            key_held[key] = key_long_handled[key] = key_consumed[key] = false;
+        }
+        return;
+    }
+    if (down) {
+        cancel_realtime_for_work();
+        if (timers_stopwatch_active() || alarm_music_active || prompt_action == PROMPT_ACTION_ALARM_MELODY) {
+            if (timers_stopwatch_active()) {
+                const bool voice_session = recording_busy() || prompt_action == PROMPT_ACTION_START_RECORDING ||
+                    mode == MODE_STT || xiaozhi_stt_busy() || prompt_action == PROMPT_ACTION_START_STT;
+                toggle_stopwatch(now);
+                // Preserve the any-key stop rule if an already queued voice
+                // session overlaps the timer. Consume this key's release once.
+                if (voice_session) stop_voice_session();
+                else if (!alarm_music_active && prompt_action != PROMPT_ACTION_ALARM_MELODY) stop_prompt();
+            }
+            if (alarm_music_active || prompt_action == PROMPT_ACTION_ALARM_MELODY) {
+                stop_prompt();
+                (void)audio_stop_speaker();
+                alarm_music_active = false;
+                deferred_timer_events &= ~TIMER_EVENT_ALARM;
+            } else if (stopwatch_beep_active) (void)audio_stop_notification();
+            stopwatch_beep_active = false;
+            timer_stop_keys[key] = true;
+            key_down[key] = 0;
+            return;
+        }
+    }
     if (on_voice_key(key, down, now)) return;
     if (key == 7) {
         // Outside S5/S6/S7, S8 independently controls the stopwatch.
@@ -1501,11 +1613,6 @@ static void on_key(int key, bool down)
         if (mode == MODE_COUNTDOWN) {
             cancel_countdown(false);
             stop_message_playback();
-            key_consumed[key] = true;
-            return;
-        }
-        if (realtime_active && key <= 4) {
-            // The webpage owns capture; physical voice keys cannot stop it.
             key_consumed[key] = true;
             return;
         }
@@ -1588,6 +1695,7 @@ static bool on_long_key(int key)
 
 static void on_rotate(int delta)
 {
+    if (delta) cancel_realtime_for_work();
     if (recording_busy() || mode == MODE_STT || xiaozhi_stt_busy()) {
         audio_snapshot_t audio; audio_get_snapshot(&audio);
         int level = (int)audio.volume / 10 + delta;
@@ -1669,8 +1777,15 @@ static void append_duration(int *ids, int *length, uint32_t seconds)
 
 static void handle_timer_events(unsigned timer_events, int64_t now)
 {
-    if (timer_events & TIMER_EVENT_ALARM) alarm_fired_at_us = now;
+    if (timer_events & TIMER_EVENT_ALARM) {
+        alarm_fired_at_us = now;
+        cancel_realtime_for_work();
+    }
     deferred_timer_events |= timer_events & (TIMER_EVENT_ALARM | TIMER_EVENT_DONE);
+    if ((timer_events & TIMER_EVENT_STOPWATCH_MINUTE) && timers_stopwatch_active()) {
+        cancel_realtime_for_work();
+        stopwatch_beep_active = audio_play_notification(1000) == ESP_OK;
+    }
     audio_snapshot_t audio;
     audio_get_snapshot(&audio);
     // Keep all microphone paths and in-progress prompts/playback undisturbed.
@@ -1680,8 +1795,7 @@ static void handle_timer_events(unsigned timer_events, int64_t now)
         prompt_length || prompt_playing || audio.speaker_playing || mark_all_read_confirming) return;
     if (deferred_timer_events & TIMER_EVENT_ALARM) {
         deferred_timer_events &= ~TIMER_EVENT_ALARM;
-        const int ids[] = {PROMPT_ALARM_DUE, PROMPT_ALARM_MELODY};
-        start_prompt_sequence(ids, 2, PROMPT_ACTION_NONE);
+        start_prompt(PROMPT_ALARM_DUE, PROMPT_ACTION_ALARM_MELODY);
     } else if (deferred_timer_events & TIMER_EVENT_DONE) {
         deferred_timer_events &= ~TIMER_EVENT_DONE;
         if (mode == MODE_COUNTDOWN) mode = MODE_IDLE;
@@ -1760,18 +1874,17 @@ static void receive(cJSON *value)
         }
         return;
     }
-    if (strcmp(op->valuestring, "pong") == 0 && cJSON_IsString(req) && strcmp(req->valuestring, probe_id) == 0) {
+    if (strcmp(op->valuestring, "pong") == 0 && cJSON_IsString(req)) {
         const cJSON *via = cJSON_GetObjectItemCaseSensitive(value, "via");
-        if (cJSON_IsString(via) && (strcmp(via->valuestring, "wifi") == 0 || strcmp(via->valuestring, "ble") == 0)) {
+        if (cJSON_IsString(via) && (strcmp(via->valuestring, "wifi") == 0 || strcmp(via->valuestring, "ble") == 0) &&
+            accept_probe_pong(req->valuestring, esp_timer_get_time())) {
             network_via = strcmp(via->valuestring, "wifi") == 0 ? 1 : 2;
             last_network_at = esp_timer_get_time();
         }
         return;
     }
     if (strcmp(op->valuestring, "settings") == 0) {
-        realtime_enabled = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(value, "realtime_enabled"));
-        if (realtime_enabled) start_realtime();
-        else stop_realtime();
+        apply_realtime_setting(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(value, "realtime_enabled")));
         return;
     }
     if (strcmp(op->valuestring, "audience") == 0) {
@@ -1950,6 +2063,7 @@ static void prompt_task_step(int64_t now)
     audio_snapshot_t audio;
     audio_get_snapshot(&audio);
     if (prompt_playing && !audio.speaker_playing) prompt_playing = false;
+    if (!prompt_playing && audio.speaker_playing) return;
     if (!prompt_playing) {
         if (prompt_position < prompt_length) {
             size_t length = 0;
@@ -1972,6 +2086,11 @@ static void prompt_task_step(int64_t now)
                     const stt_event_t failed = {.kind = STT_FAILED};
                     handle_stt_event(&failed);
                 } else stt_round_started = stt_engine_started = true;
+            }
+            else if (action == PROMPT_ACTION_ALARM_MELODY) {
+                size_t length = 0;
+                const uint8_t *data = voice_prompt_data(PROMPT_ALARM_MELODY, &length);
+                alarm_music_active = data && length && audio_play_voice_loop(data, length, 60000) == ESP_OK;
             }
             else if (action == PROMPT_ACTION_STT_ENDED && stt_terminal_received && mode == MODE_STT &&
                      (!stt_text_session || !stt_text_result_pending)) {
@@ -2010,6 +2129,7 @@ static void task(void *argument)
             else on_key(input_event.key, input_event.down);
             input_timestamp = 0;
         }
+        if (board_busy()) cancel_realtime_for_work();
         if (have_control && control_event.json != NULL) {
             diag_stage = 4;
             cJSON *value = cJSON_Parse(control_event.json);
@@ -2052,6 +2172,10 @@ static void task(void *argument)
         audio_snapshot_t audio;
         audio_get_snapshot(&audio);
         diag_stage = 8;
+        if (!audio.speaker_playing) {
+            alarm_music_active = false;
+            stopwatch_beep_active = false;
+        }
         recording_step(now);
         if ((job == JOB_DOWNLOAD || job == JOB_PLAYING) && mode == MODE_PLAYING && !advance_stream_playback()) fail_stream_playback();
         if (volume_announce_pending && !xiaozhi_stt_busy() && mode != MODE_STT && !recording_busy() && !audio.recording && prompt_length == 0 && !audio.speaker_playing) {

@@ -32,6 +32,10 @@ void audio_get_snapshot(audio_snapshot_t *snapshot);
 esp_err_t audio_set_microphone(bool on);
 esp_err_t audio_play_test(uint8_t volume);
 esp_err_t audio_play_beep(uint16_t duration_ms, bool strong);
+// Mix the minute cue with active speaker audio; otherwise play it alone.
+esp_err_t audio_play_notification(uint16_t duration_ms);
+// Cancel only the minute cue, preserving any underlying voice or PCM stream.
+esp_err_t audio_stop_notification(void);
 esp_err_t audio_stop_speaker(void);
 esp_err_t audio_set_volume(uint8_t volume);
 // Lock order is shared rail -> audio -> I2S. The worker never takes the rail gate.
@@ -40,6 +44,8 @@ esp_err_t audio_prepare_power_off(void);
 esp_err_t audio_record_start(uint8_t *buffer, size_t capacity);
 esp_err_t audio_record_stop(void);
 esp_err_t audio_play_voice(const uint8_t *buffer, size_t length);
+// Repeat existing 8 kHz mu-law samples for an exact bounded output duration.
+esp_err_t audio_play_voice_loop(const uint8_t *buffer, size_t length, uint32_t duration_ms);
 esp_err_t audio_play_voice_stream(const uint8_t *buffer, size_t length, size_t available);
 esp_err_t audio_voice_stream_extend(size_t available);
 // Bounded 16 kHz mono PCM16 playback. Writes accept the whole block or return

@@ -37,7 +37,7 @@ export async function voiceZip(files: Array<{ name: string; blob: Blob }>): Prom
   let offset = 0, directoryBytes = 0
   for (const file of files) {
     const name = new TextEncoder().encode(file.name), size = file.blob.size
-    if (name.length > 65535 || size > 0xffffffff || offset + 30 + name.length + size > 0xffffffff) throw new Error('ZIP 超过 4 GiB，请先在网页分割长语音')
+    if (name.length > 65535 || size > 0xffffffff || offset + 30 + name.length + size > 0xffffffff) throw new Error('ZIP 超过 4 GiB，无法打包此语音')
     let crc = 0xffffffff
     const reader = file.blob.stream().getReader()
     try {

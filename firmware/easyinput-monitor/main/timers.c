@@ -20,12 +20,14 @@ static int64_t last_alarm_check_us;
 static bool stopwatch_active;
 static int64_t stopwatch_started_at_us;
 static uint32_t stopwatch_elapsed_seconds;
+static uint32_t stopwatch_notified_minute;
 
 void timers_init(void)
 {
     stopwatch_active = false;
     stopwatch_started_at_us = 0;
     stopwatch_elapsed_seconds = 0;
+    stopwatch_notified_minute = 0;
     setenv("TZ", "CST-8", 1);
     tzset();
     nvs_handle_t handle;
@@ -110,6 +112,7 @@ void timers_start_stopwatch(int64_t now_us)
 {
     stopwatch_started_at_us = now_us;
     stopwatch_elapsed_seconds = 0;
+    stopwatch_notified_minute = 0;
     stopwatch_active = true;
 }
 
@@ -123,6 +126,13 @@ uint32_t timers_stop_stopwatch(int64_t now_us)
 unsigned timers_poll(int64_t now_us)
 {
     unsigned events = TIMER_EVENT_NONE;
+    if (stopwatch_active) {
+        const uint32_t minute = timers_stopwatch_seconds(now_us) / 60;
+        if (minute > stopwatch_notified_minute) {
+            stopwatch_notified_minute = minute;
+            events |= TIMER_EVENT_STOPWATCH_MINUTE;
+        }
+    }
     if (countdown_active) {
         if (next_countdown_tick_us == 0) next_countdown_tick_us = now_us + 1000000;
         while (countdown_active && now_us >= next_countdown_tick_us) {

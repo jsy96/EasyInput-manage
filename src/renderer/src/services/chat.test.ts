@@ -87,6 +87,70 @@ describe('voice history pagination', () => {
   })
 })
 
+describe('first unread navigation', () => {
+  const message = (n: number, read = true, sender = 'browser') => ({ id: `unread-${n}`, sender, name: '网页', samples: 1, created: n + 1, read })
+  const cursor = (n: number) => ({ id: `unread-${n}`, created: n + 1 })
+  it('selects the oldest board-unread voice without reading irrelevant older history', async () => {
+    const { chat, request } = connection()
+    chat.state = { ...chat.state, connected: true, unread: 2, total: 8, next: cursor(3), messages: [message(7, false), message(5, false, 'board'), message(3, false)] }
+    expect((await chat.findFirstUnread())?.id).toBe('unread-3')
+    expect(request).not.toHaveBeenCalled()
+    expect(chat.state.unread).toBe(2)
+    expect(chat.state.messages.every(m => !m.read)).toBe(true)
+  })
+  it('loads older pages until every globally unread row is available and preserves fresh read acknowledgements', async () => {
+    const { chat, request } = connection()
+    chat.state = { ...chat.state, connected: true, unread: 2, total: 6, next: cursor(4), messages: [message(4), message(5, false)] }
+    request.mockResolvedValueOnce({ messages: [message(2), message(3)], next: cursor(2), through: cursor(5), total: 6 })
+      .mockResolvedValueOnce({ messages: [message(0), message(1, false)], next: null, through: cursor(5), total: 6 })
+    expect((await chat.findFirstUnread())?.id).toBe('unread-1')
+    expect(request.mock.calls).toEqual([['list', { before: cursor(4) }], ['list', { before: cursor(2) }]])
+    expect(chat.state.messages).toHaveLength(6)
+    expect(chat.state.unread).toBe(2)
+  })
+  it('cancels before and between page requests without changing read state', async () => {
+    const { chat, request } = connection()
+    chat.state = { ...chat.state, connected: true, unread: 2, total: 6, next: cursor(4), messages: [message(4), message(5, false)] }
+    expect(await chat.findFirstUnread(() => true)).toBeNull()
+    expect(request).not.toHaveBeenCalled()
+    let cancelled = false
+    request.mockImplementationOnce(async () => { cancelled = true; return { messages: [message(2), message(3)], next: cursor(2), through: cursor(5), total: 6 } })
+    expect(await chat.findFirstUnread(() => cancelled)).toBeNull()
+    expect(request).toHaveBeenCalledOnce()
+    expect(chat.state.unread).toBe(2)
+  })
+  it('rejects reconnection during navigation instead of moving to a stale message', async () => {
+    const { chat, request } = connection()
+    chat.state = { ...chat.state, connected: true, unread: 2, total: 6, next: cursor(4), messages: [message(4), message(5, false)] }
+    request.mockImplementationOnce(async () => {
+      ;(chat as unknown as { generation: number }).generation++
+      return { messages: [message(2), message(3)], next: cursor(2), through: cursor(5), total: 6 }
+    })
+    await expect(chat.findFirstUnread()).rejects.toThrow('重新连接')
+    expect(chat.state.messages).toHaveLength(2)
+  })
+  it('shares an in-flight older-page request and stops when all messages become read', async () => {
+    const { chat, request } = connection()
+    chat.state = { ...chat.state, connected: true, unread: 2, total: 4, next: cursor(2), messages: [message(2), message(3, false)] }
+    let finish!: (page: Record<string, unknown>) => void
+    request.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    const older = chat.loadOlder(), navigation = chat.findFirstUnread()
+    expect(request).toHaveBeenCalledOnce()
+    chat.state = { ...chat.state, unread: 0, messages: chat.state.messages.map(m => ({ ...m, read: true })) }
+    finish({ messages: [message(0), message(1)], next: null, through: cursor(3), total: 4 })
+    await older
+    expect(await navigation).toBeNull()
+    expect(chat.state.messages.every(m => m.read)).toBe(true)
+  })
+  it('rejects a page cursor that cannot move towards older messages', async () => {
+    const { chat, request } = connection()
+    chat.state = { ...chat.state, connected: true, unread: 2, total: 6, next: cursor(4), messages: [message(4), message(5, false)] }
+    request.mockResolvedValue({ messages: [message(2), message(3)], next: cursor(4), through: cursor(5), total: 6 })
+    await expect(chat.findFirstUnread()).rejects.toThrow('分页未能继续')
+    expect(request).toHaveBeenCalledOnce()
+  })
+})
+
 it('keeps text in paginated chat while excluding it from voice exports and downloads', async () => {
   const { chat, request } = connection()
   const text = { id: 'text', sender: 'board', name: '开发板', kind: 'text' as const, text: '你好', samples: 0, created: 2, read: true }
@@ -243,10 +307,5 @@ describe('long voice chunks', () => {
       const { chat, request } = connection(); request.mockResolvedValue({ ...good, ...patch })
       await expect(chat.download(small)).rejects.toThrow()
     }
-  })
-  it('sends a stable browser split ID for idempotent retry', async () => {
-    const { chat, request } = connection(); request.mockResolvedValue({ op: 'split.ack', id: m.id })
-    await chat.split(m, 10, 'stable-split'); await chat.split(m, 10, 'stable-split')
-    expect(request.mock.calls).toEqual(Array(2).fill(['split', { id: m.id, seconds: 10, splitId: 'stable-split' }]))
   })
 })

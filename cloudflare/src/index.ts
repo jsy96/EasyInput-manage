@@ -34,15 +34,17 @@ export default {
         headers: { 'X-EasyInput-Clear': '1' },
       }))
     }
-    if (url.pathname !== '/ws' || request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') return new Response('EasyInput gateway', { status: 200 })
+    const asr = url.pathname === '/asr'
+    if ((!asr && url.pathname !== '/ws') || request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') return new Response('EasyInput gateway', { status: 200 })
     const device = url.searchParams.get('device')?.trim()
     const role = url.searchParams.get('role')
     const publicRoom = device === (env.PUBLIC_DEVICE_ID ?? 'easyinput-v2')
     if (!device || !/^[A-Za-z0-9_-]{3,64}$/.test(device) || !['board', 'browser'].includes(role ?? '') || !(role === 'browser' && publicRoom || authorized(env, url.searchParams.get('token')))) return new Response('Invalid device session', { status: 401 })
     if (role === 'browser' && !origin) return new Response('Origin not allowed', { status: 403 })
+    if (asr && role !== 'browser') return new Response('Browser required', { status: 403 })
     const room = env.DEVICE_ROOMS.get(env.DEVICE_ROOMS.idFromName(device))
-    const target = new URL('https://room.internal/ws')
-    for (const key of ['role', 'client', 'name']) target.searchParams.set(key, url.searchParams.get(key) ?? '')
+    const target = new URL(`https://room.internal/${asr ? 'asr' : 'ws'}`)
+    for (const key of ['role', 'client', 'name', 'id']) target.searchParams.set(key, url.searchParams.get(key) ?? '')
     // Older monitor clients do not supply an identity; keep them usable.
     if (role === 'browser' && !target.searchParams.get('client')) target.searchParams.set('client', crypto.randomUUID())
     return room.fetch(new Request(target.toString(), request))

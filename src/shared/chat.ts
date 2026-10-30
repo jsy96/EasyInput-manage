@@ -1,6 +1,6 @@
 export const CHAT_VERSION = 2
 export const AUDIO_RATE = 8000
-export const AUDIO_LIMIT = AUDIO_RATE * 20
+export const AUDIO_LIMIT = AUDIO_RATE * 60
 // Storage/WAV format guard (about 74 hours), independent of the browser mic limit.
 export const VOICE_SAMPLES_MAX = 0x7ffff000
 export const RECORD_BATCH_CHUNKS = 8
@@ -49,7 +49,7 @@ export function isChatMessage(value: unknown): value is ChatMessage {
   const m = value as ChatMessage | null
   return isChatCursor(m) && typeof m.sender === 'string' && typeof m.name === 'string' &&
     typeof m.read === 'boolean' && (m.kind === 'text'
-      ? m.samples === 0 && m.sender === 'board' && m.read && typeof m.text === 'string' && m.text.trim().length > 0 && m.text.length <= CHAT_TEXT_LIMIT
+      ? m.samples === 0 && m.read && typeof m.text === 'string' && m.text.trim().length > 0 && m.text.length <= CHAT_TEXT_LIMIT
       : (m.kind === undefined || m.kind === 'voice') && Number.isSafeInteger(m.samples) && m.samples > 0 && m.samples <= VOICE_SAMPLES_MAX &&
         (m.interrupted === undefined || typeof m.interrupted === 'boolean') &&
         (m.audioSource === undefined || (validId(m.audioSource) && Number.isSafeInteger(m.audioStart) && m.audioStart! >= 0 &&

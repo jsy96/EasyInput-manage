@@ -24,6 +24,7 @@
 #define CLOUD_EVENT_QUEUE_DEPTH 16
 #define CLOUD_BINARY_QUEUE_DEPTH 32
 #define CLOUD_BINARY_SEND_TIMEOUT_MS 1000
+#define CLOUD_BINARY_MAX_AGE_US 250000
 #define CLOUD_RECONNECT_MS 5000
 #define CHAT_PROTOCOL 2
 #define LEGACY_GATEWAY "wss://easyinput-gateway.jsy96.workers.dev"
@@ -34,21 +35,47 @@ static esp_websocket_client_handle_t client;
 static SemaphoreHandle_t state_lock;
 static SemaphoreHandle_t send_lock;
 static SemaphoreHandle_t outbound_lock;
+static SemaphoreHandle_t lifecycle_lock;
 static QueueHandle_t event_queue;
 static QueueHandle_t binary_queue;
 static TaskHandle_t sender_task;
-static char *pending_status;
 static bool online;
+static portMUX_TYPE network_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool network_ready;
+static unsigned network_generation;
 static char gateway[192];
 static char device_id[65];
 static char token[129];
 static int64_t last_presence_us;
+static int64_t connected_since_us;
 static cloud_monitor_stats_t monitor_stats;
 
 typedef struct {
     size_t length;
+    int64_t queued_at_us;
     uint8_t data[];
 } cloud_binary_frame_t;
+
+void cloud_monitor_set_network_ready(bool ready)
+{
+    portENTER_CRITICAL(&network_lock);
+    if (network_ready != ready) network_generation++;
+    network_ready = ready;
+    portEXIT_CRITICAL(&network_lock);
+    if (!ready && state_lock != NULL) {
+        xSemaphoreTake(state_lock, portMAX_DELAY);
+        online = false;
+        xSemaphoreGive(state_lock);
+    }
+}
+
+static bool network_is_ready(void)
+{
+    portENTER_CRITICAL(&network_lock);
+    const bool ready = network_ready;
+    portEXIT_CRITICAL(&network_lock);
+    return ready;
+}
 
 static void record_send_result(const char *line, bool sent)
 {
@@ -104,7 +131,7 @@ static bool send_text(const char *text, size_t length, TickType_t timeout)
     if (send_lock == NULL || xSemaphoreTake(send_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
     esp_websocket_client_handle_t current = client;
     const bool sent = current != NULL && esp_websocket_client_is_connected(current) &&
-        esp_websocket_client_send_text(current, text, length, timeout) >= 0;
+        network_is_ready() && esp_websocket_client_send_text(current, text, length, timeout) == (int)length;
     xSemaphoreGive(send_lock);
     return sent;
 }
@@ -114,7 +141,7 @@ static bool send_text_immediate(const char *text, size_t length)
     if (send_lock == NULL || xSemaphoreTake(send_lock, pdMS_TO_TICKS(20)) != pdTRUE) return false;
     esp_websocket_client_handle_t current = client;
     const bool sent = current != NULL && esp_websocket_client_is_connected(current) &&
-        esp_websocket_client_send_text(current, text, length, pdMS_TO_TICKS(50)) >= 0;
+        network_is_ready() && esp_websocket_client_send_text(current, text, length, pdMS_TO_TICKS(50)) == (int)length;
     xSemaphoreGive(send_lock);
     return sent;
 }
@@ -124,7 +151,7 @@ static bool send_binary(const uint8_t *data, size_t length, TickType_t timeout)
     if (send_lock == NULL || xSemaphoreTake(send_lock, pdMS_TO_TICKS(10)) != pdTRUE) return false;
     esp_websocket_client_handle_t current = client;
     const bool sent = current != NULL && esp_websocket_client_is_connected(current) &&
-        esp_websocket_client_send_bin(current, (const char *)data, length, timeout) >= 0;
+        network_is_ready() && esp_websocket_client_send_bin(current, (const char *)data, length, timeout) == (int)length;
     xSemaphoreGive(send_lock);
     return sent;
 }
@@ -139,6 +166,7 @@ static void stop_client(void)
         (void)esp_websocket_client_destroy(current);
     }
     if (send_lock != NULL) xSemaphoreGive(send_lock);
+    xSemaphoreTake(state_lock, portMAX_DELAY); online = false; xSemaphoreGive(state_lock);
 }
 
 static void load_config(void)
@@ -197,10 +225,21 @@ static void cloud_event_handler(void *arg, esp_event_base_t base, int32_t event_
         ESP_LOGI(TAG, "cloud WSS connected");
         const char *hello = "{\"type\":\"command\",\"protocol\":2,\"action\":\"hello.get\"}\n";
         (void)send_text(hello, strlen(hello), pdMS_TO_TICKS(1000));
-        xSemaphoreTake(state_lock, portMAX_DELAY); online = true; xSemaphoreGive(state_lock);
+        xSemaphoreTake(state_lock, portMAX_DELAY);
+        online = network_is_ready();
+        connected_since_us = esp_timer_get_time();
+        last_presence_us = 0;
+        monitor_stats.connections++;
+        xSemaphoreGive(state_lock);
         if (sender_task != NULL) (void)xTaskNotifyGive(sender_task);
     } else if (event_id == WEBSOCKET_EVENT_DISCONNECTED) {
-        xSemaphoreTake(state_lock, portMAX_DELAY); online = false; xSemaphoreGive(state_lock);
+        xSemaphoreTake(state_lock, portMAX_DELAY);
+        online = false;
+        monitor_stats.disconnects++;
+        monitor_stats.last_close_code = event ? event->close_status_code : 0;
+        const int64_t duration_ms = connected_since_us ? (esp_timer_get_time() - connected_since_us) / 1000 : 0;
+        connected_since_us = 0;
+        xSemaphoreGive(state_lock);
         // Free queued frames while the link is down: status copies pin internal
         // RAM that the TLS reconnect handshake needs.
         if (outbound_lock != NULL) {
@@ -223,44 +262,84 @@ static void cloud_event_handler(void *arg, esp_event_base_t base, int32_t event_
             }
             xSemaphoreGive(outbound_lock);
         }
-        ESP_LOGW(TAG, "cloud WSS disconnected");
+        ESP_LOGW(TAG, "cloud WSS disconnected: close_code=%d online_ms=%lld IP_ready=%d internal_free=%u largest=%u",
+                 event ? event->close_status_code : 0, (long long)duration_ms, network_is_ready(),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     } else if (event_id == WEBSOCKET_EVENT_DATA && event != NULL && (event->op_code == 0x1 || event->op_code == 0x0)) {
         static char incoming[CLOUD_COMMAND_MAX];
         static size_t received;
         if (event->payload_offset == 0) received = 0;
-        if (event->payload_len > 0 && event->payload_len < CLOUD_COMMAND_MAX && event->payload_offset == received && received + event->data_len < sizeof(incoming)) {
+        if (event->payload_len > 0 && event->payload_len < CLOUD_COMMAND_MAX && event->payload_offset >= 0 &&
+            event->data_len >= 0 && (size_t)event->payload_offset == received && received + (size_t)event->data_len < sizeof(incoming)) {
             memcpy(incoming + received, event->data_ptr, event->data_len);
             received += event->data_len;
-            if (received == event->payload_len) { incoming[received] = '\0'; cloud_message(incoming, received); received = 0; }
+            if (received == (size_t)event->payload_len) { incoming[received] = '\0'; cloud_message(incoming, received); received = 0; }
         } else received = 0;
     } else if (event_id == WEBSOCKET_EVENT_ERROR) {
-        ESP_LOGW(TAG, "cloud WSS error");
+        xSemaphoreTake(state_lock, portMAX_DELAY);
+        monitor_stats.errors++;
+        if (event) {
+            monitor_stats.last_tls_error = event->error_handle.esp_tls_last_esp_err;
+            monitor_stats.last_socket_errno = event->error_handle.esp_transport_sock_errno;
+            monitor_stats.last_http_status = event->error_handle.esp_ws_handshake_status_code;
+        }
+        xSemaphoreGive(state_lock);
+        ESP_LOGW(TAG, "cloud WSS error: tls_error=%d tls_code=%d cert_flags=%d socket_errno=%d http_status=%d error_type=%d internal_free=%u largest=%u",
+                 event ? event->error_handle.esp_tls_last_esp_err : 0,
+                 event ? event->error_handle.esp_tls_stack_err : 0,
+                 event ? event->error_handle.esp_tls_cert_verify_flags : 0,
+                 event ? event->error_handle.esp_transport_sock_errno : 0,
+                 event ? event->error_handle.esp_ws_handshake_status_code : 0,
+                 event ? (int)event->error_handle.error_type : 0,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     }
+}
+
+static void update_client_connection(void)
+{
+    static unsigned previous_generation;
+    portENTER_CRITICAL(&network_lock);
+    const bool ip_ready = network_ready;
+    const unsigned generation = network_generation;
+    portEXIT_CRITICAL(&network_lock);
+    xSemaphoreTake(lifecycle_lock, portMAX_DELAY);
+    if (client != NULL && (!ip_ready || generation != previous_generation)) stop_client();
+    previous_generation = generation;
+    if (ip_ready && configured() && system_time_ready() && client == NULL) {
+        char url[512];
+        snprintf(url, sizeof(url), "%s/ws?device=%s&role=board&token=%s", gateway, device_id, token);
+        esp_websocket_client_config_t config = {
+            .uri = url,
+            .crt_bundle_attach = esp_crt_bundle_attach,
+            .buffer_size = 2048,
+            .task_stack = 6144,
+            .network_timeout_ms = 10000,
+            .reconnect_timeout_ms = CLOUD_RECONNECT_MS,
+            .keep_alive_enable = true,
+            .keep_alive_idle = 15,
+            .keep_alive_interval = 5,
+            .keep_alive_count = 3,
+            .ping_interval_sec = 10,
+            .pingpong_timeout_sec = 30,
+        };
+        client = esp_websocket_client_init(&config);
+        if (client != NULL) {
+            esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY, cloud_event_handler, NULL);
+            if (esp_websocket_client_start(client) != ESP_OK) {
+                esp_websocket_client_destroy(client); client = NULL;
+            }
+        }
+    }
+    xSemaphoreGive(lifecycle_lock);
 }
 
 static void cloud_task(void *arg)
 {
     (void)arg;
     while (true) {
-        if (configured() && system_time_ready() && client == NULL) {
-            char url[512];
-            snprintf(url, sizeof(url), "%s/ws?device=%s&role=board&token=%s", gateway, device_id, token);
-            esp_websocket_client_config_t config = {
-                .uri = url,
-                .crt_bundle_attach = esp_crt_bundle_attach,
-                .buffer_size = 2048,
-                .task_stack = 6144,
-                .network_timeout_ms = 10000,
-                .reconnect_timeout_ms = CLOUD_RECONNECT_MS,
-            };
-            client = esp_websocket_client_init(&config);
-            if (client != NULL) {
-                esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY, cloud_event_handler, NULL);
-                if (esp_websocket_client_start(client) != ESP_OK) {
-                    esp_websocket_client_destroy(client); client = NULL;
-                }
-            }
-        }
+        update_client_connection();
         xSemaphoreTake(state_lock, portMAX_DELAY);
         const bool connected = online;
         xSemaphoreGive(state_lock);
@@ -285,10 +364,39 @@ static void cloud_task(void *arg)
     }
 }
 
+static void take_outbound(bool *control_turn, char **line, cloud_binary_frame_t **audio)
+{
+    *line = NULL;
+    *audio = NULL;
+    const bool have_control = uxQueueMessagesWaiting(event_queue) > 0;
+    if (have_control && (*control_turn || uxQueueMessagesWaiting(binary_queue) == 0)) {
+        (void)xQueueReceive(event_queue, line, 0);
+        *control_turn = false;
+        return;
+    }
+    const int64_t now = esp_timer_get_time();
+    cloud_binary_frame_t *next = NULL;
+    while (xQueueReceive(binary_queue, &next, 0) == pdTRUE) {
+        if (now >= next->queued_at_us && now - next->queued_at_us <= CLOUD_BINARY_MAX_AGE_US) {
+            *audio = next;
+            *control_turn = true;
+            return;
+        }
+        free(next);
+        xSemaphoreTake(state_lock, portMAX_DELAY);
+        monitor_stats.realtime_chunks_dropped++;
+        xSemaphoreGive(state_lock);
+    }
+    if (have_control) {
+        (void)xQueueReceive(event_queue, line, 0);
+        *control_turn = false;
+    }
+}
+
 static void cloud_sender_task(void *arg)
 {
     (void)arg;
-    bool prefer_status = false;
+    bool control_turn = true;
     while (true) {
         xSemaphoreTake(state_lock, portMAX_DELAY);
         const bool ready = online;
@@ -301,18 +409,9 @@ static void cloud_sender_task(void *arg)
         cloud_binary_frame_t *binary_frame = NULL;
         char *frame = NULL;
         xSemaphoreTake(outbound_lock, portMAX_DELAY);
-        const bool have_binary = xQueueReceive(binary_queue, &binary_frame, 0) == pdTRUE;
-        if (!have_binary) {
-            const bool have_event = uxQueueMessagesWaiting(event_queue) > 0;
-            if ((prefer_status && pending_status != NULL) || !have_event) {
-                frame = pending_status;
-                pending_status = NULL;
-                prefer_status = false;
-            } else {
-                (void)xQueueReceive(event_queue, &frame, 0);
-                prefer_status = true;
-            }
-        }
+        // Alternating when both are ready bounds control latency without
+        // starving microphone packets during a burst of timeline messages.
+        take_outbound(&control_turn, &frame, &binary_frame);
         xSemaphoreGive(outbound_lock);
 
         if (binary_frame != NULL) {
@@ -345,9 +444,14 @@ void cloud_monitor_init(void)
     state_lock = xSemaphoreCreateMutex();
     send_lock = xSemaphoreCreateMutex();
     outbound_lock = xSemaphoreCreateMutex();
+    lifecycle_lock = xSemaphoreCreateMutex();
     event_queue = xQueueCreate(CLOUD_EVENT_QUEUE_DEPTH, sizeof(char *));
     binary_queue = xQueueCreateWithCaps(CLOUD_BINARY_QUEUE_DEPTH, sizeof(cloud_binary_frame_t *),
                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!state_lock || !send_lock || !outbound_lock || !lifecycle_lock || !event_queue || !binary_queue) {
+        ESP_LOGE(TAG, "Unable to allocate cloud worker state");
+        return;
+    }
     load_config();
     if (xTaskCreateWithCaps(cloud_task, "cloud_wss", 7168, NULL, 4, NULL,
                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS ||
@@ -367,10 +471,13 @@ bool cloud_monitor_configure(const char *gateway_url, const char *device, const 
         nvs_set_str(handle, "device", device) == ESP_OK && nvs_set_str(handle, "token", pairing_token) == ESP_OK && nvs_commit(handle) == ESP_OK ? ESP_OK : ESP_FAIL;
     nvs_close(handle);
     if (result != ESP_OK) return false;
+    if (lifecycle_lock == NULL) return false;
+    xSemaphoreTake(lifecycle_lock, portMAX_DELAY);
     stop_client();
     strlcpy(gateway, gateway_url, sizeof(gateway));
     strlcpy(device_id, device, sizeof(device_id));
     strlcpy(token, pairing_token, sizeof(token));
+    xSemaphoreGive(lifecycle_lock);
     return true;
 }
 
@@ -381,8 +488,11 @@ bool cloud_monitor_clear(void)
     const esp_err_t result = nvs_erase_all(handle) == ESP_OK && nvs_commit(handle) == ESP_OK ? ESP_OK : ESP_FAIL;
     nvs_close(handle);
     if (result != ESP_OK) return false;
+    if (lifecycle_lock == NULL) return false;
+    xSemaphoreTake(lifecycle_lock, portMAX_DELAY);
     stop_client();
     gateway[0] = device_id[0] = token[0] = '\0';
+    xSemaphoreGive(lifecycle_lock);
     return true;
 }
 
@@ -448,11 +558,12 @@ bool cloud_monitor_send_binary(const uint8_t *data, size_t length)
 {
     // Realtime audio frames are handed to the cloud sender task (single writer),
     // so a stalled or reconnecting link drops frames instead of aborting it.
-    if (data == NULL || length == 0 || length > 4096 || binary_queue == NULL || sender_task == NULL) return false;
+    if (data == NULL || length == 0 || length > 4096 || binary_queue == NULL || sender_task == NULL || !cloud_monitor_is_online()) return false;
     cloud_binary_frame_t *frame = heap_caps_malloc(sizeof(cloud_binary_frame_t) + length,
                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (frame == NULL) return false;
     frame->length = length;
+    frame->queued_at_us = esp_timer_get_time();
     memcpy(frame->data, data, length);
     if (xQueueSend(binary_queue, &frame, 0) != pdTRUE) {
         free(frame);
@@ -478,7 +589,7 @@ bool cloud_monitor_is_online(void)
 {
     if (state_lock == NULL) return false;
     xSemaphoreTake(state_lock, portMAX_DELAY); const bool value = online; xSemaphoreGive(state_lock);
-    return value;
+    return value && network_is_ready();
 }
 
 bool cloud_monitor_is_configured(void) { return configured(); }

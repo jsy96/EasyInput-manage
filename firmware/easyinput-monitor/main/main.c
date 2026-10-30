@@ -38,6 +38,7 @@
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_private/esp_clk.h"
+#include "esp_random.h"
 #include "esp_spi_flash_counters.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -71,6 +72,8 @@ void ble_store_config_init(void);
 #define WIFI_STOPPED_BIT (1U << 1)
 #define WIFI_DISCONNECTED_BIT (1U << 2)
 #define WIFI_TRANSITION_TIMEOUT_MS 3000
+#define WIFI_FAST_RETRY_LIMIT 3
+#define WIFI_RETRY_MAX_MS 30000
 #define WIFI_WS_MAX_CLIENTS 3
 #define WIFI_WS_PENDING_LIMIT 16
 
@@ -104,6 +107,10 @@ static uint32_t wifi_disconnects;
 static uint32_t wifi_retries;
 static bool wifi_configured;
 static bool wifi_reconfiguring;
+static esp_timer_handle_t wifi_retry_timer;
+static unsigned wifi_retry_failures;
+static bool wifi_retry_rescan;
+static bool wifi_scan_pending;
 static int ble_peers;
 static char ble_state[16] = "starting";
 static uint8_t ble_address_type;
@@ -136,6 +143,7 @@ static uint64_t last_flash_sample_us;
 static void start_advertising(void);
 static void handle_command(const char *line);
 static void time_sync_notification_cb(struct timeval *tv);
+static void wifi_schedule_retry(void);
 
 typedef struct {
     char *line;
@@ -778,6 +786,13 @@ static void emit_status(void)
     cJSON_AddNumberToObject(cloud_debug, "realtime_chunks_sent", cloud_stats.realtime_chunks_sent);
     cJSON_AddNumberToObject(cloud_debug, "realtime_chunks_failed", cloud_stats.realtime_chunks_failed);
     cJSON_AddNumberToObject(cloud_debug, "realtime_chunks_dropped", cloud_stats.realtime_chunks_dropped);
+    cJSON_AddNumberToObject(cloud_debug, "connections", cloud_stats.connections);
+    cJSON_AddNumberToObject(cloud_debug, "disconnects", cloud_stats.disconnects);
+    cJSON_AddNumberToObject(cloud_debug, "errors", cloud_stats.errors);
+    cJSON_AddNumberToObject(cloud_debug, "last_tls_error", cloud_stats.last_tls_error);
+    cJSON_AddNumberToObject(cloud_debug, "last_socket_errno", cloud_stats.last_socket_errno);
+    cJSON_AddNumberToObject(cloud_debug, "last_http_status", cloud_stats.last_http_status);
+    cJSON_AddNumberToObject(cloud_debug, "last_close_code", cloud_stats.last_close_code);
     voice_chat_snapshot_t voice_state;
     voice_chat_get_snapshot(&voice_state);
     cJSON *voice = cJSON_AddObjectToObject(root, "voice");
@@ -1072,11 +1087,87 @@ static void send_wifi_failure(const char *action, const char *stage, esp_err_t e
     send_result(action, false, message);
 }
 
+static unsigned wifi_retry_delay_ms(unsigned failures)
+{
+    if (failures <= WIFI_FAST_RETRY_LIMIT) return 250 * failures;
+    const unsigned shift = failures - WIFI_FAST_RETRY_LIMIT - 1;
+    return shift >= 5 ? WIFI_RETRY_MAX_MS : 1000U << shift;
+}
+
+static void wifi_cancel_retry(void)
+{
+    if (wifi_retry_timer != NULL) (void)esp_timer_stop(wifi_retry_timer);
+    portENTER_CRITICAL(&state_lock);
+    const bool scanning = wifi_scan_pending;
+    wifi_scan_pending = false;
+    portEXIT_CRITICAL(&state_lock);
+    if (scanning) {
+        (void)esp_wifi_scan_stop();
+        (void)esp_wifi_clear_ap_list();
+    }
+}
+
+static esp_err_t wifi_connect_attempt(void)
+{
+    const esp_err_t result = esp_wifi_connect();
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi connect could not start: %s", esp_err_to_name(result));
+        wifi_schedule_retry();
+    }
+    return result;
+}
+
+static void wifi_retry_callback(void *arg)
+{
+    (void)arg;
+    portENTER_CRITICAL(&state_lock);
+    const bool retry = wifi_configured && !wifi_reconfiguring && strcmp(wifi_state, "connecting") == 0;
+    const bool rescan = retry && wifi_retry_rescan;
+    if (rescan) wifi_scan_pending = true;
+    portEXIT_CRITICAL(&state_lock);
+    if (!retry) return;
+    if (rescan) {
+        // A real all-channel scan replaces repeated attempts against an old AP.
+        // Do not rewrite the saved credentials or depend on clear_fast_connect,
+        // which is a stub in ESP-IDF 5.5.
+        wifi_scan_config_t scan = {.ssid = (uint8_t *)wifi_ssid, .show_hidden = true};
+        const esp_err_t result = esp_wifi_scan_start(&scan, false);
+        if (result == ESP_OK) return;
+        portENTER_CRITICAL(&state_lock); wifi_scan_pending = false; portEXIT_CRITICAL(&state_lock);
+        ESP_LOGW(TAG, "Wi-Fi rescan could not start: %s", esp_err_to_name(result));
+    }
+    (void)wifi_connect_attempt();
+}
+
+static void wifi_schedule_retry(void)
+{
+    portENTER_CRITICAL(&state_lock);
+    const bool retry = wifi_configured && !wifi_reconfiguring;
+    unsigned failures = wifi_retry_failures;
+    if (retry) {
+        if (failures < WIFI_FAST_RETRY_LIMIT + 6) failures++;
+        wifi_retry_failures = failures;
+        wifi_retry_rescan = failures > WIFI_FAST_RETRY_LIMIT;
+        wifi_retries++;
+        strlcpy(wifi_state, "connecting", sizeof(wifi_state));
+    }
+    portEXIT_CRITICAL(&state_lock);
+    if (!retry || wifi_retry_timer == NULL) return;
+    unsigned delay_ms = wifi_retry_delay_ms(failures);
+    if (delay_ms < WIFI_RETRY_MAX_MS && failures > WIFI_FAST_RETRY_LIMIT) delay_ms += esp_random() % 251;
+    (void)esp_timer_stop(wifi_retry_timer);
+    const esp_err_t result = esp_timer_start_once(wifi_retry_timer, (uint64_t)delay_ms * 1000);
+    ESP_LOGW(TAG, "Wi-Fi retry %u in %u ms (%s), timer=%s", failures, delay_ms,
+             failures > WIFI_FAST_RETRY_LIMIT ? "rescan" : "fast", esp_err_to_name(result));
+}
+
 static esp_err_t pause_wifi_for_command(void)
 {
     portENTER_CRITICAL(&state_lock);
     wifi_reconfiguring = true;
     portEXIT_CRITICAL(&state_lock);
+    cloud_monitor_set_network_ready(false);
+    wifi_cancel_retry();
 
     if ((xEventGroupGetBits(wifi_lifecycle_events) & WIFI_STOPPED_BIT) != 0) return ESP_OK;
 
@@ -1104,17 +1195,13 @@ static esp_err_t resume_wifi_after_command(void)
 
     portENTER_CRITICAL(&state_lock);
     wifi_reconfiguring = false;
+    wifi_retry_failures = 0;
     const bool connect = result == ESP_OK && wifi_configured;
     strlcpy(wifi_state, connect ? "connecting" : "disconnected", sizeof(wifi_state));
     portEXIT_CRITICAL(&state_lock);
 
     if (connect) {
-        result = esp_wifi_connect();
-        if (result != ESP_OK) {
-            portENTER_CRITICAL(&state_lock);
-            strlcpy(wifi_state, "disconnected", sizeof(wifi_state));
-            portEXIT_CRITICAL(&state_lock);
-        }
+        result = wifi_connect_attempt();
     }
     return result;
 }
@@ -1492,10 +1579,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         }
         portEXIT_CRITICAL(&state_lock);
         memset(config.sta.password, 0, sizeof(config.sta.password));
-        if (have_config) (void)esp_wifi_connect();
+        if (have_config) (void)wifi_connect_attempt();
         xEventGroupClearBits(wifi_lifecycle_events, WIFI_STOPPED_BIT);
         xEventGroupSetBits(wifi_lifecycle_events, WIFI_STARTED_BIT);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_STOP) {
+        cloud_monitor_set_network_ready(false);
+        wifi_cancel_retry();
         portENTER_CRITICAL(&state_lock);
         wifi_rssi = 0;
         wifi_channel = 0;
@@ -1513,6 +1602,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         wifi_channel = ap.primary;
         portEXIT_CRITICAL(&state_lock);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        cloud_monitor_set_network_ready(false);
         const wifi_event_sta_disconnected_t *event = event_data;
         portENTER_CRITICAL(&state_lock);
         wifi_disconnect_code = event == NULL ? 0 : event->reason;
@@ -1521,14 +1611,32 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         wifi_channel = 0;
         wifi_ip[0] = wifi_netmask[0] = wifi_gateway[0] = wifi_dns[0] = '\0';
         if (wifi_configured) {
-            wifi_retries++;
             strlcpy(wifi_state, "connecting", sizeof(wifi_state));
         } else {
             strlcpy(wifi_state, "disconnected", sizeof(wifi_state));
         }
         const bool reconnect = wifi_configured && !wifi_reconfiguring;
         portEXIT_CRITICAL(&state_lock);
-        if (reconnect) (void)esp_wifi_connect();
+        ESP_LOGW(TAG, "Wi-Fi disconnected: reason=%d count=%lu internal_free=%u largest=%u",
+                 event == NULL ? 0 : event->reason, (unsigned long)wifi_disconnects,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        if (reconnect) wifi_schedule_retry();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE) {
+        portENTER_CRITICAL(&state_lock);
+        const bool reconnect = wifi_scan_pending && wifi_configured && !wifi_reconfiguring;
+        wifi_scan_pending = false;
+        portEXIT_CRITICAL(&state_lock);
+        if (reconnect) {
+            (void)esp_wifi_clear_ap_list();
+            (void)wifi_connect_attempt();
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) {
+        cloud_monitor_set_network_ready(false);
+        portENTER_CRITICAL(&state_lock);
+        wifi_ip[0] = wifi_netmask[0] = wifi_gateway[0] = wifi_dns[0] = '\0';
+        portEXIT_CRITICAL(&state_lock);
+        ESP_LOGW(TAG, "Wi-Fi station lost its IP; cloud connection paused");
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *event = event_data;
         esp_netif_ip_info_t info = {0};
@@ -1537,12 +1645,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             esp_ip4addr_ntoa(&info.ip, ip, sizeof(ip));
             esp_ip4addr_ntoa(&info.netmask, netmask, sizeof(netmask));
             esp_ip4addr_ntoa(&info.gw, gateway, sizeof(gateway));
-            esp_netif_dns_info_t public_dns = {0};
-            public_dns.ip.type = ESP_IPADDR_TYPE_V4;
-            public_dns.ip.u_addr.ip4.addr = esp_ip4addr_aton("1.1.1.1");
-            (void)esp_netif_set_dns_info(wifi_netif, ESP_NETIF_DNS_MAIN, &public_dns);
-            public_dns.ip.u_addr.ip4.addr = esp_ip4addr_aton("8.8.8.8");
-            (void)esp_netif_set_dns_info(wifi_netif, ESP_NETIF_DNS_BACKUP, &public_dns);
+            // Keep the DNS learned through DHCP; public DNS may be unreachable
+            // on this network even while the router's resolver works.
             esp_netif_dns_info_t dns_info = {0};
             if (esp_netif_get_dns_info(wifi_netif, ESP_NETIF_DNS_MAIN, &dns_info) == ESP_OK) {
                 esp_ip4addr_ntoa((const esp_ip4_addr_t *)&dns_info.ip.u_addr.ip4, dns, sizeof(dns));
@@ -1553,7 +1657,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             strlcpy(wifi_netmask, netmask, sizeof(wifi_netmask));
             strlcpy(wifi_gateway, gateway, sizeof(wifi_gateway));
             strlcpy(wifi_dns, dns, sizeof(wifi_dns));
+            wifi_retry_failures = 0;
+            wifi_retry_rescan = false;
             portEXIT_CRITICAL(&state_lock);
+            wifi_cancel_retry();
+            cloud_monitor_set_network_ready(true);
+            ESP_LOGI(TAG, "Wi-Fi IP ready: rssi=%d channel=%d DNS=%s", wifi_rssi, wifi_channel, dns);
             if (!sntp_started) {
                 const esp_err_t sntp_result = esp_netif_sntp_start();
                 if (sntp_result == ESP_OK) {
@@ -1572,6 +1681,8 @@ static void init_wifi_monitor(void)
 {
     wifi_lifecycle_events = xEventGroupCreate();
     ESP_ERROR_CHECK(wifi_lifecycle_events != NULL ? ESP_OK : ESP_ERR_NO_MEM);
+    const esp_timer_create_args_t retry_args = {.callback = wifi_retry_callback, .name = "wifi_retry"};
+    ESP_ERROR_CHECK(esp_timer_create(&retry_args, &wifi_retry_timer));
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     wifi_netif = esp_netif_create_default_wifi_sta();
@@ -1584,6 +1695,7 @@ static void init_wifi_monitor(void)
     ESP_ERROR_CHECK(esp_wifi_init(&config));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_FLASH));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
@@ -1781,13 +1893,15 @@ static bool save_phone_config(const char *ssid, const char *password, const char
     if (pairing_code[0] && !cloud_monitor_configure("wss://easy.leige.online", "easyinput-v2", pairing_code)) return false;
     if (!cloud_monitor_is_configured()) return false;
     portENTER_CRITICAL(&state_lock); wifi_reconfiguring = true; portEXIT_CRITICAL(&state_lock);
+    cloud_monitor_set_network_ready(false);
+    wifi_cancel_retry();
     xEventGroupClearBits(wifi_lifecycle_events, WIFI_DISCONNECTED_BIT);
     const esp_err_t disconnect = esp_wifi_disconnect();
     if (disconnect == ESP_OK) {
         const EventBits_t bits = xEventGroupWaitBits(wifi_lifecycle_events, WIFI_DISCONNECTED_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(3000));
         if (!(bits & WIFI_DISCONNECTED_BIT)) {
             portENTER_CRITICAL(&state_lock); wifi_reconfiguring = false; portEXIT_CRITICAL(&state_lock);
-            (void)esp_wifi_connect(); return false;
+            (void)wifi_connect_attempt(); return false;
         }
     }
     wifi_config_t config = {0};
@@ -1799,13 +1913,14 @@ static bool save_phone_config(const char *ssid, const char *password, const char
     memset(config.sta.password, 0, sizeof(config.sta.password));
     portENTER_CRITICAL(&state_lock);
     wifi_reconfiguring = false;
+    wifi_retry_failures = 0;
     if (rc == ESP_OK) {
         strlcpy(wifi_ssid, ssid, sizeof(wifi_ssid)); wifi_configured = true;
         strlcpy(wifi_state, "connecting", sizeof(wifi_state));
         wifi_ip[0] = wifi_netmask[0] = wifi_gateway[0] = wifi_dns[0] = '\0';
     }
     portEXIT_CRITICAL(&state_lock);
-    if (rc != ESP_OK) (void)esp_wifi_connect();
+    if (rc != ESP_OK) (void)wifi_connect_attempt();
     return rc == ESP_OK;
 }
 
@@ -1813,7 +1928,7 @@ static void reconnect_phone_wifi(void)
 {
     // Keep the temporary AP available while the station joins the saved network.
     // Event callbacks handle reconnecting after the disconnect acknowledgement.
-    (void)esp_wifi_connect();
+    (void)wifi_connect_attempt();
 }
 
 static bool init_nvs_safely(void)

@@ -32,7 +32,12 @@ static job_t job;
 static ui_mode_t mode;
 static prompt_action_t prompt_action;
 static bool send_when_saved, prompt_playing, mark_all_read_confirming, realtime_active, setup_waiting, volume_announce_pending;
-static bool key_held[9], key_long_handled[9], key_consumed[9];
+static bool key_held[9], key_long_handled[9], key_consumed[9], timer_stop_keys[9];
+static bool alarm_music_active,stopwatch_beep_active;
+static void cancel_realtime_for_work(void) { realtime_active=false; }
+static int audio_stop_speaker(void) { return 0; }
+static int audio_stop_notification(void) { return 0; }
+static int audio_play_notification(uint16_t ms) { assert(ms==1000);return 0; }
 static int64_t key_down[9], settings_commit_at, retry_at, alarm_fired_at_us, setup_deadline, input_timestamp;
 static char hold_id[65], discarded_id[65];
 static int alarm_draft, timer_draft, last_prompt;
@@ -73,7 +78,9 @@ static void release_audio(void) { released++; }
 static void finish_job(void) { job = JOB_IDLE; }
 static void upload_begin(void) { uploads++; job = JOB_UP_BEGIN; }
 static void play_previous_message(void) {}
-static void *earliest_unread(void) { return NULL; }
+typedef void message_t;
+static message_t *earliest_unread(void) { return NULL; }
+static void set_cursor(message_t *p) { (void)p; }
 static void play_message(void *p) { (void)p; }
 static void begin_alarm_setting(void) {}
 static void begin_timer_setting(void) {}
@@ -106,6 +113,8 @@ static void reset_input(void) {
   stopwatch_result_head=stopwatch_result_count=0;
   stt_round_started = stt_end_announced = stt_terminal_received = false;
   memset(voice_stop_keys, 0, sizeof voice_stop_keys);
+  memset(timer_stop_keys, 0, sizeof timer_stop_keys);
+  alarm_music_active=stopwatch_beep_active=false;
   memset(key_down, 0, sizeof key_down); memset(key_held, 0, sizeof key_held);
   memset(key_long_handled, 0, sizeof key_long_handled); memset(key_consumed, 0, sizeof key_consumed);
   hold_id[0] = discarded_id[0] = 0;
@@ -154,7 +163,7 @@ static void test_inputs(void) {
   assert(job==JOB_CACHE && mode==MODE_RECORD_READY && released==0 && uploads==0 && send_when_saved);
 
   reset_input(); realtime_active=true; press_key(6,50000);
-  assert(!stt_text_session && realtime_active && last_prompt==PROMPT_TRANSCRIPT_FAILURE);
+  assert(stt_text_session && !realtime_active && prompt_action==PROMPT_ACTION_START_STT);
   reset_input(); on_rotate(1); assert(volume_changes==1 && speaker_volume==30);
   on_rotate(-5); assert(speaker_volume==10); on_rotate(20); assert(speaker_volume==100);
   reset_input(); ordinary_recording=true; mode=MODE_RECORDING; on_rotate(1);

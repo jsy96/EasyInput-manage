@@ -7,6 +7,8 @@ import { isHealthMeasurement } from '../../src/shared/health'
 import type { HealthRecord } from '../../src/shared/health'
 import { isLedgerEntry, ledgerDay } from '../../src/shared/ledger'
 import type { LedgerRecord } from '../../src/shared/ledger'
+import { createXiaozhiIdentity, runXiaozhiTranscription } from './xiaozhi'
+import type { XiaozhiIdentity } from './xiaozhi'
 
 type Attachment = { role: 'board' | 'browser'; client?: string; name?: string; last?: number; uptime?: number; healthPending?: number; ledgerPending?: number }
 type Frame = Record<string, unknown>
@@ -22,6 +24,7 @@ export class DeviceRoomV2 {
   private historyReady: Promise<void> | null = null
   private history: ChatMessage[] = []
   private revision = 0
+  private asrBusy = false
   private async loadHistory(): Promise<void> {
     if (!this.historyReady) this.historyReady = this.state.blockConcurrencyWhile(async () => {
       const version = await this.state.storage.get<number>('voice-revision')
@@ -86,7 +89,67 @@ export class DeviceRoomV2 {
     return { messages, next: eligible.length > messages.length ? { created: messages[0].created, id: messages[0].id } : null,
       through: upper ? { created: upper.created, id: upper.id } : null, total: this.history.filter(m => !upper || compareMessages(m, upper) <= 0).length }
   }
-  private stats(): Frame { return { total: this.history.length, unread: this.history.filter(m => m.sender !== 'board' && !m.read).length } }
+  private stats(): Frame { return { total: this.history.length, unread: this.history.filter(m => isVoiceMessage(m) && m.sender !== 'board' && !m.read).length } }
+  private async saveTranscription(id: string, sender: ChatClient, text: string): Promise<void> {
+    await this.state.blockConcurrencyWhile(async () => {
+      if (await this.state.storage.get<string>(`asr-complete:${id}`) === sender.id) return
+      const parts: string[] = []
+      let part = ''
+      for (const character of text.trim()) {
+        if (part.length + character.length > CHAT_TEXT_LIMIT) { parts.push(part); part = '' }
+        part += character
+      }
+      if (part) parts.push(part)
+      if (!parts.length) throw new Error('未识别到普通话文字，请重新录制')
+      const items = [...await this.messages()], removed: ChatMessage[] = [], added: ChatMessage[] = []
+      for (const [index, value] of parts.entries()) {
+        const messageId = `${id}-t${index}`
+        if (items.some(m => m.id === messageId) || await this.state.storage.get(`retired:${messageId}`)) throw new Error('转写消息编号已占用')
+        if (items.length >= CHAT_LIMIT) {
+          const old = items.findIndex(m => m.sender === 'board' || m.read)
+          if (old < 0) throw new Error('已有 5000 条未读留言，请先播放后再发送')
+          removed.push(...items.splice(old, 1))
+        }
+        const message: ChatMessage = { id: messageId, sender: sender.id, name: sender.name, kind: 'text', text: value,
+          samples: 0, read: true, created: Math.max(Date.now(), (items.at(-1)?.created ?? 0) + 1) }
+        items.push(message); added.push(message)
+      }
+      await this.saveMessages(items, { [`asr-complete:${id}`]: sender.id })
+      for (const old of removed) await this.retireAudio(old)
+      if (removed.length) this.broadcast(frame('pruned', { ids: removed.map(m => m.id), ...this.stats() }), true)
+      for (const message of added) this.broadcast(frame('message', { message, added: true, ...this.stats() }), true)
+    })
+  }
+  private async transcription(request: Request): Promise<Response> {
+    const url = new URL(request.url), client = url.searchParams.get('client'), id = url.searchParams.get('id')
+    if (!validId(client) || !validId(id) || id.length > 48) return new Response('Invalid transcription session', { status: 400 })
+    const sender = (await this.clients()).find(c => c.id === client)
+    if (!sender || !this.sockets().some(s => this.attachment(s).client === client)) return new Response('Open chat first', { status: 403 })
+    // Reservation is short: never put network/recognition waits in the room lock.
+    let reserved = false, completed = false, identity: XiaozhiIdentity | undefined
+    try { await this.state.blockConcurrencyWhile(async () => {
+      completed = await this.state.storage.get<string>(`asr-complete:${id}`) === client
+      if (completed || this.asrBusy) return
+      const owner = await this.state.storage.get<string>(`asr-owner:${id}`)
+      if (owner && owner !== client) return
+      const last = await this.state.storage.get<number>('asr-attempt-at') ?? 0
+      if (Date.now() - last < 3000) return
+      this.asrBusy = true; reserved = true
+      identity = await this.state.storage.get<XiaozhiIdentity>('xiaozhi-web-identity') ?? createXiaozhiIdentity()
+      await this.state.storage.put({ 'xiaozhi-web-identity': identity, [`asr-owner:${id}`]: client, 'asr-attempt-at': Date.now() })
+    }) } catch (error) { if (reserved) this.asrBusy = false; throw error }
+    if (!completed && !reserved) return new Response('普通话识别正在处理，请稍后重试', { status: 429 })
+    const [browser, server] = Object.values(new WebSocketPair()) as [WebSocket, WebSocket]
+    server.binaryType = 'arraybuffer'
+    server.accept()
+    if (completed) {
+      server.send(JSON.stringify({ type: 'done' })); server.close(1000, 'already saved')
+    } else {
+      this.state.waitUntil(runXiaozhiTranscription(server, identity!, text => this.saveTranscription(id, sender, text))
+        .finally(() => { this.asrBusy = false }))
+    }
+    return new Response(null, { status: 101, webSocket: browser })
+  }
   private async sourceChunk(id: string, index: number, clip?: ArrayBuffer): Promise<string> {
     const bytes = clip ?? await this.state.storage.get<ArrayBuffer>(`clip:${id}`)
     if (bytes) return btoa(String.fromCharCode(...new Uint8Array(bytes).subarray(index * AUDIO_CHUNK, (index + 1) * AUDIO_CHUNK)))
@@ -208,6 +271,7 @@ export class DeviceRoomV2 {
   }
   async fetch(request: Request): Promise<Response> {
     await this.loadHistory()
+    if (new URL(request.url).pathname === '/asr' && request.headers.get('Upgrade')?.toLowerCase() === 'websocket') return this.transcription(request)
     if (request.method === 'POST' && request.headers.get('X-EasyInput-Clear') === '1') {
       const cleared = await this.state.blockConcurrencyWhile(() => this.clearHistory())
       return Response.json({ ok: true, cleared })
@@ -596,7 +660,7 @@ export class DeviceRoomV2 {
       return
     }
     if (v.op === 'begin') {
-      if (!validId(id) || !Number.isInteger(v.samples) || Number(v.samples) < 1 || Number(v.samples) > AUDIO_LIMIT) throw new Error('语音必须在 20 秒以内')
+      if (!validId(id) || !Number.isInteger(v.samples) || Number(v.samples) < 1 || Number(v.samples) > AUDIO_LIMIT) throw new Error('语音必须在 60 秒以内')
       const items = await this.messages()
       const existing = items.find((m) => m.id === id)
       if (existing) {

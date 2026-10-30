@@ -19,7 +19,7 @@ it('runs real alarm persistence, feedback, stopwatch and five-light priorities w
       return voice.slice(voice.lastIndexOf('typedef enum {', end), end)
     }).join('\n')
     const constants = ['SLOW_BLINK_ON_US', 'SLOW_BLINK_PERIOD_US', 'FLASH_ON_US', 'FLASH_PERIOD_US',
-      'ALARM_FLASH_US', 'STOPWATCH_RESULT_CAPACITY', 'PROMPT_SEQUENCE_CAPACITY', 'SETUP_LONG_US']
+      'ALARM_FLASH_US', 'NETWORK_FRESH_US', 'STOPWATCH_RESULT_CAPACITY', 'PROMPT_SEQUENCE_CAPACITY', 'SETUP_LONG_US']
       .map(name => voice.match(new RegExp(`^#define ${name} .+$`, 'm'))?.[0]).join('\n')
     const wifiType = readFileSync(join(sourceDir, 'voice_chat.h'), 'utf8')
       .match(/typedef enum \{[^}]+\} voice_chat_wifi_state_t;/)?.[0]
@@ -45,6 +45,7 @@ void nvs_close(nvs_handle_t);
 #include <string.h>
 #include <time.h>
 #include "timers.h"
+#include "esp_err.h"
 #include "voice_prompts.h"
 #include "nvs.h"
 static uint16_t stored_alarm=1440,staged_alarm;
@@ -104,7 +105,7 @@ static int alarm_draft,timer_draft;
 static bool setup_waiting;
 static uint32_t stopwatch_results[STOPWATCH_RESULT_CAPACITY];
 static unsigned stopwatch_result_head,stopwatch_result_count,deferred_timer_events;
-static bool stopwatch_start_pending,stopwatch_busy_pending,prompt_playing;
+static bool stopwatch_start_pending,stopwatch_busy_pending,prompt_playing,stopwatch_beep_active;
 static int prompt_length,spoken[128],spoken_count,beeps;
 static bool xiaozhi_stt_busy(void) { return worker_busy; }
 static bool xiaozhi_stt_pending(void *p) { (void)p;return pending_text; }
@@ -122,7 +123,9 @@ static void start_prompt_sequence(const int *ids,int n,prompt_action_t action) {
 }
 static void start_prompt(int p,prompt_action_t a) { start_prompt_sequence(&p,1,a); }
 static int audio_play_beep(uint16_t ms,bool strong) { (void)ms;(void)strong;beeps++;return 0; }
+static int audio_play_notification(uint16_t ms) { assert(ms==1000);beeps++;return 0; }
 static int64_t esp_timer_get_time(void) { return 1; }
+static void cancel_realtime_for_work(void) { realtime_active=false; }
 static void stop_message_playback(void) {}
 static void cancel_countdown(bool prompt) { (void)prompt;timers_cancel_countdown(); }
 static void stop_prompt(void) { prompt_length=spoken_count=0;prompt_playing=false; }
@@ -138,6 +141,12 @@ static void assert_modes(const char *a,const char *b,const char *c,const char *d
 int main(void) {
   timers_init();unsigned before=commits;
   timers_start_stopwatch(0);assert(timers_stopwatch_active());
+  assert(!(timers_poll(59999999)&TIMER_EVENT_STOPWATCH_MINUTE));
+  assert(timers_poll(60000000)&TIMER_EVENT_STOPWATCH_MINUTE);
+  assert(!(timers_poll(60000001)&TIMER_EVENT_STOPWATCH_MINUTE));
+  assert(timers_poll(180000000)&TIMER_EVENT_STOPWATCH_MINUTE);
+  assert(!(timers_poll(180000001)&TIMER_EVENT_STOPWATCH_MINUTE));
+  timers_start_stopwatch(0);
   assert(timers_stopwatch_seconds(999999)==0 && timers_stopwatch_seconds(1000000)==1);
   assert(timers_stop_stopwatch(59999999)==59 && !timers_stopwatch_active());
   assert(timers_stopwatch_seconds(999000000)==59 && commits==before);
@@ -155,7 +164,7 @@ int main(void) {
 
   struct tm alarm_time={.tm_year=126,.tm_mon=9,.tm_mday=29,.tm_hour=12};
   wall_time=mktime(&alarm_time);
-  int64_t alarm_poll_us=100000000;
+  int64_t alarm_poll_us=1000000000;
   assert(timers_poll(alarm_poll_us)&TIMER_EVENT_ALARM);
   const char *stages[]={"nvs_open","nvs_set_u16","nvs_commit"};
   int *failures[]={&fail_open,&fail_set,&fail_commit};
@@ -249,6 +258,10 @@ int main(void) {
   receiving_until_us=0;pending_text=false;
 
   realtime_active=false;last_network_at=0;timers_start_stopwatch(0);
+  int old_beeps=beeps;audio_state.speaker_playing=true;
+  handle_timer_events(TIMER_EVENT_STOPWATCH_MINUTE,60000000);
+  assert(beeps==old_beeps+1 && stopwatch_beep_active);
+  audio_state.speaker_playing=false;
   toggle_stopwatch(65000000);assert(stopwatch_result_count==1 && !timers_stopwatch_active());
   audio_state.recording=true;handle_timer_events(TIMER_EVENT_ALARM,90000000);
   assert(stopwatch_result_count==1 && deferred_timer_events==TIMER_EVENT_ALARM && alarm_fired_at_us==90000000 && !spoken_count);
@@ -260,7 +273,7 @@ int main(void) {
   job=JOB_PLAYING;handle_timer_events(0,90000004);assert(!spoken_count);
   mode=MODE_IDLE;handle_timer_events(0,90000004);assert(!spoken_count);
   job=JOB_IDLE;handle_timer_events(0,90000004);
-  assert(spoken_count==2 && spoken[0]==PROMPT_ALARM_DUE && spoken[1]==PROMPT_ALARM_MELODY && stopwatch_result_count==1);
+  assert(spoken_count==1 && spoken[0]==PROMPT_ALARM_DUE && stopwatch_result_count==1);
   handle_timer_events(0,90000005);assert(stopwatch_result_count==1);speech_done();
   handle_timer_events(0,90000006);
   const int duration[]={PROMPT_STOPWATCH_TOTAL,PROMPT_DIGIT_1,PROMPT_MINUTES,PROMPT_DIGIT_5,PROMPT_SECONDS};

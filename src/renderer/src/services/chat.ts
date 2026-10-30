@@ -33,9 +33,8 @@ export class ChatConnection {
   private lastPong = 0
   private pending = new Map<string, { resolve: (f: Frame) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>()
   private realtimeListeners = new Set<(event: RealtimeEvent) => void>()
-  private splitRequests = new Map<string, string>()
   private uploadBusy = false
-  private historyLoading = false
+  private historyLoading: Promise<void> | null = null
   private generation = 0
   private pruned = new Set<string>()
   private displayedTexts = new Set<string>()
@@ -211,17 +210,38 @@ export class ChatConnection {
     return { messages, next, through: upper, total: Number(page.total) }
   }
   async loadOlder(): Promise<void> {
-    if (this.historyLoading || !this.state.next) return
-    this.historyLoading = true
+    if (this.historyLoading) return this.historyLoading
+    if (!this.state.next) return
     const generation = this.generation
-    try {
-      const page = await this.historyPage(this.state.next)
+    const before = this.state.next
+    const loading = (async () => {
+      const page = await this.historyPage(before)
       if (generation !== this.generation) throw new Error('语音服务已重新连接，请重新加载历史')
       const messages = new Map(page.messages.filter(m => !this.pruned.has(m.id)).map(m => [m.id, m]))
       // Fresh broadcasts win over metadata downloaded just before a read acknowledgement.
       for (const m of this.state.messages) messages.set(m.id, m)
       this.update({ messages: sortMessages([...messages.values()]), next: page.next })
-    } finally { this.historyLoading = false }
+    })()
+    this.historyLoading = loading
+    try { await loading }
+    finally { if (this.historyLoading === loading) this.historyLoading = null }
+  }
+  async findFirstUnread(cancelled = () => false): Promise<ChatMessage | null> {
+    const generation = this.generation
+    for (let page = 0; page <= CHAT_LIMIT; page++) {
+      if (cancelled()) return null
+      if (this.stopped || generation !== this.generation || !this.state.connected) throw new Error('语音服务已重新连接，请重新定位未读')
+      if (!this.state.unread) return null
+      const unread = sortMessages(this.state.messages).filter(m => isVoiceMessage(m) && m.sender !== 'board' && !m.read)
+      // The room count covers every page. Only stop early once every unread row is loaded.
+      if (unread.length >= this.state.unread || !this.state.next) return unread[0] ?? null
+      const before = this.state.next
+      await this.loadOlder()
+      if (cancelled()) return null
+      if (generation !== this.generation) throw new Error('语音服务已重新连接，请重新定位未读')
+      if (this.state.next && compareMessages(this.state.next, before) >= 0) throw new Error('历史分页未能继续，请重试定位未读')
+    }
+    throw new Error('历史分页超出消息上限，请重新连接后重试')
   }
   async voiceHistory(progress?: (count: number, total: number) => void): Promise<ChatMessage[]> {
     const generation = this.generation, records: ChatMessage[] = []
@@ -277,14 +297,6 @@ export class ChatConnection {
       if (Number(page.next) <= after) throw new Error('记账记录下载未能继续')
       after = Number(page.next)
     }
-  }
-  async split(m: ChatMessage, seconds: number, splitId?: string): Promise<void> {
-    const key = `${m.id}:${seconds}`
-    splitId ??= this.splitRequests.get(key) ?? crypto.randomUUID()
-    this.splitRequests.set(key, splitId)
-    while (this.splitRequests.size > 128) this.splitRequests.delete(this.splitRequests.keys().next().value!)
-    const ack = await this.request('split', { id: m.id, seconds, splitId })
-    if (ack.op !== 'split.ack' || ack.id !== m.id) throw new Error('分割确认异常，请刷新历史')
   }
   async *audioChunks(m: ChatMessage): AsyncGenerator<Uint8Array> {
     if (!isVoiceMessage(m) || !isChatMessage(m)) throw new Error('这条消息没有可用的语音文件')
